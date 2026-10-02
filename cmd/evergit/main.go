@@ -1,0 +1,75 @@
+package main
+
+import (
+	"flag"
+	"log"
+	"os"
+	"path/filepath"
+	"time"
+
+	"evergit/internal/config"
+	"evergit/internal/converter"
+	"evergit/internal/server"
+)
+
+func main() {
+	// CLI Flags
+	httpAddr := flag.String("http", "", "HTTP listen address (e.g. :8080)")
+	sshAddr := flag.String("ssh", "", "SSH listen address (e.g. :2222)")
+	storageRoot := flag.String("storage", "", "Storage root directory")
+	cacheTTLStr := flag.String("ttl", "5m", "Cache TTL (e.g. 5m, 1h)")
+	flag.Parse()
+
+	cfg := config.Load()
+
+	// Override config with flags if provided
+	if *httpAddr != "" {
+		cfg.HTTPAddr = *httpAddr
+	}
+	if *sshAddr != "" {
+		cfg.SSHAddr = *sshAddr
+	}
+	if *storageRoot != "" {
+		absPath, err := filepath.Abs(*storageRoot)
+		if err != nil {
+			log.Fatalf("Failed to resolve absolute path of storage %q: %v", *storageRoot, err)
+		}
+		cfg.StorageRoot = absPath
+	}
+	if *cacheTTLStr != "" {
+		ttl, err := time.ParseDuration(*cacheTTLStr)
+		if err != nil {
+			log.Fatalf("Invalid TTL duration %q: %v", *cacheTTLStr, err)
+		}
+		cfg.CacheTTL = ttl
+	}
+
+	log.Printf("Initializing Evergit Daemon...")
+	log.Printf("Storage Root: %s", cfg.StorageRoot)
+	log.Printf("Cache TTL:    %v", cfg.CacheTTL)
+
+	// Ensure Storage Root exists
+	if err := os.MkdirAll(cfg.StorageRoot, 0755); err != nil {
+		log.Fatalf("Failed to create storage root: %v", err)
+	}
+
+	convManager := converter.NewManager(cfg.StorageRoot, cfg.CacheTTL)
+
+	// Start SSH Server
+	sshServer, err := server.NewSSHServer(cfg, convManager)
+	if err != nil {
+		log.Fatalf("Failed to create SSH server: %v", err)
+	}
+	if _, err := sshServer.Start(); err != nil {
+		log.Fatalf("Failed to start SSH server: %v", err)
+	}
+
+	// Start HTTP Server (Blocking)
+	httpServer, err := server.NewHTTPServer(cfg, convManager)
+	if err != nil {
+		log.Fatalf("Failed to create HTTP server: %v", err)
+	}
+	if err := httpServer.ListenAndServe(); err != nil {
+		log.Fatalf("HTTP server failed: %v", err)
+	}
+}
