@@ -137,7 +137,7 @@ func TestConverterForcePushBackup(t *testing.T) {
 
 	// 2. Setup the Converter Manager
 	storageRoot := filepath.Join(tempDir, "storage")
-	manager := NewManager(10 * time.Millisecond) // Low TTL to force sync on next check
+	manager := NewManager(0) // Zero TTL syncs on every call
 
 	info := &resolver.RepositoryInfo{
 		Domain:      "local",
@@ -164,9 +164,6 @@ func TestConverterForcePushBackup(t *testing.T) {
 	if oldHeadSHA1 == newHeadSHA1 {
 		t.Fatalf("Amended commit should have a different hash than the original!")
 	}
-
-	// Wait for TTL to expire to force a sync
-	time.Sleep(20 * time.Millisecond)
 
 	// Second JIT conversion (Triggers fetch and backup check!)
 	err = manager.EnsureRepo(info, nil)
@@ -230,7 +227,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 
 	// 2. Setup the Converter Manager
 	storageRoot := filepath.Join(tempDir, "storage")
-	manager := NewManager(10 * time.Millisecond) // Low TTL to force sync
+	manager := NewManager(0) // Zero TTL syncs on every call
 
 	info := &resolver.RepositoryInfo{
 		Domain:      "local",
@@ -253,8 +250,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 	_, _ = runCmd(upstreamPath, "git", "add", "test.txt")
 	_, _ = runCmd(upstreamPath, "git", "commit", "--amend", "-m", "commit B (amended)")
 
-	// Wait for TTL to expire and sync a second time
-	time.Sleep(20 * time.Millisecond)
+	// Sync a second time
 	err = manager.EnsureRepo(info, nil)
 	if err != nil {
 		t.Fatalf("Second EnsureRepo failed: %v", err)
@@ -287,8 +283,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 	_, _ = runCmd(upstreamPath, "git", "add", "test.txt")
 	_, _ = runCmd(upstreamPath, "git", "commit", "-m", "commit C (regular update)")
 
-	// Wait for TTL to expire and sync a third time
-	time.Sleep(20 * time.Millisecond)
+	// Sync a third time
 	err = manager.EnsureRepo(info, nil)
 	if err != nil {
 		t.Fatalf("Third EnsureRepo failed: %v", err)
