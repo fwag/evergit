@@ -1,6 +1,7 @@
 package converter
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -328,4 +329,104 @@ func TestConverterBackupPreservation(t *testing.T) {
 	if !strings.Contains(refsOutputAfterFullConversion, backupRef) {
 		t.Errorf("Backup ref %s was lost during full re-conversion!\nRemaining refs:\n%s", backupRef, refsOutputAfterFullConversion)
 	}
+}
+
+// newTestUpstream creates a SHA1 upstream repository with a single commit.
+func newTestUpstream(t *testing.T) string {
+	t.Helper()
+	upstreamPath := filepath.Join(t.TempDir(), "upstream.git")
+	if _, err := runCmd("", "git", "init", "--initial-branch=main", "--object-format=sha1", upstreamPath); err != nil {
+		t.Fatalf("failed to init upstream: %v", err)
+	}
+	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
+	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
+	commitToUpstream(t, upstreamPath, "commit 0")
+	return upstreamPath
+}
+
+func commitToUpstream(t *testing.T, upstreamPath, msg string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(upstreamPath, "test.txt"), []byte(msg), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = runCmd(upstreamPath, "git", "add", "test.txt")
+	if _, err := runCmd(upstreamPath, "git", "commit", "-m", msg); err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+}
+
+func newTestRepoInfo(t *testing.T, upstreamPath string) *resolver.RepositoryInfo {
+	storageRoot := t.TempDir()
+	return &resolver.RepositoryInfo{
+		Domain:      "local",
+		Owner:       "test",
+		RepoName:    "repo",
+		RemoteURL:   upstreamPath,
+		MirrorPath:  filepath.Join(storageRoot, "mirrors", "repo.git"),
+		ServingPath: filepath.Join(storageRoot, "repos", "repo.git"),
+	}
+}
+
+// assertCompatMapComplete checks that every commit in the serving repo has a loose-object-idx entry.
+func assertCompatMapComplete(t *testing.T, servingPath string) {
+	t.Helper()
+	types, err := runCmd(servingPath, "git", "cat-file", "--batch-all-objects", "--batch-check=%(objecttype) %(objectname)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := os.ReadFile(filepath.Join(servingPath, "objects", "loose-object-idx"))
+	if err != nil {
+		t.Fatalf("loose-object-idx missing: %v", err)
+	}
+	for _, line := range strings.Split(types, "\n") {
+		if oid, ok := strings.CutPrefix(line, "commit "); ok && !strings.Contains(string(idx), oid+" ") {
+			t.Errorf("commit %s has no loose-object-idx entry", oid)
+		}
+	}
+}
+
+func TestCompatMapCompleteAfterIncrementalConversion(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager("", 0)
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("initial EnsureRepo failed: %v", err)
+	}
+	for i := 1; i <= 40; i++ {
+		commitToUpstream(t, upstreamPath, fmt.Sprintf("commit %d", i))
+	}
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("incremental EnsureRepo failed: %v", err)
+	}
+	assertCompatMapComplete(t, info.ServingPath)
+}
+
+func TestCompatMapRecoversWhenMissing(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager("", 0)
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("initial EnsureRepo failed: %v", err)
+	}
+	if err := os.Remove(filepath.Join(info.ServingPath, "objects", "loose-object-idx")); err != nil {
+		t.Fatal(err)
+	}
+
+	// An incremental update must rebuild the map rather than fail to append to it
+	commitToUpstream(t, upstreamPath, "commit 1")
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("incremental EnsureRepo failed: %v", err)
+	}
+	assertCompatMapComplete(t, info.ServingPath)
+
+	// A sync with no upstream changes must also restore a lost map
+	if err := os.Remove(filepath.Join(info.ServingPath, "objects", "loose-object-idx")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("no-op EnsureRepo failed: %v", err)
+	}
+	assertCompatMapComplete(t, info.ServingPath)
 }

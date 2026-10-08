@@ -63,6 +63,9 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 		// If we could not fetch updates, or if nothing has changed, we should just keep the current converted serving repo.
 		// Let's touch HEAD to reset the TTL so we don't spam fetch on every request.
 		if !changed {
+			if err := ensureLooseObjectIdx(info.ServingPath); err != nil {
+				return err
+			}
 			now := time.Now()
 			_ = os.Chtimes(servingHeadPath, now, now)
 			return nil
@@ -191,20 +194,12 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 	var targetPath string
 	var exportFlags []string
 	var importFlags []string
-	var oldSha1Size, oldSha256Size int64
 
 	if isIncremental {
 		targetPath = info.ServingPath
 		log.Printf("Starting high-performance incremental conversion for repository %s...", info.RepoName)
 		if progressWriter != nil {
 			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Incremental update found. Performing incremental JIT conversion...\n")
-		}
-
-		if fi, err := os.Stat(sha1MarksPath); err == nil {
-			oldSha1Size = fi.Size()
-		}
-		if fi, err := os.Stat(sha256MarksPath); err == nil {
-			oldSha256Size = fi.Size()
 		}
 
 		// Temporarily unset compatObjectFormat so git fast-import does not crash on existing tree mapping checks
@@ -318,17 +313,12 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		headRef = "refs/heads/main"
 	}
 
-	// Generate loose-object-idx bidirectional hash translation map
-	var genErr error
-	if isIncremental {
-		genErr = generateLooseObjectIdxIncremental(sha1MarksPath, sha256MarksPath, targetPath, oldSha1Size, oldSha256Size)
-	} else {
-		sha1TmpMarksPath := filepath.Join(targetPath, "evergit-sha1-marks.txt")
-		sha256TmpMarksPath := filepath.Join(targetPath, "evergit-sha256-marks.txt")
-		genErr = generateLooseObjectIdx(sha1TmpMarksPath, sha256TmpMarksPath, targetPath)
-	}
-	if genErr != nil {
-		log.Printf("WARNING: failed to generate loose-object-idx compatibility map: %v", genErr)
+	// Regenerate the loose-object-idx translation map from the complete marks files
+	if err := generateLooseObjectIdx(targetPath); err != nil {
+		if !isIncremental {
+			os.RemoveAll(targetPath)
+		}
+		return fmt.Errorf("failed to generate loose-object-idx compatibility map: %w", err)
 	}
 
 	// Set the default branch (HEAD) symbolic ref
@@ -369,7 +359,13 @@ func runCmd(dir, name string, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-func generateLooseObjectIdx(sha1MarksPath, sha256MarksPath, repoPath string) error {
+// generateLooseObjectIdx rebuilds objects/loose-object-idx by pairing the SHA1 and SHA256 marks files.
+// Both files always hold every mark (fast-export/fast-import rewrite them in full), so the map is
+// rebuilt from scratch rather than appended to, and swapped in atomically for concurrent readers.
+func generateLooseObjectIdx(repoPath string) error {
+	sha1MarksPath := filepath.Join(repoPath, "evergit-sha1-marks.txt")
+	sha256MarksPath := filepath.Join(repoPath, "evergit-sha256-marks.txt")
+
 	sha1Marks, err := parseMarksFile(sha1MarksPath)
 	if err != nil {
 		return fmt.Errorf("failed to parse SHA1 marks: %w", err)
@@ -392,10 +388,31 @@ func generateLooseObjectIdx(sha1MarksPath, sha256MarksPath, repoPath string) err
 	}
 
 	idxPath := filepath.Join(repoPath, "objects", "loose-object-idx")
-	if err := os.WriteFile(idxPath, []byte(sb.String()), 0644); err != nil {
+	tmpPath := idxPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(sb.String()), 0644); err != nil {
 		return fmt.Errorf("failed to write loose-object-idx file: %w", err)
 	}
+	if err := os.Rename(tmpPath, idxPath); err != nil {
+		return fmt.Errorf("failed to install loose-object-idx file: %w", err)
+	}
 
+	return nil
+}
+
+// ensureLooseObjectIdx regenerates the translation map if it is missing or older than the marks,
+// e.g. after a failed or interrupted conversion.
+func ensureLooseObjectIdx(repoPath string) error {
+	marks, err := os.Stat(filepath.Join(repoPath, "evergit-sha256-marks.txt"))
+	if err != nil {
+		return nil // No marks to build from
+	}
+	idx, err := os.Stat(filepath.Join(repoPath, "objects", "loose-object-idx"))
+	if err == nil && !idx.ModTime().Before(marks.ModTime()) {
+		return nil
+	}
+	if err := generateLooseObjectIdx(repoPath); err != nil {
+		return fmt.Errorf("failed to regenerate loose-object-idx compatibility map: %w", err)
+	}
 	return nil
 }
 
@@ -530,67 +547,4 @@ func (m *Manager) logBackupRefs(info *resolver.RepositoryInfo) {
 			}
 		}
 	}
-}
-
-func generateLooseObjectIdxIncremental(sha1MarksPath, sha256MarksPath, repoPath string, oldSha1Size, oldSha256Size int64) error {
-	sha1Marks, err := parseNewMarks(sha1MarksPath, oldSha1Size)
-	if err != nil {
-		return err
-	}
-
-	sha256Marks, err := parseNewMarks(sha256MarksPath, oldSha256Size)
-	if err != nil {
-		return err
-	}
-
-	if len(sha1Marks) == 0 || len(sha256Marks) == 0 {
-		return nil // No new objects to map
-	}
-
-	// Append new mappings to loose-object-idx
-	idxPath := filepath.Join(repoPath, "objects", "loose-object-idx")
-	f, err := os.OpenFile(idxPath, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open loose-object-idx for appending: %w", err)
-	}
-	defer f.Close()
-
-	for mark, sha1Hash := range sha1Marks {
-		sha256Hash, ok := sha256Marks[mark]
-		if ok {
-			if _, err := f.WriteString(fmt.Sprintf("%s %s\n", sha256Hash, sha1Hash)); err != nil {
-				return fmt.Errorf("failed to append to loose-object-idx: %w", err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func parseNewMarks(path string, startOffset int64) (map[string]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	_, err = f.Seek(startOffset, io.SeekStart)
-	if err != nil {
-		return nil, err
-	}
-
-	marks := make(map[string]string)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) == 2 {
-			marks[parts[0]] = parts[1]
-		}
-	}
-
-	return marks, scanner.Err()
 }
