@@ -99,7 +99,20 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 		return false, fmt.Errorf("failed to create mirrors directory: %w", err)
 	}
 
-	if _, err := os.Stat(info.MirrorPath); os.IsNotExist(err) {
+	_, statErr := os.Stat(info.MirrorPath)
+	if statErr == nil && !looksLikeBareRepo(info.MirrorPath) {
+		// git would otherwise walk up from this directory and operate on an enclosing repository
+		log.Printf("WARNING: mirror %s is not a git repository (interrupted clone?), re-cloning", info.MirrorPath)
+		if err := os.RemoveAll(info.MirrorPath); err != nil {
+			return false, fmt.Errorf("failed to remove broken mirror %s: %w", info.MirrorPath, err)
+		}
+		statErr = os.ErrNotExist
+	}
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return false, fmt.Errorf("failed to access mirror %s: %w", info.MirrorPath, statErr)
+	}
+
+	if os.IsNotExist(statErr) {
 		// Clone as a bare mirror
 		_, err := runCmdTimeout(upstreamTimeout, "", "git", "clone", "--mirror", info.RemoteURL, info.MirrorPath)
 		if err != nil {
@@ -158,6 +171,16 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 
 		return false, nil // No changes detected!
 	}
+}
+
+// looksLikeBareRepo is a deliberately structural check, so a transient git failure can never
+// cause a valid mirror (and its backup refs) to be deleted.
+func looksLikeBareRepo(path string) bool {
+	if _, err := os.Stat(filepath.Join(path, "HEAD")); err != nil {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(path, "objects"))
+	return err == nil && fi.IsDir()
 }
 
 // backupRefsNegativeRefspec keeps "git fetch --prune" from deleting our backup refs.

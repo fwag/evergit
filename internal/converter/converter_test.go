@@ -628,3 +628,29 @@ func TestRunCmdTimeout(t *testing.T) {
 		t.Errorf("timed-out command took %v to return", elapsed)
 	}
 }
+
+func TestBrokenMirrorIsRecloned(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager("", 0)
+
+	// An interrupted clone can leave an empty directory behind. Put it inside an unrelated
+	// repository, which git would otherwise discover and operate on instead.
+	parentRepo := filepath.Dir(filepath.Dir(info.MirrorPath))
+	if _, err := runCmd("", "git", "init", "-q", parentRepo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(info.MirrorPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo with a broken mirror failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(info.MirrorPath, "HEAD")); err != nil {
+		t.Errorf("mirror was not re-cloned: %v", err)
+	}
+	if out, _ := runCmd(parentRepo, "git", "config", "--get-all", "remote.origin.fetch"); out != "" {
+		t.Errorf("unrelated parent repository was modified: remote.origin.fetch = %q", out)
+	}
+}
