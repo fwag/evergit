@@ -18,17 +18,15 @@ import (
 )
 
 type Manager struct {
-	storageRoot string
-	cacheTTL    time.Duration
-	locksMu     sync.Mutex
-	repoLocks   map[string]*sync.Mutex
+	cacheTTL  time.Duration
+	locksMu   sync.Mutex
+	repoLocks map[string]*sync.Mutex
 }
 
-func NewManager(storageRoot string, cacheTTL time.Duration) *Manager {
+func NewManager(cacheTTL time.Duration) *Manager {
 	return &Manager{
-		storageRoot: storageRoot,
-		cacheTTL:    cacheTTL,
-		repoLocks:   make(map[string]*sync.Mutex),
+		cacheTTL:  cacheTTL,
+		repoLocks: make(map[string]*sync.Mutex),
 	}
 }
 
@@ -58,12 +56,10 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 		return err
 	}
 
-	// If the final repository already exists, and we might have returned false from syncMirror,
-	// we check if we can completely bypass the conversion.
+	// Skip conversion when the serving repo exists and the mirror did not change (or the fetch
+	// failed and we fall back to the cache). Touching HEAD restarts the TTL.
 	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
 	if _, err := os.Stat(servingHeadPath); err == nil {
-		// If we could not fetch updates, or if nothing has changed, we should just keep the current converted serving repo.
-		// Let's touch HEAD to reset the TTL so we don't spam fetch on every request.
 		if !changed {
 			if err := ensureLooseObjectIdx(info.ServingPath); err != nil {
 				return err

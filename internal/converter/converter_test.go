@@ -59,7 +59,7 @@ func TestConverter(t *testing.T) {
 
 	// 2. Setup the Converter Manager
 	storageRoot := filepath.Join(tempDir, "storage")
-	manager := NewManager(storageRoot, 1*time.Second)
+	manager := NewManager(1 * time.Second)
 
 	info := &resolver.RepositoryInfo{
 		Domain:      "local",
@@ -136,7 +136,7 @@ func TestConverterForcePushBackup(t *testing.T) {
 
 	// 2. Setup the Converter Manager
 	storageRoot := filepath.Join(tempDir, "storage")
-	manager := NewManager(storageRoot, 10*time.Millisecond) // Low TTL to force sync on next check
+	manager := NewManager(10 * time.Millisecond) // Low TTL to force sync on next check
 
 	info := &resolver.RepositoryInfo{
 		Domain:      "local",
@@ -229,7 +229,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 
 	// 2. Setup the Converter Manager
 	storageRoot := filepath.Join(tempDir, "storage")
-	manager := NewManager(storageRoot, 10*time.Millisecond) // Low TTL to force sync
+	manager := NewManager(10 * time.Millisecond) // Low TTL to force sync
 
 	info := &resolver.RepositoryInfo{
 		Domain:      "local",
@@ -393,7 +393,7 @@ func assertCompatMapComplete(t *testing.T, servingPath string) {
 func TestCompatMapCompleteAfterIncrementalConversion(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager("", 0)
+	manager := NewManager(0)
 
 	if err := manager.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
@@ -410,7 +410,7 @@ func TestCompatMapCompleteAfterIncrementalConversion(t *testing.T) {
 func TestCompatMapRecoversWhenMissing(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager("", 0)
+	manager := NewManager(0)
 
 	if err := manager.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
@@ -440,7 +440,7 @@ func TestDeletedBranchIsNoLongerServed(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	_, _ = runCmd(upstreamPath, "git", "branch", "feature")
 	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager("", 0)
+	manager := NewManager(0)
 
 	if err := manager.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
@@ -486,7 +486,7 @@ func assertCompatObjectFormat(t *testing.T, servingPath string) {
 func TestCompatObjectFormatRestoredAfterFailedImport(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager("", 0)
+	manager := NewManager(0)
 
 	if err := manager.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
@@ -510,7 +510,7 @@ func TestCompatObjectFormatRestoredAfterFailedImport(t *testing.T) {
 func TestCompatObjectFormatRestoredOnNoOpSync(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager("", 0)
+	manager := NewManager(0)
 
 	if err := manager.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
@@ -528,7 +528,7 @@ func TestCompatObjectFormatRestoredOnNoOpSync(t *testing.T) {
 func TestFullConversionNeverHidesServingRepo(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager("", 0)
+	manager := NewManager(0)
 
 	if err := manager.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
@@ -585,7 +585,7 @@ func TestFullConversionNeverHidesServingRepo(t *testing.T) {
 func TestFullConversionMigratesLegacyServingDirectory(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager("", 0)
+	manager := NewManager(0)
 
 	if err := manager.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
@@ -632,7 +632,7 @@ func TestRunCmdTimeout(t *testing.T) {
 func TestBrokenMirrorIsRecloned(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager("", 0)
+	manager := NewManager(0)
 
 	// An interrupted clone can leave an empty directory behind. Put it inside an unrelated
 	// repository, which git would otherwise discover and operate on instead.

@@ -45,6 +45,9 @@ func main() {
 		if err != nil {
 			log.Fatalf("Invalid TTL duration %q: %v", *cacheTTLStr, err)
 		}
+		if ttl <= 0 {
+			log.Fatalf("Invalid TTL duration %q: must be positive", *cacheTTLStr)
+		}
 		cfg.CacheTTL = ttl
 	}
 
@@ -69,7 +72,7 @@ func main() {
 	// Also keeps the file referenced: a garbage-collected *os.File would close and release the lock
 	defer lockFile.Close()
 
-	convManager := converter.NewManager(cfg.StorageRoot, cfg.CacheTTL)
+	convManager := converter.NewManager(cfg.CacheTTL)
 
 	// Start SSH Server
 	sshServer, err := server.NewSSHServer(cfg, convManager)

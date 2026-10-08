@@ -74,7 +74,7 @@ func TestIntegration(t *testing.T) {
 		UpstreamOverrides: map[string]string{"local.test": upstreamPath},
 	}
 
-	convManager := converter.NewManager(cfg.StorageRoot, cfg.CacheTTL)
+	convManager := converter.NewManager(cfg.CacheTTL)
 
 	// Start SSH Server
 	sshServer, err := server.NewSSHServer(cfg, convManager)
