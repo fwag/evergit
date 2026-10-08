@@ -3,10 +3,13 @@ package resolver
 import (
 	"path/filepath"
 	"testing"
+
+	"evergit/internal/config"
 )
 
 func TestParsePath(t *testing.T) {
 	storageRoot := "/tmp/evergit"
+	cfg := &config.Config{StorageRoot: storageRoot, AllowedHosts: config.DefaultAllowedHosts}
 
 	tests := []struct {
 		name        string
@@ -87,6 +90,36 @@ func TestParsePath(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:        "Host is case-insensitive",
+			rawPath:     "GitHub.com/ta/evergit",
+			wantDomain:  "github.com",
+			wantOwner:   "ta",
+			wantRepo:    "evergit",
+			wantRemote:  "https://github.com/ta/evergit.git",
+			wantMirror:  filepath.Join(storageRoot, "mirrors", "github.com", "ta", "evergit.git"),
+			wantServing: filepath.Join(storageRoot, "repos", "github.com", "ta", "evergit.git"),
+		},
+		{
+			name:    "Host not in allowlist",
+			rawPath: "evil.test/a/b",
+			wantErr: true,
+		},
+		{
+			name:    "IP address host",
+			rawPath: "169.254.169.254/latest/meta-data/x",
+			wantErr: true,
+		},
+		{
+			name:    "Host with port",
+			rawPath: "127.0.0.1:9200/a/b",
+			wantErr: true,
+		},
+		{
+			name:    "Host with userinfo",
+			rawPath: "user:pass@github.com/a/b",
+			wantErr: true,
+		},
+		{
 			name:    "Unsafe characters",
 			rawPath: "github.com/org/re po",
 			wantErr: true,
@@ -95,7 +128,7 @@ func TestParsePath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParsePath(tt.rawPath, storageRoot)
+			got, err := ParsePath(tt.rawPath, cfg)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("ParsePath() error = %v, wantErr %v", err, tt.wantErr)
 			}

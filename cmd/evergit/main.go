@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"evergit/internal/config"
@@ -18,6 +19,7 @@ func main() {
 	sshAddr := flag.String("ssh", "", "SSH listen address (e.g. :2222)")
 	storageRoot := flag.String("storage", "", "Storage root directory")
 	cacheTTLStr := flag.String("ttl", "5m", "Cache TTL (e.g. 5m, 1h)")
+	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
 	flag.Parse()
 
 	cfg := config.Load()
@@ -44,9 +46,14 @@ func main() {
 		cfg.CacheTTL = ttl
 	}
 
+	if *allowedHosts != "" {
+		cfg.AllowedHosts = config.ParseHostList(*allowedHosts)
+	}
+
 	log.Printf("Initializing Evergit Daemon...")
 	log.Printf("Storage Root: %s", cfg.StorageRoot)
 	log.Printf("Cache TTL:    %v", cfg.CacheTTL)
+	log.Printf("Allowed hosts: %s", strings.Join(cfg.AllowedHosts, ", "))
 
 	// Ensure Storage Root exists
 	if err := os.MkdirAll(cfg.StorageRoot, 0755); err != nil {

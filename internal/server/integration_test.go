@@ -70,10 +70,11 @@ func TestIntegration(t *testing.T) {
 
 	// 3. Configure and start Evergit Servers
 	cfg := &config.Config{
-		HTTPAddr:    "127.0.0.1:0",
-		SSHAddr:     "127.0.0.1:0",
-		StorageRoot: filepath.Join(tempDir, "storage"),
-		CacheTTL:    5 * time.Minute,
+		HTTPAddr:     "127.0.0.1:0",
+		SSHAddr:      "127.0.0.1:0",
+		StorageRoot:  filepath.Join(tempDir, "storage"),
+		CacheTTL:     5 * time.Minute,
+		AllowedHosts: []string{"local.test"},
 	}
 
 	convManager := converter.NewManager(cfg.StorageRoot, cfg.CacheTTL)

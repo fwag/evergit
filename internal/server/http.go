@@ -53,7 +53,7 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 			return
 		}
 
-		info, err := resolver.ParsePath(repoPath, cfg.StorageRoot)
+		info, err := resolver.ParsePath(repoPath, cfg)
 		if err != nil {
 			log.Printf("[HTTP] Path parse error: %v", err)
 			http.Error(w, "Invalid repository path", http.StatusBadRequest)

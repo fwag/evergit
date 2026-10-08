@@ -141,7 +141,7 @@ func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
 		return err
 	}
 
-	info, err := resolver.ParsePath(repoPath, s.cfg.StorageRoot)
+	info, err := resolver.ParsePath(repoPath, s.cfg)
 	if err != nil {
 		writeError(ch, err)
 		return err

@@ -13,7 +13,7 @@ It is designed to solve a critical interoperability gap: **Git does not allow re
 - **Force-Push and Deletion Protection (History Archival):** Captures references automatically before fetching updates. If a branch/tag is force-pushed (overwritten) or deleted upstream, Evergit automatically archives the old commits under a dedicated, permanent namespace (`refs/evergit-backups/`). This guarantees that old commits are never lost or garbage collected, and remain fully checkoutable by clients!
 - **Fully Compliant Smart HTTP/HTTPS Serving:** Leverages Go's native CGI wrapper over `git-http-backend`, delivering complete out-of-the-box support for the Git Smart HTTP protocol (v1 and v2).
 - **Custom SSH Git Daemon:** Employs a secure, lightweight custom SSH server using `golang.org/x/crypto/ssh` that accepts public-key connections, handles directory traversal protection, and directly pipes connection channels into local `git-upload-pack` subprocesses.
-- **Flexible Path Resolution:** Resolves short paths like `/github/owner/repo` or `/gitlab/owner/repo` to their corresponding domains, and also supports arbitrary nested paths for GitLab subgroups (e.g., `/gitlab.com/org/subgroup1/subgroup2/repo`).
+- **Flexible Path Resolution:** Resolves short paths like `/github/owner/repo` or `/gitlab/owner/repo` to their corresponding domains, and also supports arbitrary nested paths for GitLab subgroups (e.g., `/gitlab.com/org/subgroup1/subgroup2/repo`). Only upstream hosts on the allowlist are proxied (see `-allowed-hosts`), so clients cannot point Evergit at internal services.
 
 ---
 
@@ -36,6 +36,7 @@ go build -o evergit ./cmd/evergit
 - `-ssh`: SSH listen address (default: `:2222`)
 - `-storage`: Directory path for storing host keys, cache mirrors, and converted repositories (default: `./storage`)
 - `-ttl`: Cache duration before checking upstream for updates (default: `5m`)
+- `-allowed-hosts`: Comma-separated upstream hosts clients may request; also settable via `EVERGIT_ALLOWED_HOSTS` (default: `github.com,gitlab.com,bitbucket.org`). Self-hosted forges must be added explicitly.
 
 ---
 

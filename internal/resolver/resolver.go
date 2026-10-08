@@ -6,7 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
+
+	"evergit/internal/config"
 )
 
 // validSegment restricts every path segment to characters that are safe both in a URL and on disk.
@@ -22,8 +25,11 @@ type RepositoryInfo struct {
 }
 
 // ParsePath parses a raw Git path (e.g. "github/owner/repo.git" or "github.com/org/sub/repo.git")
-// and resolves it into detailed repository information based on the storageRoot.
-func ParsePath(rawPath, storageRoot string) (*RepositoryInfo, error) {
+// and resolves it into detailed repository information based on the configured storage root.
+// Only hosts listed in cfg.AllowedHosts are accepted.
+func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
+	storageRoot := cfg.StorageRoot
+
 	path := strings.Trim(rawPath, "/")
 
 	// Git clients might append .git
@@ -41,7 +47,7 @@ func ParsePath(rawPath, storageRoot string) (*RepositoryInfo, error) {
 		}
 	}
 
-	domain := parts[0]
+	domain := strings.ToLower(parts[0])
 	repoName := parts[len(parts)-1]
 	ownerSegments := parts[1 : len(parts)-1]
 	owner := strings.Join(ownerSegments, "/")
@@ -56,9 +62,9 @@ func ParsePath(rawPath, storageRoot string) (*RepositoryInfo, error) {
 		domain = "bitbucket.org"
 	}
 
-	// Validate domain format (at least has a dot) to prevent arbitrary folders
-	if !strings.Contains(domain, ".") {
-		return nil, errors.New("invalid domain format: domain must be a FQDN or a known shorthand")
+	// Only proxy explicitly allowed upstreams, so clients cannot point Evergit at internal hosts
+	if !slices.Contains(cfg.AllowedHosts, domain) {
+		return nil, fmt.Errorf("upstream host %q is not allowed", domain)
 	}
 
 	// Rebuild remote URL
