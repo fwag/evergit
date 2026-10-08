@@ -96,8 +96,16 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, err)
 		}
+		if err := excludeBackupRefsFromFetch(info.MirrorPath); err != nil {
+			return false, err
+		}
 		return true, nil // Newly cloned, definitely changed
 	} else {
+		// Also applied here to migrate mirrors created before the exclusion existed
+		if err := excludeBackupRefsFromFetch(info.MirrorPath); err != nil {
+			return false, err
+		}
+
 		// Read current refs before fetching
 		oldRefsOutput, err := runCmd(info.MirrorPath, "git", "show-ref")
 		var oldRefs map[string]string
@@ -141,6 +149,24 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 
 		return false, nil // No changes detected!
 	}
+}
+
+// backupRefsNegativeRefspec keeps "git fetch --prune" from deleting our backup refs.
+// A --mirror clone fetches with "+refs/*:refs/*", so without it every ref absent upstream
+// (including refs/evergit-backups/*) is pruned. Requires Git >= 2.29.
+const backupRefsNegativeRefspec = "^refs/evergit-backups/*"
+
+func excludeBackupRefsFromFetch(mirrorPath string) error {
+	refspecs, _ := runCmd(mirrorPath, "git", "config", "--get-all", "remote.origin.fetch")
+	for _, refspec := range strings.Split(refspecs, "\n") {
+		if strings.TrimSpace(refspec) == backupRefsNegativeRefspec {
+			return nil
+		}
+	}
+	if _, err := runCmd(mirrorPath, "git", "config", "--add", "remote.origin.fetch", backupRefsNegativeRefspec); err != nil {
+		return fmt.Errorf("failed to exclude backup refs from fetch in %s: %w", mirrorPath, err)
+	}
+	return nil
 }
 
 func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.Writer) error {
@@ -413,19 +439,27 @@ func (m *Manager) backupForcePushedRefs(info *resolver.RepositoryInfo, oldRefs m
 		}
 
 		newOID, exists := newRefs[ref]
-		// If the ref was deleted or overwritten (force pushed)
-		if !exists || oldOID != newOID {
-			shortSHA := oldOID
-			if len(shortSHA) > 8 {
-				shortSHA = shortSHA[:8]
+		if exists && oldOID == newOID {
+			continue
+		}
+		// A fast-forwarded branch still reaches the old commit, so there is nothing to archive.
+		// Tags are always archived on change, since the old tag object itself would be lost.
+		if exists && strings.HasPrefix(ref, "refs/heads/") {
+			if _, err := runCmd(info.MirrorPath, "git", "merge-base", "--is-ancestor", oldOID, newOID); err == nil {
+				continue
 			}
-			backupRef := fmt.Sprintf("refs/evergit-backups/%s/%s-%s", strings.TrimPrefix(ref, "refs/"), nowStr, shortSHA)
+		}
+		// The ref was deleted or overwritten (force pushed)
+		shortSHA := oldOID
+		if len(shortSHA) > 8 {
+			shortSHA = shortSHA[:8]
+		}
+		backupRef := fmt.Sprintf("refs/evergit-backups/%s/%s-%s", strings.TrimPrefix(ref, "refs/"), nowStr, shortSHA)
 
-			log.Printf("[Backup] Creating backup reference %s pointing to old commit %s", backupRef, oldOID)
-			_, err := runCmd(info.MirrorPath, "git", "update-ref", backupRef, oldOID)
-			if err != nil {
-				log.Printf("WARNING: failed to create backup ref %s pointing to %s: %v", backupRef, oldOID, err)
-			}
+		log.Printf("[Backup] Creating backup reference %s pointing to old commit %s", backupRef, oldOID)
+		_, err := runCmd(info.MirrorPath, "git", "update-ref", backupRef, oldOID)
+		if err != nil {
+			log.Printf("WARNING: failed to create backup ref %s pointing to %s: %v", backupRef, oldOID, err)
 		}
 	}
 }

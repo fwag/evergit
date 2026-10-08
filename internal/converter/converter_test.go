@@ -297,4 +297,35 @@ func TestConverterBackupPreservation(t *testing.T) {
 	if !strings.Contains(refsOutputAfterThirdSync, backupRef) {
 		t.Errorf("Backup ref %s was DELETED or lost during incremental update!\nRemaining refs:\n%s", backupRef, refsOutputAfterThirdSync)
 	}
+
+	// 6. The backup must also survive in the mirror, which is the source of truth for full conversions
+	mirrorRefsOutput, err := runCmd(info.MirrorPath, "git", "show-ref")
+	if err != nil {
+		t.Fatalf("failed to show-ref in mirror after third sync: %v", err)
+	}
+	if !strings.Contains(mirrorRefsOutput, backupRef) {
+		t.Errorf("Backup ref %s was pruned from the mirror by fetch --prune!\nRemaining mirror refs:\n%s", backupRef, mirrorRefsOutput)
+	}
+
+	// The regular fast-forward update (Commit C) must not have created an extra backup
+	if n := strings.Count(mirrorRefsOutput, "refs/evergit-backups/"); n != 1 {
+		t.Errorf("Expected exactly 1 backup ref after a fast-forward update, got %d:\n%s", n, mirrorRefsOutput)
+	}
+
+	// 7. Force a full re-conversion by dropping the serving repository; the backup must be rebuilt from the mirror
+	if err := os.RemoveAll(info.ServingPath); err != nil {
+		t.Fatalf("failed to remove serving repo: %v", err)
+	}
+	err = manager.EnsureRepo(info, nil)
+	if err != nil {
+		t.Fatalf("Full re-conversion EnsureRepo failed: %v", err)
+	}
+
+	refsOutputAfterFullConversion, err := runCmd(info.ServingPath, "git", "show-ref")
+	if err != nil {
+		t.Fatalf("failed to show-ref after full re-conversion: %v", err)
+	}
+	if !strings.Contains(refsOutputAfterFullConversion, backupRef) {
+		t.Errorf("Backup ref %s was lost during full re-conversion!\nRemaining refs:\n%s", backupRef, refsOutputAfterFullConversion)
+	}
 }
