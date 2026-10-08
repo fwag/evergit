@@ -2,10 +2,12 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"evergit/internal/config"
@@ -60,6 +62,13 @@ func main() {
 		log.Fatalf("Failed to create storage root: %v", err)
 	}
 
+	lockFile, err := lockStorage(cfg.StorageRoot)
+	if err != nil {
+		log.Fatalf("Failed to lock storage root: %v", err)
+	}
+	// Also keeps the file referenced: a garbage-collected *os.File would close and release the lock
+	defer lockFile.Close()
+
 	convManager := converter.NewManager(cfg.StorageRoot, cfg.CacheTTL)
 
 	// Start SSH Server
@@ -79,4 +88,19 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != nil {
 		log.Fatalf("HTTP server failed: %v", err)
 	}
+}
+
+// lockStorage takes an exclusive lock on the storage root for the process lifetime. Repository
+// locks only coordinate within one process, so a second instance on the same storage would race.
+func lockStorage(root string) (*os.File, error) {
+	path := filepath.Join(root, "evergit.lock")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("%s is locked, is another Evergit instance using this storage? (%w)", path, err)
+	}
+	return f, nil
 }
