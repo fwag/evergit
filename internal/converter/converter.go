@@ -188,15 +188,25 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 			return false, err
 		}
 
-		// Read current refs before fetching
-		oldRefsOutput, err := runCmd(info.MirrorPath, "git", "show-ref")
-		var oldRefs map[string]string
-		if err == nil {
-			oldRefs = parseShowRef(oldRefsOutput)
+		// Read current refs before fetching: without this baseline, force-pushes cannot be archived
+		oldRefs, err := listRefs(info.MirrorPath)
+		if err != nil {
+			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
+				log.Printf("WARNING: cannot read refs of mirror %s (%v), skipping upstream fetch and serving cached repository", info.MirrorPath, err)
+				return false, nil
+			}
+			return false, fmt.Errorf("failed to read refs of mirror %s: %w", info.MirrorPath, err)
 		}
 
 		// Fetch updates
 		_, err = runCmdTimeout(upstreamTimeout, info.MirrorPath, "git", "fetch", "--prune")
+
+		// Archive overwritten/deleted refs even if the fetch failed midway, since it may already
+		// have pruned or updated some of them
+		if len(oldRefs) > 0 {
+			m.backupForcePushedRefs(info, oldRefs)
+		}
+
 		if err != nil {
 			// Check if we have an existing serving repository to fall back to
 			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
@@ -206,16 +216,10 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 			return false, fmt.Errorf("upstream fetch failed and no local cache available for %s: %w", info.RemoteURL, err)
 		}
 
-		// Create backup refs if there were old refs
-		if len(oldRefs) > 0 {
-			m.backupForcePushedRefs(info, oldRefs)
-		}
-
 		// Read new refs after fetching & backup creation
-		newRefsOutput, err := runCmd(info.MirrorPath, "git", "show-ref")
-		var newRefs map[string]string
-		if err == nil {
-			newRefs = parseShowRef(newRefsOutput)
+		newRefs, err := listRefs(info.MirrorPath)
+		if err != nil {
+			return false, fmt.Errorf("failed to read refs of mirror %s: %w", info.MirrorPath, err)
 		}
 
 		// Compare references to determine if anything changed
@@ -708,13 +712,12 @@ func parseMarkLine(line string, hashLen int) (mark, hash string, ok bool) {
 	return mark, hash, true
 }
 func (m *Manager) backupForcePushedRefs(info *resolver.RepositoryInfo, oldRefs map[string]string) {
-	// List new refs
-	newRefsOutput, err := runCmd(info.MirrorPath, "git", "show-ref")
+	newRefs, err := listRefs(info.MirrorPath)
 	if err != nil {
-		newRefsOutput = ""
+		// Without the current refs every ref would look deleted
+		log.Printf("WARNING: cannot read refs of mirror %s, skipping backups: %v", info.MirrorPath, err)
+		return
 	}
-
-	newRefs := parseShowRef(newRefsOutput)
 	nowStr := time.Now().Format("20060102-150405")
 
 	for ref, oldOID := range oldRefs {
@@ -749,6 +752,16 @@ func (m *Manager) backupForcePushedRefs(info *resolver.RepositoryInfo, oldRefs m
 			log.Printf("WARNING: failed to create backup ref %s pointing to %s: %v", backupRef, oldOID, err)
 		}
 	}
+}
+
+// listRefs returns refname -> object id for all refs. Unlike show-ref, for-each-ref succeeds on a
+// repository without refs, so an error always means the refs could not be read.
+func listRefs(repoPath string) (map[string]string, error) {
+	out, err := runCmd(repoPath, "git", "for-each-ref", "--format=%(objectname) %(refname)")
+	if err != nil {
+		return nil, err
+	}
+	return parseShowRef(out), nil
 }
 
 func parseShowRef(output string) map[string]string {
