@@ -21,13 +21,19 @@ import (
 type Manager struct {
 	cacheTTL  time.Duration
 	locksMu   sync.Mutex
-	repoLocks map[string]*sync.Mutex
+	repoLocks map[string]*repoLock
+}
+
+// repoLock is a per-repository mutex, reference-counted so idle entries can be dropped.
+type repoLock struct {
+	mu    sync.Mutex
+	users int
 }
 
 func NewManager(cacheTTL time.Duration) *Manager {
 	return &Manager{
 		cacheTTL:  cacheTTL,
-		repoLocks: make(map[string]*sync.Mutex),
+		repoLocks: make(map[string]*repoLock),
 	}
 }
 
@@ -40,17 +46,8 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 		progressWriter = async
 	}
 
-	// Get or create a per-repo lock
-	m.locksMu.Lock()
-	lock, exists := m.repoLocks[info.ServingPath]
-	if !exists {
-		lock = &sync.Mutex{}
-		m.repoLocks[info.ServingPath] = lock
-	}
-	m.locksMu.Unlock()
-
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := m.lockRepo(info.ServingPath)
+	defer unlock()
 
 	// 1. Check if the repository already exists and is within its TTL
 	if !m.needsSync(info) {
@@ -87,6 +84,29 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 	}
 
 	return nil
+}
+
+// lockRepo acquires the repository's lock and returns its release function. Entries are removed
+// once unused, so the map does not grow with every distinct path ever requested.
+func (m *Manager) lockRepo(key string) func() {
+	m.locksMu.Lock()
+	lock, exists := m.repoLocks[key]
+	if !exists {
+		lock = &repoLock{}
+		m.repoLocks[key] = lock
+	}
+	lock.users++
+	m.locksMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		m.locksMu.Lock()
+		if lock.users--; lock.users == 0 {
+			delete(m.repoLocks, key)
+		}
+		m.locksMu.Unlock()
+	}
 }
 
 // asyncWriter forwards writes from a goroutine and drops them when its buffer is full, so a

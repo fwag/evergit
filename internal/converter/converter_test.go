@@ -727,3 +727,24 @@ func TestStalledProgressWriterDoesNotBlockConversion(t *testing.T) {
 		t.Fatal("EnsureRepo blocked on a stalled progress writer while holding the repository lock")
 	}
 }
+
+func TestRepoLocksAreReleased(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	manager := NewManager(0)
+
+	for i := 0; i < 5; i++ {
+		if err := manager.EnsureRepo(newTestRepoInfo(t, upstreamPath), nil); err != nil {
+			t.Fatalf("EnsureRepo failed: %v", err)
+		}
+	}
+	// Failing requests (unreachable upstream) must not leak entries either
+	for i := 0; i < 5; i++ {
+		_ = manager.EnsureRepo(newTestRepoInfo(t, filepath.Join(t.TempDir(), "missing")), nil)
+	}
+
+	manager.locksMu.Lock()
+	defer manager.locksMu.Unlock()
+	if n := len(manager.repoLocks); n != 0 {
+		t.Errorf("%d repository locks retained after all requests finished", n)
+	}
+}
