@@ -3,7 +3,6 @@ package resolver
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -69,8 +68,8 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 
 	// Rebuild remote URL
 	var remoteURL string
-	if domain == "local.test" && os.Getenv("EVERGIT_TEST_UPSTREAM_DIR") != "" {
-		remoteURL = os.Getenv("EVERGIT_TEST_UPSTREAM_DIR")
+	if override, ok := cfg.UpstreamOverrides[domain]; ok {
+		remoteURL = override
 	} else {
 		remoteURL = "https://" + domain + "/" + owner + "/" + repoName + ".git"
 	}

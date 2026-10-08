@@ -64,17 +64,14 @@ func TestIntegration(t *testing.T) {
 		t.Fatalf("failed to commit: %v", err)
 	}
 
-	// 2. Set up environment variable for the resolver test-fallback
-	os.Setenv("EVERGIT_TEST_UPSTREAM_DIR", upstreamPath)
-	defer os.Unsetenv("EVERGIT_TEST_UPSTREAM_DIR")
-
-	// 3. Configure and start Evergit Servers
+	// 2. Configure and start Evergit Servers
 	cfg := &config.Config{
-		HTTPAddr:     "127.0.0.1:0",
-		SSHAddr:      "127.0.0.1:0",
-		StorageRoot:  filepath.Join(tempDir, "storage"),
-		CacheTTL:     5 * time.Minute,
-		AllowedHosts: []string{"local.test"},
+		HTTPAddr:          "127.0.0.1:0",
+		SSHAddr:           "127.0.0.1:0",
+		StorageRoot:       filepath.Join(tempDir, "storage"),
+		CacheTTL:          5 * time.Minute,
+		AllowedHosts:      []string{"local.test"},
+		UpstreamOverrides: map[string]string{"local.test": upstreamPath},
 	}
 
 	convManager := converter.NewManager(cfg.StorageRoot, cfg.CacheTTL)
@@ -107,7 +104,7 @@ func TestIntegration(t *testing.T) {
 		_ = http.Serve(httpListener, httpServer)
 	}()
 
-	// 4. Perform HTTP Clone and verify
+	// 3. Perform HTTP Clone and verify
 	t.Run("HTTP Clone JIT Conversion", func(t *testing.T) {
 		cloneHttpPath := filepath.Join(tempDir, "clone-http")
 		_, err := runCmd("", "git", "clone", fmt.Sprintf("http://%s/local.test/test/repo.git", cfg.HTTPAddr), cloneHttpPath)
@@ -134,7 +131,7 @@ func TestIntegration(t *testing.T) {
 		}
 	})
 
-	// 5. Perform SSH Clone and verify
+	// 4. Perform SSH Clone and verify
 	t.Run("SSH Clone JIT Conversion", func(t *testing.T) {
 		// Generate client key for authentication
 		clientKeyPath := filepath.Join(tempDir, "client_key")

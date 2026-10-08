@@ -17,6 +17,9 @@ type Config struct {
 	CacheTTL    time.Duration
 	// AllowedHosts lists the upstream hosts clients may request; anything else is rejected
 	AllowedHosts []string
+	// UpstreamOverrides maps a host to a local upstream path. Deliberately not exposed via flags
+	// or environment variables; tests set it to serve fixtures without network access.
+	UpstreamOverrides map[string]string
 }
 
 func Load() *Config {
