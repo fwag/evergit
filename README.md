@@ -106,16 +106,25 @@ curl -s http://localhost:8080/github.com/owner/repo.git/objects/loose-object-idx
 
 ##  Security Architecture
 
-1. **OS Command Injection Prevention:** Evergit completely avoids shell execution (`/bin/sh -c`). The custom SSH server parses incoming connection payloads structurally and invokes `os/exec.Command` directly with explicit arguments.
-2. **Directory Traversal Protection:** The path resolver resolves all repository targets into clean absolute paths and verifies that they strictly reside within the designated `storage/repos/` root directory.
-3. **Resource Efficiency:** Evergit pipes stdout from `git-fast-export` directly into the stdin of `git-fast-import` using OS memory pipes (`io.Pipe`). No massive, intermediate dump files are written to disk.
-4. **Fine-grained Concurrency Locking:** Concurrent clone requests targeting the same repository are serialized using safe, path-based mutexes, preventing CPU/IO exhaustion.
+1. **OS Command Injection Prevention:** Evergit completely avoids shell execution (`/bin/sh -c`). The custom SSH server parses incoming connection payloads structurally and invokes `os/exec.Command` directly with explicit arguments, and only `git-upload-pack` is allowed.
+2. **Path Validation:** Every repository path segment is restricted to `[A-Za-z0-9._-]` (no `.`/`..` or empty segments), and the resolved paths are verified to stay within the storage root, for both HTTP and SSH.
+3. **Upstream Allowlist:** Only hosts listed in `-allowed-hosts` are proxied, so clients cannot make Evergit reach internal services or arbitrary ports.
+4. **Isolated Git Environment:** Inherited variables that would redirect git to another repository (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, ...) are stripped from every git invocation.
+5. **Atomic Publishing:** Full conversions are built separately and published with an atomic symlink swap, so clients never observe a missing or half-written repository.
+6. **Bounded Operations:** HTTP header reads, SSH handshakes and upstream transfers have timeouts; stalled upstream transfers are aborted, and a slow client cannot stall a conversion.
+7. **Concurrency Locking:** Syncs and conversions of the same repository are serialized with per-repository mutexes, and an exclusive lock on the storage root prevents two Evergit instances from sharing it.
+
+### Deployment Recommendations
+
+- **Serve over HTTPS.** Evergit speaks plain HTTP. Put it behind a TLS-terminating reverse proxy: the SHA-1 ↔ SHA-256 lookups and `loose-object-idx` are trusted by clients to translate legacy ids, and a tampered answer would point them at a different commit.
+- **Rate-limit and authenticate at the proxy.** Evergit has no authentication, quotas or rate limits; every request for a new repository triggers an upstream clone and a full conversion. The SSH server accepts any public key, as it is intended for anonymous read-only access.
+- **Archived history is kept forever.** Backup refs under `refs/evergit-backups/` are never expired; repositories with frequent force-pushes grow accordingly.
 
 ---
 
 ##  Testing
 
-Evergit has excellent test coverage including high-fidelity end-to-end integration tests that spin up ephemeral servers on the fly and verify clone compatibility against real `git` clients:
+The test suite runs against real `git` binaries: unit tests for path resolution, conversion, force-push archival, the compatibility map and failure recovery, plus end-to-end tests that start ephemeral HTTP/SSH servers and clone from them. Tests isolate git from your global configuration.
 
 ```bash
 go test -v ./...
