@@ -430,3 +430,42 @@ func TestCompatMapRecoversWhenMissing(t *testing.T) {
 	}
 	assertCompatMapComplete(t, info.ServingPath)
 }
+
+func TestDeletedBranchIsNoLongerServed(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	_, _ = runCmd(upstreamPath, "git", "branch", "feature")
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager("", 0)
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("initial EnsureRepo failed: %v", err)
+	}
+
+	// A backup that only survives in the serving repo (pruned from mirrors by older versions)
+	mainOID, _ := runCmd(info.ServingPath, "git", "rev-parse", "refs/heads/main")
+	legacyBackup := "refs/evergit-backups/heads/legacy/20260101-000000-abcdef12"
+	if _, err := runCmd(info.ServingPath, "git", "update-ref", legacyBackup, mainOID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runCmd(upstreamPath, "git", "branch", "-D", "feature"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo after deletion failed: %v", err)
+	}
+
+	refs, err := runCmd(info.ServingPath, "git", "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(refs, "refs/heads/feature\n") || strings.HasSuffix(refs, "refs/heads/feature") {
+		t.Errorf("deleted branch is still served:\n%s", refs)
+	}
+	if !strings.Contains(refs, "refs/evergit-backups/heads/feature/") {
+		t.Errorf("deleted branch was not archived:\n%s", refs)
+	}
+	if !strings.Contains(refs, legacyBackup) {
+		t.Errorf("legacy backup %s was removed:\n%s", legacyBackup, refs)
+	}
+}

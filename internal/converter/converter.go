@@ -301,6 +301,13 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		return fmt.Errorf("git fast-import failed: %v (stderr: %q)", importErr, strings.TrimSpace(importErrBuf.String()))
 	}
 
+	// fast-import never deletes refs, so drop the ones that no longer exist in the mirror
+	if isIncremental {
+		if err := pruneServingRefs(info); err != nil {
+			return err
+		}
+	}
+
 	// Enable/Restore SHA1 compatibility mapping on the repository
 	_, err = runCmd(targetPath, "git", "--git-dir=.", "config", "extensions.compatObjectFormat", "sha1")
 	if err != nil {
@@ -342,6 +349,45 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 	// Log the translated backup refs to show both SHA256 and SHA1 mappings
 	m.logBackupRefs(info)
 
+	return nil
+}
+
+// pruneServingRefs deletes serving refs that are absent from the mirror, e.g. branches deleted
+// upstream (their history is archived under refs/evergit-backups/ by backupForcePushedRefs).
+// Backup refs are never pruned: older versions lost some from the mirror, leaving the serving
+// repo as their only copy.
+func pruneServingRefs(info *resolver.RepositoryInfo) error {
+	mirrorRefs, err := runCmd(info.MirrorPath, "git", "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		return err
+	}
+	servingRefs, err := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		return err
+	}
+
+	inMirror := make(map[string]bool)
+	for _, ref := range strings.Split(mirrorRefs, "\n") {
+		inMirror[ref] = true
+	}
+	var deletions strings.Builder
+	for _, ref := range strings.Split(servingRefs, "\n") {
+		if ref == "" || inMirror[ref] || strings.HasPrefix(ref, "refs/evergit-backups/") {
+			continue
+		}
+		log.Printf("[Prune] Removing ref %s, no longer present upstream", ref)
+		fmt.Fprintf(&deletions, "delete %s\n", ref)
+	}
+	if deletions.Len() == 0 {
+		return nil
+	}
+
+	cmd := exec.Command("git", "--git-dir=.", "update-ref", "--stdin")
+	cmd.Dir = info.ServingPath
+	cmd.Stdin = strings.NewReader(deletions.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to prune refs in %s: %w (output: %q)", info.ServingPath, err, strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 
