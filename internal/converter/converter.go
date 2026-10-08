@@ -174,17 +174,19 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 
 	if os.IsNotExist(statErr) {
 		// Clone as a bare mirror
-		_, err := runCmdTimeout(upstreamTimeout, "", "git", "clone", "--mirror", info.RemoteURL, info.MirrorPath)
+		// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
+		// thousands of refs/pull/* from forks
+		_, err := runCmdTimeout(upstreamTimeout, "", "git", "clone", "--bare", info.RemoteURL, info.MirrorPath)
 		if err != nil {
 			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, err)
 		}
-		if err := excludeBackupRefsFromFetch(info.MirrorPath); err != nil {
+		if err := configureMirrorRefs(info.MirrorPath); err != nil {
 			return false, err
 		}
 		return true, nil // Newly cloned, definitely changed
 	} else {
-		// Also applied here to migrate mirrors created before the exclusion existed
-		if err := excludeBackupRefsFromFetch(info.MirrorPath); err != nil {
+		// Also applied here to migrate mirrors created by earlier versions with "clone --mirror"
+		if err := configureMirrorRefs(info.MirrorPath); err != nil {
 			return false, err
 		}
 
@@ -247,20 +249,48 @@ func looksLikeBareRepo(path string) bool {
 	return err == nil && fi.IsDir()
 }
 
-// backupRefsNegativeRefspec keeps "git fetch --prune" from deleting our backup refs.
-// A --mirror clone fetches with "+refs/*:refs/*", so without it every ref absent upstream
-// (including refs/evergit-backups/*) is pruned. Requires Git >= 2.29.
-const backupRefsNegativeRefspec = "^refs/evergit-backups/*"
+// mirrorRefspecs restrict the mirror to branches and tags. Forge refs (refs/pull/*,
+// refs/merge-requests/*, ...) are not needed and can number in the tens of thousands. Being
+// scoped to heads and tags, "git fetch --prune" can never delete refs/evergit-backups/*.
+var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
-func excludeBackupRefsFromFetch(mirrorPath string) error {
-	refspecs, _ := runCmd(mirrorPath, "git", "config", "--get-all", "remote.origin.fetch")
-	for _, refspec := range strings.Split(refspecs, "\n") {
-		if strings.TrimSpace(refspec) == backupRefsNegativeRefspec {
-			return nil
+// configureMirrorRefs sets the mirror's fetch refspecs and, for mirrors created by earlier
+// versions with "clone --mirror", deletes the refs outside of them once.
+func configureMirrorRefs(mirrorPath string) error {
+	current, _ := runCmd(mirrorPath, "git", "config", "--get-all", "remote.origin.fetch")
+	if current == strings.Join(mirrorRefspecs, "\n") {
+		return nil
+	}
+
+	if _, err := runCmd(mirrorPath, "git", "config", "--replace-all", "remote.origin.fetch", mirrorRefspecs[0]); err != nil {
+		return fmt.Errorf("failed to configure fetch refspecs in %s: %w", mirrorPath, err)
+	}
+	for _, refspec := range mirrorRefspecs[1:] {
+		if _, err := runCmd(mirrorPath, "git", "config", "--add", "remote.origin.fetch", refspec); err != nil {
+			return fmt.Errorf("failed to configure fetch refspecs in %s: %w", mirrorPath, err)
 		}
 	}
-	if _, err := runCmd(mirrorPath, "git", "config", "--add", "remote.origin.fetch", backupRefsNegativeRefspec); err != nil {
-		return fmt.Errorf("failed to exclude backup refs from fetch in %s: %w", mirrorPath, err)
+
+	refs, err := listRefs(mirrorPath)
+	if err != nil {
+		return err
+	}
+	var deletions strings.Builder
+	for ref := range refs {
+		if !strings.HasPrefix(ref, "refs/heads/") && !strings.HasPrefix(ref, "refs/tags/") && !strings.HasPrefix(ref, "refs/evergit-backups/") {
+			fmt.Fprintf(&deletions, "delete %s\n", ref)
+		}
+	}
+	if deletions.Len() == 0 {
+		return nil
+	}
+	log.Printf("Migrating mirror %s to branches and tags only", mirrorPath)
+	cmd := exec.Command("git", "update-ref", "--stdin")
+	cmd.Dir = mirrorPath
+	cmd.Env = GitEnv()
+	cmd.Stdin = strings.NewReader(deletions.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to remove non-branch refs from %s: %w (output: %q)", mirrorPath, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

@@ -788,3 +788,52 @@ func TestInheritedGitEnvironmentIsIgnored(t *testing.T) {
 	}
 	assertCompatMapComplete(t, info.ServingPath)
 }
+
+func assertOnlyBranchesAndTags(t *testing.T, label, repoPath string) {
+	t.Helper()
+	refs, err := runCmd(repoPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range strings.Split(refs, "\n") {
+		if !strings.HasPrefix(ref, "refs/heads/") && !strings.HasPrefix(ref, "refs/tags/") && !strings.HasPrefix(ref, "refs/evergit-backups/") {
+			t.Errorf("%s contains unexpected ref %s", label, ref)
+		}
+	}
+}
+
+func TestOnlyBranchesAndTagsAreMirrored(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	head, _ := runCmd(upstreamPath, "git", "rev-parse", "HEAD")
+	_, _ = runCmd(upstreamPath, "git", "tag", "v1.0")
+	// Forge-specific refs, e.g. GitHub pull requests from forks
+	_, _ = runCmd(upstreamPath, "git", "update-ref", "refs/pull/1/head", head)
+	_, _ = runCmd(upstreamPath, "git", "update-ref", "refs/merge-requests/1/head", head)
+
+	info := newTestRepoInfo(t, upstreamPath)
+	if err := NewManager(0).EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo failed: %v", err)
+	}
+	assertOnlyBranchesAndTags(t, "mirror", info.MirrorPath)
+	assertOnlyBranchesAndTags(t, "serving repo", info.ServingPath)
+	if refs, _ := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)"); !strings.Contains(refs, "refs/tags/v1.0") {
+		t.Errorf("tag missing from serving repo:\n%s", refs)
+	}
+}
+
+func TestLegacyFullMirrorIsMigrated(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	head, _ := runCmd(upstreamPath, "git", "rev-parse", "HEAD")
+	_, _ = runCmd(upstreamPath, "git", "update-ref", "refs/pull/1/head", head)
+	info := newTestRepoInfo(t, upstreamPath)
+
+	// Mirror as created by earlier versions: every upstream ref
+	if _, err := runCmd("", "git", "clone", "-q", "--mirror", upstreamPath, info.MirrorPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewManager(0).EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo failed: %v", err)
+	}
+	assertOnlyBranchesAndTags(t, "migrated mirror", info.MirrorPath)
+	assertOnlyBranchesAndTags(t, "serving repo", info.ServingPath)
+}
