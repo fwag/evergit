@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -61,18 +62,30 @@ func (s *SSHServer) Start() (net.Listener, error) {
 	s.cfg.SSHAddr = listener.Addr().String()
 	log.Printf("Starting Evergit SSH Server on %s", s.cfg.SSHAddr)
 
-	go func() {
-		for {
-			nConn, err := listener.Accept()
-			if err != nil {
-				log.Printf("[SSH] Accept failed: %v", err)
-				return
-			}
-			go s.handleConn(nConn)
-		}
-	}()
+	go s.acceptLoop(listener)
 
 	return listener, nil
+}
+
+// acceptLoop serves connections until the listener is closed, retrying transient errors
+// (e.g. EMFILE) with backoff instead of silently stopping SSH for the process lifetime.
+func (s *SSHServer) acceptLoop(listener net.Listener) {
+	const initialBackoff = 5 * time.Millisecond
+	backoff := initialBackoff
+	for {
+		nConn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("[SSH] Accept failed, retrying in %v: %v", backoff, err)
+			time.Sleep(backoff)
+			backoff = min(backoff*2, time.Second)
+			continue
+		}
+		backoff = initialBackoff
+		go s.handleConn(nConn)
+	}
 }
 
 // handshakeTimeout bounds how long an unauthenticated connection may take to complete the handshake.
@@ -130,7 +143,8 @@ func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			return
 
 		case "env":
-			req.Reply(true, nil)
+			// Environment variables are not applied, so do not claim otherwise
+			req.Reply(false, nil)
 
 		default:
 			req.Reply(false, nil)
@@ -231,6 +245,10 @@ func getOrCreateHostKey(path string) (ssh.Signer, error) {
 	if err == nil {
 		return ssh.ParsePrivateKey(data)
 	}
+	// Only generate a key when none exists; replacing an unreadable one would change the host identity
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("failed to read SSH host key %s: %w", path, err)
+	}
 
 	log.Println("[SSH] Generating new RSA host key...")
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -243,13 +261,22 @@ func getOrCreateHostKey(path string) (ssh.Signer, error) {
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	}
 
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, fs.ErrExist) {
+		// Another process created the key concurrently; use theirs
+		return getOrCreateHostKey(path)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
 	if err := pem.Encode(f, privateKeyPEM); err != nil {
+		f.Close()
+		os.Remove(path)
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
 		return nil, err
 	}
 
