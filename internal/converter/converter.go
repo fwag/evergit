@@ -66,6 +66,10 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 			if err := ensureLooseObjectIdx(info.ServingPath); err != nil {
 				return err
 			}
+			// Repairs the setting if a previous conversion was killed mid-import
+			if err := enableCompatObjectFormat(info.ServingPath); err != nil {
+				return err
+			}
 			now := time.Now()
 			_ = os.Chtimes(servingHeadPath, now, now)
 			return nil
@@ -204,6 +208,11 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 
 		// Temporarily unset compatObjectFormat so git fast-import does not crash on existing tree mapping checks
 		_, _ = runCmd(targetPath, "git", "--git-dir=.", "config", "--unset", "extensions.compatObjectFormat")
+		defer func() {
+			if err := enableCompatObjectFormat(targetPath); err != nil {
+				log.Printf("WARNING: %v", err)
+			}
+		}()
 
 		exportFlags = []string{"--all", "--signed-commits=strip", "--tag-of-filtered-object=rewrite", "--import-marks=" + sha1MarksPath, "--export-marks=" + sha1MarksPath}
 		importFlags = []string{"--force", "--import-marks=" + sha256MarksPath, "--export-marks=" + sha256MarksPath}
@@ -308,10 +317,11 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		}
 	}
 
-	// Enable/Restore SHA1 compatibility mapping on the repository
-	_, err = runCmd(targetPath, "git", "--git-dir=.", "config", "extensions.compatObjectFormat", "sha1")
-	if err != nil {
-		log.Printf("WARNING: failed to configure extensions.compatObjectFormat in %s: %v", targetPath, err)
+	// Enable SHA1 compatibility mapping on the new repository (restored by the deferred call when incremental)
+	if !isIncremental {
+		if err := enableCompatObjectFormat(targetPath); err != nil {
+			log.Printf("WARNING: %v", err)
+		}
 	}
 
 	// Get HEAD symbolic-ref from mirror
@@ -349,6 +359,17 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 	// Log the translated backup refs to show both SHA256 and SHA1 mappings
 	m.logBackupRefs(info)
 
+	return nil
+}
+
+// enableCompatObjectFormat sets extensions.compatObjectFormat=sha1 unless it is already set.
+func enableCompatObjectFormat(repoPath string) error {
+	if format, err := runCmd(repoPath, "git", "--git-dir=.", "config", "extensions.compatObjectFormat"); err == nil && format == "sha1" {
+		return nil
+	}
+	if _, err := runCmd(repoPath, "git", "--git-dir=.", "config", "extensions.compatObjectFormat", "sha1"); err != nil {
+		return fmt.Errorf("failed to configure extensions.compatObjectFormat in %s: %w", repoPath, err)
+	}
 	return nil
 }
 

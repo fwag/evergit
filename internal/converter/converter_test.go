@@ -469,3 +469,49 @@ func TestDeletedBranchIsNoLongerServed(t *testing.T) {
 		t.Errorf("legacy backup %s was removed:\n%s", legacyBackup, refs)
 	}
 }
+
+func assertCompatObjectFormat(t *testing.T, servingPath string) {
+	t.Helper()
+	format, err := runCmd(servingPath, "git", "--git-dir=.", "config", "extensions.compatObjectFormat")
+	if err != nil || format != "sha1" {
+		t.Errorf("extensions.compatObjectFormat = %q (err %v), want sha1", format, err)
+	}
+}
+
+func TestCompatObjectFormatRestoredAfterFailedImport(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager("", 0)
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("initial EnsureRepo failed: %v", err)
+	}
+
+	// Corrupt the marks so the incremental fast-import fails
+	if err := os.WriteFile(filepath.Join(info.ServingPath, "evergit-sha256-marks.txt"), []byte("garbage\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	commitToUpstream(t, upstreamPath, "commit 1")
+	if err := manager.EnsureRepo(info, nil); err == nil {
+		t.Fatal("expected incremental EnsureRepo to fail with corrupted marks")
+	}
+	assertCompatObjectFormat(t, info.ServingPath)
+}
+
+func TestCompatObjectFormatRestoredOnNoOpSync(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager("", 0)
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("initial EnsureRepo failed: %v", err)
+	}
+	// Simulate a crash during a previous incremental conversion
+	if _, err := runCmd(info.ServingPath, "git", "--git-dir=.", "config", "--unset", "extensions.compatObjectFormat"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("no-op EnsureRepo failed: %v", err)
+	}
+	assertCompatObjectFormat(t, info.ServingPath)
+}
