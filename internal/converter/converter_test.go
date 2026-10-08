@@ -748,3 +748,25 @@ func TestRepoLocksAreReleased(t *testing.T) {
 		t.Errorf("%d repository locks retained after all requests finished", n)
 	}
 }
+
+func TestGenerateLooseObjectIdxSkipsMalformedMarks(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "objects"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	sha1A, sha256A := strings.Repeat("a", 40), strings.Repeat("1", 64)
+	sha1B, sha256B := strings.Repeat("b", 40), strings.Repeat("2", 64)
+	sha1Marks := ":1 " + sha1A + "\n:2 " + sha1B + "\n:3 " + strings.Repeat("c", 17) + "\n:4 not-a-hash-at-all-not-a-hash-at-all-xx\n"
+	sha256Marks := ":1 " + sha256A + "\n:2 " + sha256B + "\n:3 " + strings.Repeat("3", 64) + "\n:4 " + strings.Repeat("4", 64) + "\n:5 " + strings.Repeat("5", 30)
+	_ = os.WriteFile(filepath.Join(repo, "evergit-sha1-marks.txt"), []byte(sha1Marks), 0644)
+	_ = os.WriteFile(filepath.Join(repo, "evergit-sha256-marks.txt"), []byte(sha256Marks), 0644)
+
+	if err := generateLooseObjectIdx(repo); err != nil {
+		t.Fatal(err)
+	}
+	idx, _ := os.ReadFile(filepath.Join(repo, "objects", "loose-object-idx"))
+	want := "# loose-object-idx\n" + sha256A + " " + sha1A + "\n" + sha256B + " " + sha1B + "\n"
+	if string(idx) != want {
+		t.Errorf("loose-object-idx =\n%s\nwant\n%s", idx, want)
+	}
+}

@@ -587,34 +587,49 @@ func runCmdTimeout(timeout time.Duration, dir, name string, args ...string) (str
 // generateLooseObjectIdx rebuilds objects/loose-object-idx by pairing the SHA1 and SHA256 marks files.
 // Both files always hold every mark (fast-export/fast-import rewrite them in full), so the map is
 // rebuilt from scratch rather than appended to, and swapped in atomically for concurrent readers.
+// Only the SHA1 marks are held in memory (fast-export writes them unordered); the SHA256 marks are
+// streamed in mark order straight to the output. Malformed lines, e.g. truncated by a crash, are skipped.
 func generateLooseObjectIdx(repoPath string) error {
-	sha1MarksPath := filepath.Join(repoPath, "evergit-sha1-marks.txt")
-	sha256MarksPath := filepath.Join(repoPath, "evergit-sha256-marks.txt")
-
-	sha1Marks, err := parseMarksFile(sha1MarksPath)
+	sha1Marks, err := parseMarksFile(filepath.Join(repoPath, "evergit-sha1-marks.txt"), 40)
 	if err != nil {
 		return fmt.Errorf("failed to parse SHA1 marks: %w", err)
 	}
 
-	sha256Marks, err := parseMarksFile(sha256MarksPath)
+	sha256File, err := os.Open(filepath.Join(repoPath, "evergit-sha256-marks.txt"))
 	if err != nil {
-		return fmt.Errorf("failed to parse SHA256 marks: %w", err)
+		return fmt.Errorf("failed to open SHA256 marks: %w", err)
 	}
-
-	// Build the mapping content
-	var sb strings.Builder
-	sb.WriteString("# loose-object-idx\n")
-
-	for mark, sha1Hash := range sha1Marks {
-		sha256Hash, ok := sha256Marks[mark]
-		if ok {
-			sb.WriteString(fmt.Sprintf("%s %s\n", sha256Hash, sha1Hash))
-		}
-	}
+	defer sha256File.Close()
 
 	idxPath := filepath.Join(repoPath, "objects", "loose-object-idx")
 	tmpPath := idxPath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(sb.String()), 0644); err != nil {
+	out, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("failed to create loose-object-idx file: %w", err)
+	}
+	defer os.Remove(tmpPath) // No-op once renamed
+
+	w := bufio.NewWriter(out)
+	_, _ = w.WriteString("# loose-object-idx\n")
+	scanner := bufio.NewScanner(sha256File)
+	for scanner.Scan() {
+		mark, sha256Hash, ok := parseMarkLine(scanner.Text(), 64)
+		if !ok {
+			continue
+		}
+		if sha1Hash, ok := sha1Marks[mark]; ok {
+			_, _ = fmt.Fprintf(w, "%s %s\n", sha256Hash, sha1Hash)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		out.Close()
+		return fmt.Errorf("failed to read SHA256 marks: %w", err)
+	}
+	if err := w.Flush(); err != nil {
+		out.Close()
+		return fmt.Errorf("failed to write loose-object-idx file: %w", err)
+	}
+	if err := out.Close(); err != nil {
 		return fmt.Errorf("failed to write loose-object-idx file: %w", err)
 	}
 	if err := os.Rename(tmpPath, idxPath); err != nil {
@@ -641,27 +656,32 @@ func ensureLooseObjectIdx(repoPath string) error {
 	return nil
 }
 
-func parseMarksFile(path string) (map[string]string, error) {
-	data, err := os.ReadFile(path)
+// parseMarksFile reads a marks file into a mark -> hash map, skipping malformed lines.
+func parseMarksFile(path string, hashLen int) (map[string]string, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 
 	marks := make(map[string]string)
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) == 2 {
-			marks[parts[0]] = parts[1]
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if mark, hash, ok := parseMarkLine(scanner.Text(), hashLen); ok {
+			marks[mark] = hash
 		}
 	}
-	return marks, nil
+	return marks, scanner.Err()
 }
 
+// parseMarkLine parses ":<mark> <hash>", requiring hash to be hashLen lowercase hex digits.
+func parseMarkLine(line string, hashLen int) (mark, hash string, ok bool) {
+	mark, hash, found := strings.Cut(strings.TrimSpace(line), " ")
+	if !found || len(mark) < 2 || mark[0] != ':' || len(hash) != hashLen || strings.Trim(hash, "0123456789abcdef") != "" {
+		return "", "", false
+	}
+	return mark, hash, true
+}
 func (m *Manager) backupForcePushedRefs(info *resolver.RepositoryInfo, oldRefs map[string]string) {
 	// List new refs
 	newRefsOutput, err := runCmd(info.MirrorPath, "git", "show-ref")
@@ -725,52 +745,30 @@ func parseShowRef(output string) map[string]string {
 }
 
 func (m *Manager) logBackupRefs(info *resolver.RepositoryInfo) {
-	// List all refs in the serving repo
-	showRefOut, err := runCmd(info.ServingPath, "git", "--git-dir=.", "show-ref")
-	if err != nil {
+	backupRefsOut, err := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(objectname) %(refname)", "refs/evergit-backups/")
+	if err != nil || backupRefsOut == "" {
 		return
 	}
+	backups := parseShowRef(backupRefsOut) // refname -> sha256
 
-	// Parse loose-object-idx to map sha256 -> sha1
-	idxPath := filepath.Join(info.ServingPath, "objects", "loose-object-idx")
-	idxData, err := os.ReadFile(idxPath)
-	if err != nil {
-		return
-	}
-
+	// One pass over the translation map, keeping only the backup targets
 	sha256ToSha1 := make(map[string]string)
-	lines := strings.Split(string(idxData), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) == 2 {
-			sha256ToSha1[parts[0]] = parts[1]
-		}
+	for _, sha256 := range backups {
+		sha256ToSha1[sha256] = "unknown"
 	}
-
-	// Print mapping for each backup ref
-	refLines := strings.Split(showRefOut, "\n")
-	for _, refLine := range refLines {
-		refLine = strings.TrimSpace(refLine)
-		if refLine == "" {
-			continue
-		}
-		parts := strings.SplitN(refLine, " ", 2)
-		if len(parts) == 2 {
-			sha256 := parts[0]
-			refName := parts[1]
-
-			if strings.HasPrefix(refName, "refs/evergit-backups/") {
-				sha1, ok := sha256ToSha1[sha256]
-				if !ok {
-					sha1 = "unknown"
-				}
-				log.Printf("[Backup] Preserved history: %s -> SHA256: %s (SHA1: %s)", refName, sha256, sha1)
+	if f, err := os.Open(filepath.Join(info.ServingPath, "objects", "loose-object-idx")); err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			sha256, sha1, found := strings.Cut(scanner.Text(), " ")
+			if _, wanted := sha256ToSha1[sha256]; found && wanted {
+				sha256ToSha1[sha256] = sha1
 			}
 		}
+		f.Close()
+	}
+
+	for refName, sha256 := range backups {
+		log.Printf("[Backup] Preserved history: %s -> SHA256: %s (SHA1: %s)", refName, sha256, sha256ToSha1[sha256])
 	}
 }
 
