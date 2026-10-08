@@ -497,8 +497,12 @@ func TestCompatObjectFormatRestoredAfterFailedImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	commitToUpstream(t, upstreamPath, "commit 1")
-	if err := manager.EnsureRepo(info, nil); err == nil {
+	err := manager.EnsureRepo(info, nil)
+	if err == nil {
 		t.Fatal("expected incremental EnsureRepo to fail with corrupted marks")
+	}
+	if strings.Contains(err.Error(), `stderr: ""`) {
+		t.Errorf("fast-import failure should include its stderr, got: %v", err)
 	}
 	assertCompatObjectFormat(t, info.ServingPath)
 }

@@ -270,14 +270,19 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 	if err := importCmd.Start(); err != nil {
 		_ = r.Close()
 		_ = w.Close()
+		_ = exportCmd.Process.Kill()
+		_ = exportCmd.Wait()
 		return fmt.Errorf("failed to start git fast-import: %w", err)
 	}
 
-	// Stream stderr of fast-import in real-time
+	// Stream stderr of fast-import in real-time, keeping it for error reporting
+	stderrDone := make(chan struct{})
 	go func() {
+		defer close(stderrDone)
 		scanner := bufio.NewScanner(importStderrPipe)
 		for scanner.Scan() {
 			line := scanner.Text()
+			importErrBuf.WriteString(line + "\n")
 			log.Printf("[%s fast-import] %s", info.RepoName, line)
 			if progressWriter != nil {
 				_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [Progress] %s\n", line)
@@ -292,22 +297,25 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		exportErrChan <- err
 	}()
 
+	// All stderr reads must complete before Wait closes the pipe
+	<-stderrDone
 	importErr := importCmd.Wait()
 	_ = r.Close()
 
 	exportErr := <-exportErrChan
 
-	if exportErr != nil {
-		if !isIncremental {
-			os.RemoveAll(targetPath)
-		}
-		return fmt.Errorf("git fast-export failed: %v (stderr: %q)", exportErr, strings.TrimSpace(exportErrBuf.String()))
-	}
+	// Check fast-import first: when it fails, fast-export usually fails too, on a broken pipe
 	if importErr != nil {
 		if !isIncremental {
 			os.RemoveAll(targetPath)
 		}
 		return fmt.Errorf("git fast-import failed: %v (stderr: %q)", importErr, strings.TrimSpace(importErrBuf.String()))
+	}
+	if exportErr != nil {
+		if !isIncremental {
+			os.RemoveAll(targetPath)
+		}
+		return fmt.Errorf("git fast-export failed: %v (stderr: %q)", exportErr, strings.TrimSpace(exportErrBuf.String()))
 	}
 
 	// fast-import never deletes refs, so drop the ones that no longer exist in the mirror
