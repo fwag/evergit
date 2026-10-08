@@ -1,12 +1,14 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/http/cgi"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -47,6 +49,14 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 	s.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[HTTP] Request: %s %s", r.Method, r.URL.Path)
 
+		// SHA-1 <-> SHA-256 id lookups: /<repo>/sha1/<id> and /<repo>/sha256/<id>
+		if m := idLookupPath.FindStringSubmatch(r.URL.Path); m != nil {
+			if info, err := resolver.ParsePath(m[1], cfg); err == nil {
+				serveIDLookup(w, conv, info, m[2], m[3])
+				return
+			}
+		}
+
 		// Parse the repository info from the request path
 		repoPath, ok := extractRepoPath(r.URL.Path)
 		if !ok {
@@ -81,6 +91,33 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 	})
 
 	return s, nil
+}
+
+var idLookupPath = regexp.MustCompile(`^/(.+)/(sha1|sha256)/([^/]+)$`)
+
+// serveIDLookup answers with the id of the same object in the other hash format, as plain text.
+func serveIDLookup(w http.ResponseWriter, conv *converter.Manager, info *resolver.RepositoryInfo, format, id string) {
+	if err := conv.EnsureRepo(info, nil); err != nil {
+		log.Printf("[HTTP] JIT conversion failed for %s: %v", info.RepoName, err)
+		http.Error(w, "Internal Server Error (gitconv failure)", http.StatusInternalServerError)
+		return
+	}
+
+	translated, err := converter.LookupID(info.ServingPath, format, id)
+	switch {
+	case err == nil:
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintln(w, translated)
+	case errors.Is(err, converter.ErrIDInvalid):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, converter.ErrIDNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, converter.ErrIDAmbiguous):
+		http.Error(w, err.Error(), http.StatusConflict)
+	default:
+		log.Printf("[HTTP] id lookup failed for %s: %v", info.RepoName, err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
 }
 
 func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {

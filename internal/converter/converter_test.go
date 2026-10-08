@@ -1,6 +1,7 @@
 package converter
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -652,5 +653,50 @@ func TestBrokenMirrorIsRecloned(t *testing.T) {
 	}
 	if out, _ := runCmd(parentRepo, "git", "config", "--get-all", "remote.origin.fetch"); out != "" {
 		t.Errorf("unrelated parent repository was modified: remote.origin.fetch = %q", out)
+	}
+}
+
+func TestLookupID(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "objects"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	a256, a1 := "aa"+strings.Repeat("1", 62), "ab12345"+strings.Repeat("1", 33)
+	b256, b1 := "aa"+strings.Repeat("2", 62), "ab12399"+strings.Repeat("2", 33)
+	idx := "# loose-object-idx\n" + a256 + " " + a1 + "\n" + b256 + " " + b1 + "\n"
+	if err := os.WriteFile(filepath.Join(repo, "objects", "loose-object-idx"), []byte(idx), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		format, id, want string
+		wantErr          error
+	}{
+		{"sha1", a1, a256, nil},
+		{"sha1", "AB12345", a256, nil},
+		{"sha1", "ab123", "", ErrIDInvalid}, // shorter than 7
+		{"sha1", "ab12300", "", ErrIDNotFound},
+		{"sha1", "ab1239", "", ErrIDInvalid},
+		{"sha256", b256, b1, nil},
+		{"sha256", "aa22222", b1, nil},
+		{"sha256", "aaaaaaa", "", ErrIDNotFound},
+		{"sha1", a1 + "0", "", ErrIDInvalid}, // longer than a SHA-1
+		{"sha256", "aa", "", ErrIDInvalid},
+		{"md5", a1, "", ErrIDInvalid},
+	}
+	for _, tt := range tests {
+		got, err := LookupID(repo, tt.format, tt.id)
+		if !errors.Is(err, tt.wantErr) || got != tt.want {
+			t.Errorf("LookupID(%s, %s) = %q, %v; want %q, %v", tt.format, tt.id, got, err, tt.want, tt.wantErr)
+		}
+	}
+
+	// Two SHA-1s share the prefix "ab123"; make it long enough to be valid but still ambiguous
+	if err := os.WriteFile(filepath.Join(repo, "objects", "loose-object-idx"),
+		[]byte(idx+"cc"+strings.Repeat("3", 62)+" ab12345"+strings.Repeat("3", 33)+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LookupID(repo, "sha1", "ab12345"); !errors.Is(err, ErrIDAmbiguous) {
+		t.Errorf("ambiguous prefix: err = %v, want ErrIDAmbiguous", err)
 	}
 }

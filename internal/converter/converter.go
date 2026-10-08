@@ -3,6 +3,7 @@ package converter
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -709,4 +710,59 @@ func (m *Manager) logBackupRefs(info *resolver.RepositoryInfo) {
 			}
 		}
 	}
+}
+
+var (
+	ErrIDInvalid   = errors.New("invalid object id")
+	ErrIDNotFound  = errors.New("object id not found")
+	ErrIDAmbiguous = errors.New("ambiguous object id prefix")
+)
+
+// minIDPrefix is the shortest abbreviated object id accepted, matching git's default abbreviation.
+const minIDPrefix = 7
+
+// LookupID translates a full or abbreviated object id between hash formats using the repository's
+// loose-object-idx. format is the format of id ("sha1" or "sha256"); the id in the other format is
+// returned.
+func LookupID(repoPath, format, id string) (string, error) {
+	var column, maxLen int
+	switch format {
+	case "sha1":
+		column, maxLen = 1, 40
+	case "sha256":
+		column, maxLen = 0, 64
+	default:
+		return "", fmt.Errorf("%w: unknown hash format %q", ErrIDInvalid, format)
+	}
+	id = strings.ToLower(id)
+	if len(id) < minIDPrefix || len(id) > maxLen || strings.Trim(id, "0123456789abcdef") != "" {
+		return "", fmt.Errorf("%w: %q is not a %s id of %d to %d hex digits", ErrIDInvalid, id, format, minIDPrefix, maxLen)
+	}
+
+	f, err := os.Open(filepath.Join(repoPath, "objects", "loose-object-idx"))
+	if err != nil {
+		return "", fmt.Errorf("failed to open loose-object-idx: %w", err)
+	}
+	defer f.Close()
+
+	match := ""
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 || strings.HasPrefix(fields[0], "#") || !strings.HasPrefix(fields[column], id) {
+			continue
+		}
+		other := fields[1-column]
+		if match != "" && match != other {
+			return "", fmt.Errorf("%w: %s", ErrIDAmbiguous, id)
+		}
+		match = other
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("failed to read loose-object-idx: %w", err)
+	}
+	if match == "" {
+		return "", fmt.Errorf("%w: %s", ErrIDNotFound, id)
+	}
+	return match, nil
 }
