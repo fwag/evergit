@@ -770,3 +770,26 @@ func TestGenerateLooseObjectIdxSkipsMalformedMarks(t *testing.T) {
 		t.Errorf("loose-object-idx =\n%s\nwant\n%s", idx, want)
 	}
 }
+
+func TestInheritedGitEnvironmentIsIgnored(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	decoy := filepath.Join(t.TempDir(), "decoy.git")
+	if _, err := runCmd("", "git", "init", "-q", "--bare", decoy); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stray variable in the daemon's environment would redirect every git operation
+	t.Setenv("GIT_DIR", decoy)
+	t.Setenv("GIT_OBJECT_DIRECTORY", filepath.Join(decoy, "objects"))
+	if err := NewManager(0).EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo failed with GIT_DIR set: %v", err)
+	}
+	os.Unsetenv("GIT_DIR")
+	os.Unsetenv("GIT_OBJECT_DIRECTORY")
+
+	if refs, _ := runCmd(decoy, "git", "--git-dir=.", "for-each-ref"); refs != "" {
+		t.Errorf("decoy repository was modified:\n%s", refs)
+	}
+	assertCompatMapComplete(t, info.ServingPath)
+}

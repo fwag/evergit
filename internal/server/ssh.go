@@ -190,6 +190,7 @@ func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
 
 	// Execute git command directly against the safe path
 	cmd := exec.Command(verb, absServingPath)
+	cmd.Env = converter.GitEnv()
 	cmd.Stdin = ch
 	cmd.Stdout = ch
 	cmd.Stderr = ch.Stderr()

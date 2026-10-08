@@ -25,7 +25,9 @@ type HTTPServer struct {
 
 func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, error) {
 	// Find the git-http-backend path utilizing git --exec-path
-	gitExecPath, err := exec.Command("git", "--exec-path").Output()
+	execPathCmd := exec.Command("git", "--exec-path")
+	execPathCmd.Env = converter.GitEnv()
+	gitExecPath, err := execPathCmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to locate git exec-path: %w", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -325,9 +326,11 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 
 	// Run fast-export and fast-import
 	exportCmd := exec.Command("git", append([]string{"fast-export"}, exportFlags...)...)
+	exportCmd.Env = GitEnv()
 	exportCmd.Dir = info.MirrorPath
 
 	importCmd := exec.Command("git", append([]string{"fast-import"}, importFlags...)...)
+	importCmd.Env = GitEnv()
 	importCmd.Dir = targetPath
 
 	r, w := io.Pipe()
@@ -543,6 +546,7 @@ func pruneServingRefs(info *resolver.RepositoryInfo) error {
 	}
 
 	cmd := exec.Command("git", "--git-dir=.", "update-ref", "--stdin")
+	cmd.Env = GitEnv()
 	cmd.Dir = info.ServingPath
 	cmd.Stdin = strings.NewReader(deletions.String())
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -554,6 +558,27 @@ func pruneServingRefs(info *resolver.RepositoryInfo) error {
 // upstreamTimeout caps a whole clone or fetch; stalled transfers are aborted much earlier by the
 // low-speed limit set in runCmdTimeout.
 const upstreamTimeout = time.Hour
+
+// redirectingGitEnv are variables that make git operate on a different repository, object store or
+// work tree than the one Evergit chose. Inherited from the daemon's environment, they would silently
+// redirect every operation, including writes.
+var redirectingGitEnv = []string{
+	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+	"GIT_QUARANTINE_PATH", "GIT_PREFIX", "GIT_DEFAULT_HASH",
+}
+
+// GitEnv returns the process environment without redirecting git variables, plus extra.
+func GitEnv(extra ...string) []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if !slices.Contains(redirectingGitEnv, name) {
+			env = append(env, kv)
+		}
+	}
+	return append(env, extra...)
+}
 
 func runCmd(dir, name string, args ...string) (string, error) {
 	return runCmdTimeout(0, dir, name, args...)
@@ -571,7 +596,7 @@ func runCmdTimeout(timeout time.Duration, dir, name string, args ...string) (str
 	// Child processes (e.g. git-remote-https) may keep the output pipes open after a kill
 	cmd.WaitDelay = 10 * time.Second
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=true",
+	cmd.Env = GitEnv("GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=true",
 		// Abort transfers slower than 1 KiB/s for 60s, so a hung upstream cannot hold the repo lock
 		"GIT_HTTP_LOW_SPEED_LIMIT=1024", "GIT_HTTP_LOW_SPEED_TIME=60")
 	var stdout, stderr strings.Builder
