@@ -34,6 +34,12 @@ func NewManager(cacheTTL time.Duration) *Manager {
 // EnsureRepo checks if the repository exists, is up-to-date, and is converted.
 // If not, it clones/fetches, converts it, and optionally streams progress.
 func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+	if progressWriter != nil {
+		async := newAsyncWriter(progressWriter)
+		defer async.Close()
+		progressWriter = async
+	}
+
 	// Get or create a per-repo lock
 	m.locksMu.Lock()
 	lock, exists := m.repoLocks[info.ServingPath]
@@ -81,6 +87,42 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 	}
 
 	return nil
+}
+
+// asyncWriter forwards writes from a goroutine and drops them when its buffer is full, so a
+// client that stops reading progress cannot stall a conversion holding the repository lock.
+type asyncWriter struct {
+	lines chan []byte
+	done  chan struct{}
+}
+
+func newAsyncWriter(w io.Writer) *asyncWriter {
+	a := &asyncWriter{lines: make(chan []byte, 256), done: make(chan struct{})}
+	go func() {
+		defer close(a.done)
+		for line := range a.lines {
+			_, _ = w.Write(line)
+		}
+	}()
+	return a
+}
+
+func (a *asyncWriter) Write(p []byte) (int, error) {
+	select {
+	case a.lines <- append([]byte(nil), p...):
+	default: // Reader is not keeping up; drop the progress line
+	}
+	return len(p), nil
+}
+
+// Close stops accepting writes and gives queued lines a moment to flush, so progress is not
+// interleaved with output written after the conversion. A stalled reader is abandoned.
+func (a *asyncWriter) Close() {
+	close(a.lines)
+	select {
+	case <-a.done:
+	case <-time.After(time.Second):
+	}
 }
 
 func (m *Manager) needsSync(info *resolver.RepositoryInfo) bool {

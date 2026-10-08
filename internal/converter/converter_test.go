@@ -700,3 +700,30 @@ func TestLookupID(t *testing.T) {
 		t.Errorf("ambiguous prefix: err = %v, want ErrIDAmbiguous", err)
 	}
 }
+
+// stalledWriter blocks every write until released, like an SSH client that stopped reading stderr.
+type stalledWriter struct{ release chan struct{} }
+
+func (w stalledWriter) Write(p []byte) (int, error) {
+	<-w.release
+	return len(p), nil
+}
+
+func TestStalledProgressWriterDoesNotBlockConversion(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager(0)
+	writer := stalledWriter{release: make(chan struct{})}
+	defer close(writer.release)
+
+	done := make(chan error, 1)
+	go func() { done <- manager.EnsureRepo(info, writer) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("EnsureRepo failed: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("EnsureRepo blocked on a stalled progress writer while holding the repository lock")
+	}
+}
