@@ -837,3 +837,22 @@ func TestLegacyFullMirrorIsMigrated(t *testing.T) {
 	assertOnlyBranchesAndTags(t, "migrated mirror", info.MirrorPath)
 	assertOnlyBranchesAndTags(t, "serving repo", info.ServingPath)
 }
+
+func TestSubmodulesAreRejectedWithClearError(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	// A submodule entry (gitlink) records a SHA-1 commit of another repository
+	if _, err := runCmd(upstreamPath, "git", "update-index", "--add", "--cacheinfo", "160000,"+strings.Repeat("ab", 20)+",libs/dependency"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd(upstreamPath, "git", "commit", "-q", "-m", "add submodule"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := NewManager(0).EnsureRepo(newTestRepoInfo(t, upstreamPath), nil)
+	if !errors.Is(err, ErrSubmodulesUnsupported) {
+		t.Fatalf("err = %v, want ErrSubmodulesUnsupported", err)
+	}
+	if !strings.Contains(err.Error(), "libs/dependency") {
+		t.Errorf("error should name the submodule path, got: %v", err)
+	}
+}

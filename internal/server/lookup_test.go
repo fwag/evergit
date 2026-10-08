@@ -110,3 +110,33 @@ func TestIDLookup(t *testing.T) {
 		t.Errorf("git to-sha1 with evergit.url = %q (err %v), want %s", out, err, sha1)
 	}
 }
+
+func TestCloneOfRepoWithSubmodulesExplainsFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	upstreamPath := filepath.Join(tempDir, "upstream")
+	_, _ = runCmd("", "git", "init", "-q", "--initial-branch=main", "--object-format=sha1", upstreamPath)
+	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
+	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
+	_, _ = runCmd(upstreamPath, "git", "update-index", "--add", "--cacheinfo", "160000,"+strings.Repeat("ab", 20)+",libs/dependency")
+	if _, err := runCmd(upstreamPath, "git", "commit", "-q", "-m", "add submodule"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		StorageRoot:       filepath.Join(tempDir, "storage"),
+		CacheTTL:          5 * time.Minute,
+		AllowedHosts:      []string{"local.test"},
+		UpstreamOverrides: map[string]string{"local.test": upstreamPath},
+	}
+	httpServer, err := server.NewHTTPServer(cfg, converter.NewManager(cfg.CacheTTL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(httpServer)
+	defer ts.Close()
+
+	_, err = runCmd("", "git", "clone", "-q", ts.URL+"/local.test/test/repo.git", filepath.Join(tempDir, "clone"))
+	if err == nil || !strings.Contains(err.Error(), "submodule") {
+		t.Errorf("clone should fail explaining submodules are unsupported, got: %v", err)
+	}
+}

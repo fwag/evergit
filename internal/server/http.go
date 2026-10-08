@@ -76,8 +76,7 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 		// Run JIT clone and conversion if necessary
 		log.Printf("[HTTP] Ensuring repository %s is available & converted...", info.RepoName)
 		if err := conv.EnsureRepo(info, nil); err != nil {
-			log.Printf("[HTTP] JIT conversion failed for %s: %v", info.RepoName, err)
-			http.Error(w, "Internal Server Error (gitconv failure)", http.StatusInternalServerError)
+			writeConversionError(w, info, err)
 			return
 		}
 
@@ -95,13 +94,23 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 	return s, nil
 }
 
+// writeConversionError reports a failed EnsureRepo. git clients print the body as "remote: ...",
+// so known limitations are explained instead of reported as a generic failure.
+func writeConversionError(w http.ResponseWriter, info *resolver.RepositoryInfo, err error) {
+	log.Printf("[HTTP] JIT conversion failed for %s: %v", info.RepoName, err)
+	if errors.Is(err, converter.ErrSubmodulesUnsupported) {
+		http.Error(w, "Evergit: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Error(w, "Internal Server Error (gitconv failure)", http.StatusInternalServerError)
+}
+
 var idLookupPath = regexp.MustCompile(`^/(.+)/(sha1|sha256)/([^/]+)$`)
 
 // serveIDLookup answers with the id of the same object in the other hash format, as plain text.
 func serveIDLookup(w http.ResponseWriter, conv *converter.Manager, info *resolver.RepositoryInfo, format, id string) {
 	if err := conv.EnsureRepo(info, nil); err != nil {
-		log.Printf("[HTTP] JIT conversion failed for %s: %v", info.RepoName, err)
-		http.Error(w, "Internal Server Error (gitconv failure)", http.StatusInternalServerError)
+		writeConversionError(w, info, err)
 		return
 	}
 

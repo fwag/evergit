@@ -15,6 +15,11 @@ It is designed to solve a critical interoperability gap: **Git does not allow re
 - **Custom SSH Git Daemon:** Employs a secure, lightweight custom SSH server using `golang.org/x/crypto/ssh` that accepts public-key connections, handles directory traversal protection, and directly pipes connection channels into local `git-upload-pack` subprocesses.
 - **Flexible Path Resolution:** Resolves short paths like `/github/owner/repo` or `/gitlab/owner/repo` to their corresponding domains, and also supports arbitrary nested paths for GitLab subgroups (e.g., `/gitlab.com/org/subgroup1/subgroup2/repo`). Only upstream hosts on the allowlist are proxied (see `-allowed-hosts`), so clients cannot point Evergit at internal services.
 
+### Limitations
+
+- **Repositories containing submodules are not supported yet.** A submodule entry records a SHA-1 commit id of another repository, which has no SHA-256 equivalent unless that repository is converted too. Such repositories fail with an explicit `repositories containing submodules cannot be converted to SHA-256 yet` error naming the submodule path.
+- **Only branches and tags are mirrored.** Forge-specific refs such as GitHub's `refs/pull/*` or GitLab's `refs/merge-requests/*` are not served.
+
 ---
 
 ##  Installation & Setup

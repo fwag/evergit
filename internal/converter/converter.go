@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -429,6 +430,10 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		if !isIncremental {
 			os.RemoveAll(targetPath)
 		}
+		if m := gitlinkRejection.FindStringSubmatch(importErrBuf.String()); m != nil {
+			return fmt.Errorf("%w: %s records SHA-1 commit %s at %q, which has no SHA-256 equivalent",
+				ErrSubmodulesUnsupported, info.RepoName, m[1], m[2])
+		}
 		return fmt.Errorf("git fast-import failed: %v (stderr: %q)", importErr, strings.TrimSpace(importErrBuf.String()))
 	}
 	if exportErr != nil {
@@ -839,6 +844,14 @@ func (m *Manager) logBackupRefs(info *resolver.RepositoryInfo) {
 		log.Printf("[Backup] Preserved history: %s -> SHA256: %s (SHA1: %s)", refName, sha256, sha256ToSha1[sha256])
 	}
 }
+
+// ErrSubmodulesUnsupported is returned for repositories whose history contains submodules: a
+// submodule entry records a SHA-1 commit id of another repository, which cannot be translated
+// without converting that repository too.
+var ErrSubmodulesUnsupported = errors.New("repositories containing submodules cannot be converted to SHA-256 yet")
+
+// gitlinkRejection matches fast-import refusing a submodule entry ("M 160000 <sha1> <path>").
+var gitlinkRejection = regexp.MustCompile(`M 160000 ([0-9a-f]{40}) (.+)`)
 
 var (
 	ErrIDInvalid   = errors.New("invalid object id")
