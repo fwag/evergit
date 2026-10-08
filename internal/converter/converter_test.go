@@ -618,3 +618,13 @@ func TestFullConversionMigratesLegacyServingDirectory(t *testing.T) {
 		t.Errorf("expected migrated repo to serve the latest commit, got %q (err %v)", logOut, err)
 	}
 }
+
+func TestRunCmdTimeout(t *testing.T) {
+	start := time.Now()
+	if _, err := runCmdTimeout(100*time.Millisecond, "", "sleep", "10"); err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("timed-out command took %v to return", elapsed)
+	}
+}

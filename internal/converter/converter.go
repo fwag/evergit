@@ -2,6 +2,7 @@ package converter
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -100,7 +101,7 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 
 	if _, err := os.Stat(info.MirrorPath); os.IsNotExist(err) {
 		// Clone as a bare mirror
-		_, err := runCmd("", "git", "clone", "--mirror", info.RemoteURL, info.MirrorPath)
+		_, err := runCmdTimeout(upstreamTimeout, "", "git", "clone", "--mirror", info.RemoteURL, info.MirrorPath)
 		if err != nil {
 			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, err)
 		}
@@ -122,7 +123,7 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 		}
 
 		// Fetch updates
-		_, err = runCmd(info.MirrorPath, "git", "fetch", "--prune")
+		_, err = runCmdTimeout(upstreamTimeout, info.MirrorPath, "git", "fetch", "--prune")
 		if err != nil {
 			// Check if we have an existing serving repository to fall back to
 			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
@@ -468,10 +469,29 @@ func pruneServingRefs(info *resolver.RepositoryInfo) error {
 	return nil
 }
 
+// upstreamTimeout caps a whole clone or fetch; stalled transfers are aborted much earlier by the
+// low-speed limit set in runCmdTimeout.
+const upstreamTimeout = time.Hour
+
 func runCmd(dir, name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	return runCmdTimeout(0, dir, name, args...)
+}
+
+// runCmdTimeout runs a command, killing it after timeout (0 means no limit).
+func runCmdTimeout(timeout time.Duration, dir, name string, args ...string) (string, error) {
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	// Child processes (e.g. git-remote-https) may keep the output pipes open after a kill
+	cmd.WaitDelay = 10 * time.Second
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=true")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=true",
+		// Abort transfers slower than 1 KiB/s for 60s, so a hung upstream cannot hold the repo lock
+		"GIT_HTTP_LOW_SPEED_LIMIT=1024", "GIT_HTTP_LOW_SPEED_TIME=60")
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

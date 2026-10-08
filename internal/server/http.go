@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"evergit/internal/config"
 	"evergit/internal/converter"
@@ -88,7 +89,14 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) ListenAndServe() error {
 	log.Printf("Starting Evergit HTTP Server on %s", s.cfg.HTTPAddr)
-	return http.ListenAndServe(s.cfg.HTTPAddr, s)
+	server := &http.Server{
+		Addr:    s.cfg.HTTPAddr,
+		Handler: s,
+		// No WriteTimeout: large clones legitimately stream for a long time
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	return server.ListenAndServe()
 }
 
 // extractRepoPath extracts the repository path from the HTTP request path.

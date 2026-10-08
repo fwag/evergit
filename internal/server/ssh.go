@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"evergit/internal/config"
 	"evergit/internal/converter"
@@ -74,12 +75,17 @@ func (s *SSHServer) Start() (net.Listener, error) {
 	return listener, nil
 }
 
+// handshakeTimeout bounds how long an unauthenticated connection may take to complete the handshake.
+const handshakeTimeout = 30 * time.Second
+
 func (s *SSHServer) handleConn(nConn net.Conn) {
+	_ = nConn.SetDeadline(time.Now().Add(handshakeTimeout))
 	conn, chans, reqs, err := ssh.NewServerConn(nConn, s.sshConfig)
 	if err != nil {
 		log.Printf("[SSH] Handshake failed: %v", err)
 		return
 	}
+	_ = nConn.SetDeadline(time.Time{})
 	defer conn.Close()
 
 	log.Printf("[SSH] New session established from %s", conn.RemoteAddr())
