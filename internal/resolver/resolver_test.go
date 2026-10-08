@@ -51,6 +51,46 @@ func TestParsePath(t *testing.T) {
 			rawPath: "invalidDomain/ta/repo",
 			wantErr: true,
 		},
+		{
+			name:        "Dot-prefixed repo name",
+			rawPath:     "github/org/.github",
+			wantDomain:  "github.com",
+			wantOwner:   "org",
+			wantRepo:    ".github",
+			wantRemote:  "https://github.com/org/.github.git",
+			wantMirror:  filepath.Join(storageRoot, "mirrors", "github.com", "org", ".github.git"),
+			wantServing: filepath.Join(storageRoot, "repos", "github.com", "org", ".github.git"),
+		},
+		{
+			name:    "Relative traversal escaping storage",
+			rawPath: "../../../tmp/pwn/x/y.git",
+			wantErr: true,
+		},
+		{
+			name:    "Traversal behind a valid domain",
+			rawPath: "a.b/../../../../tmp/x/y",
+			wantErr: true,
+		},
+		{
+			name:    "Traversal inside owner",
+			rawPath: "github.com/org/../other/repo",
+			wantErr: true,
+		},
+		{
+			name:    "Bare .git repo name",
+			rawPath: "github.com/org/project/.git",
+			wantErr: true,
+		},
+		{
+			name:    "Empty segment",
+			rawPath: "github.com/org//repo",
+			wantErr: true,
+		},
+		{
+			name:    "Unsafe characters",
+			rawPath: "github.com/org/re po",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

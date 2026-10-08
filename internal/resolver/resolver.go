@@ -2,10 +2,15 @@ package resolver
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
+
+// validSegment restricts every path segment to characters that are safe both in a URL and on disk.
+var validSegment = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 type RepositoryInfo struct {
 	Domain      string // e.g. github.com
@@ -19,18 +24,21 @@ type RepositoryInfo struct {
 // ParsePath parses a raw Git path (e.g. "github/owner/repo.git" or "github.com/org/sub/repo.git")
 // and resolves it into detailed repository information based on the storageRoot.
 func ParsePath(rawPath, storageRoot string) (*RepositoryInfo, error) {
-	// Clean and normalize the path
-	path := filepath.Clean(rawPath)
-	path = strings.TrimPrefix(path, "/")
-	path = strings.TrimSuffix(path, "/")
+	path := strings.Trim(rawPath, "/")
 
 	// Git clients might append .git
 	path = strings.TrimSuffix(path, ".git")
 
-	// Split the path into segments
-	parts := strings.Split(path, string(filepath.Separator))
+	// Split the path into segments. No filepath.Clean: it keeps leading ".." on relative
+	// paths, so traversal is rejected per segment instead.
+	parts := strings.Split(path, "/")
 	if len(parts) < 3 {
 		return nil, errors.New("invalid repository path: must be in the format 'domain/owner/repo' or 'shorthand/owner/repo'")
+	}
+	for _, part := range parts {
+		if part == "." || part == ".." || !validSegment.MatchString(part) {
+			return nil, fmt.Errorf("invalid repository path segment %q", part)
+		}
 	}
 
 	domain := parts[0]
@@ -64,6 +72,9 @@ func ParsePath(rawPath, storageRoot string) (*RepositoryInfo, error) {
 	// Define safe local paths
 	mirrorPath := filepath.Join(storageRoot, "mirrors", domain, owner, repoName+".git")
 	servingPath := filepath.Join(storageRoot, "repos", domain, owner, repoName+".git")
+	if !isWithin(filepath.Join(storageRoot, "mirrors"), mirrorPath) || !isWithin(filepath.Join(storageRoot, "repos"), servingPath) {
+		return nil, errors.New("invalid repository path: resolves outside of storage")
+	}
 
 	return &RepositoryInfo{
 		Domain:      domain,
@@ -73,4 +84,9 @@ func ParsePath(rawPath, storageRoot string) (*RepositoryInfo, error) {
 		MirrorPath:  mirrorPath,
 		ServingPath: servingPath,
 	}, nil
+}
+
+func isWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

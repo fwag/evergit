@@ -147,19 +147,9 @@ func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
 		return err
 	}
 
-	// Layered security: Verify ServingPath resides strictly in storage repos
-	absReposRoot, err := filepath.Abs(filepath.Join(s.cfg.StorageRoot, "repos"))
-	if err != nil {
-		writeError(ch, err)
-		return err
-	}
+	// ParsePath guarantees ServingPath resides within the storage repos directory
 	absServingPath, err := filepath.Abs(info.ServingPath)
 	if err != nil {
-		writeError(ch, err)
-		return err
-	}
-	if !strings.HasPrefix(absServingPath, absReposRoot) {
-		err := errors.New("access denied: path traversal detected")
 		writeError(ch, err)
 		return err
 	}
