@@ -20,7 +20,8 @@ type RepositoryInfo struct {
 	RepoName    string // e.g. evergit (stripped of .git)
 	RemoteURL   string // e.g. https://github.com/ta/evergit.git
 	MirrorPath  string // e.g. <storageRoot>/mirrors/github.com/ta/evergit.git
-	ServingPath string // e.g. <storageRoot>/repos/github.com/ta/evergit.git
+	ServingPath string // e.g. <storageRoot>/repos/github.com/ta/evergit.git; symlink to the current build
+	BuildsPath  string // e.g. <storageRoot>/builds/github.com/ta/evergit.git; holds full conversion builds
 }
 
 // ParsePath parses a raw Git path (e.g. "github/owner/repo.git" or "github.com/org/sub/repo.git")
@@ -77,6 +78,7 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 	// Define safe local paths
 	mirrorPath := filepath.Join(storageRoot, "mirrors", domain, owner, repoName+".git")
 	servingPath := filepath.Join(storageRoot, "repos", domain, owner, repoName+".git")
+	buildsPath := filepath.Join(storageRoot, "builds", domain, owner, repoName+".git")
 	if !isWithin(filepath.Join(storageRoot, "mirrors"), mirrorPath) || !isWithin(filepath.Join(storageRoot, "repos"), servingPath) {
 		return nil, errors.New("invalid repository path: resolves outside of storage")
 	}
@@ -88,6 +90,7 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 		RemoteURL:   remoteURL,
 		MirrorPath:  mirrorPath,
 		ServingPath: servingPath,
+		BuildsPath:  buildsPath,
 	}, nil
 }
 

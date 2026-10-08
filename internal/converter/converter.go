@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -217,9 +218,8 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		exportFlags = []string{"--all", "--signed-commits=strip", "--tag-of-filtered-object=rewrite", "--import-marks=" + sha1MarksPath, "--export-marks=" + sha1MarksPath}
 		importFlags = []string{"--force", "--import-marks=" + sha256MarksPath, "--export-marks=" + sha256MarksPath}
 	} else {
-		// Full conversion
-		targetPath = info.ServingPath + ".tmp"
-		os.RemoveAll(targetPath)
+		// Full conversion into a fresh build directory, published by publishBuild once complete
+		targetPath = filepath.Join(info.BuildsPath, strconv.FormatInt(time.Now().UnixNano(), 10))
 		log.Printf("Starting full conversion for repository %s...", info.RepoName)
 		if progressWriter != nil {
 			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Updates found. Performing full JIT conversion...\n")
@@ -349,16 +349,64 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 	_ = os.Chtimes(filepath.Join(targetPath, "HEAD"), now, now)
 
 	if !isIncremental {
-		// Swap atomically only for full conversion
-		os.RemoveAll(info.ServingPath)
-		if err := os.Rename(targetPath, info.ServingPath); err != nil {
-			return fmt.Errorf("failed to atomically swap converted repository to %s: %w", info.ServingPath, err)
+		if err := publishBuild(info, targetPath); err != nil {
+			os.RemoveAll(targetPath)
+			return err
 		}
 	}
 
 	// Log the translated backup refs to show both SHA256 and SHA1 mappings
 	m.logBackupRefs(info)
 
+	return nil
+}
+
+// publishBuild atomically points the ServingPath symlink at buildPath, so readers always see
+// either the old or the new repository. The previous build is kept for readers still using it;
+// older builds are removed.
+func publishBuild(info *resolver.RepositoryInfo, buildPath string) error {
+	previous := ""
+	if fi, err := os.Lstat(info.ServingPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if target, err := os.Readlink(info.ServingPath); err == nil {
+				previous = filepath.Join(filepath.Dir(info.ServingPath), target)
+			}
+		} else {
+			// Serving repo created before builds existed: move it aside so the symlink can replace it
+			previous = filepath.Join(info.BuildsPath, "legacy")
+			os.RemoveAll(previous)
+			if err := os.Rename(info.ServingPath, previous); err != nil {
+				return fmt.Errorf("failed to move legacy serving repository %s aside: %w", info.ServingPath, err)
+			}
+		}
+	}
+
+	target, err := filepath.Rel(filepath.Dir(info.ServingPath), buildPath)
+	if err != nil {
+		return fmt.Errorf("failed to compute build symlink target: %w", err)
+	}
+	tmpLink := info.ServingPath + ".link"
+	os.Remove(tmpLink)
+	if err := os.Symlink(target, tmpLink); err != nil {
+		return fmt.Errorf("failed to create build symlink: %w", err)
+	}
+	if err := os.Rename(tmpLink, info.ServingPath); err != nil {
+		os.Remove(tmpLink)
+		return fmt.Errorf("failed to publish build %s to %s: %w", buildPath, info.ServingPath, err)
+	}
+
+	// Leftover from versions that built next to the serving repo
+	os.RemoveAll(info.ServingPath + ".tmp")
+	builds, err := os.ReadDir(info.BuildsPath)
+	if err != nil {
+		return nil
+	}
+	for _, build := range builds {
+		path := filepath.Join(info.BuildsPath, build.Name())
+		if path != buildPath && path != previous {
+			os.RemoveAll(path)
+		}
+	}
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,6 +68,7 @@ func TestConverter(t *testing.T) {
 		RemoteURL:   upstreamPath, // Git clones directly from local directory
 		MirrorPath:  filepath.Join(storageRoot, "mirrors", "local", "test", "repo.git"),
 		ServingPath: filepath.Join(storageRoot, "repos", "local", "test", "repo.git"),
+		BuildsPath:  filepath.Join(storageRoot, "builds", "local", "test", "repo.git"),
 	}
 
 	// 3. Ensure the repository converts successfully
@@ -143,6 +145,7 @@ func TestConverterForcePushBackup(t *testing.T) {
 		RemoteURL:   upstreamPath,
 		MirrorPath:  filepath.Join(storageRoot, "mirrors", "local", "test", "repo-backup.git"),
 		ServingPath: filepath.Join(storageRoot, "repos", "local", "test", "repo-backup.git"),
+		BuildsPath:  filepath.Join(storageRoot, "builds", "local", "test", "repo-backup.git"),
 	}
 
 	// First JIT conversion (Initial sync)
@@ -235,6 +238,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 		RemoteURL:   upstreamPath,
 		MirrorPath:  filepath.Join(storageRoot, "mirrors", "local", "test", "repo-preservation.git"),
 		ServingPath: filepath.Join(storageRoot, "repos", "local", "test", "repo-preservation.git"),
+		BuildsPath:  filepath.Join(storageRoot, "builds", "local", "test", "repo-preservation.git"),
 	}
 
 	// First JIT conversion (Commit A is imported)
@@ -364,6 +368,7 @@ func newTestRepoInfo(t *testing.T, upstreamPath string) *resolver.RepositoryInfo
 		RemoteURL:   upstreamPath,
 		MirrorPath:  filepath.Join(storageRoot, "mirrors", "repo.git"),
 		ServingPath: filepath.Join(storageRoot, "repos", "repo.git"),
+		BuildsPath:  filepath.Join(storageRoot, "builds", "repo.git"),
 	}
 }
 
@@ -514,4 +519,98 @@ func TestCompatObjectFormatRestoredOnNoOpSync(t *testing.T) {
 		t.Fatalf("no-op EnsureRepo failed: %v", err)
 	}
 	assertCompatObjectFormat(t, info.ServingPath)
+}
+
+func TestFullConversionNeverHidesServingRepo(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager("", 0)
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("initial EnsureRepo failed: %v", err)
+	}
+
+	stop := make(chan struct{})
+	failures := make(chan error, 1000)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := runCmd("", "git", "--git-dir="+info.ServingPath, "rev-parse", "HEAD"); err != nil {
+				select {
+				case failures <- err:
+				default:
+				}
+			}
+		}
+	}()
+
+	for i := 1; i <= 10; i++ {
+		commitToUpstream(t, upstreamPath, fmt.Sprintf("commit %d", i))
+		// Dropping the marks forces the full conversion path
+		_ = os.Remove(filepath.Join(info.ServingPath, "evergit-sha1-marks.txt"))
+		if err := manager.EnsureRepo(info, nil); err != nil {
+			t.Fatalf("EnsureRepo %d failed: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	close(failures)
+
+	if n := len(failures); n > 0 {
+		t.Errorf("%d reads failed during full conversions, first: %v", n, <-failures)
+	}
+	assertCompatMapComplete(t, info.ServingPath)
+
+	// Only the current build should remain once older ones are cleaned up
+	builds, err := os.ReadDir(info.BuildsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(builds) > 2 {
+		t.Errorf("expected at most 2 builds (current and previous), found %d", len(builds))
+	}
+}
+
+func TestFullConversionMigratesLegacyServingDirectory(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager("", 0)
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("initial EnsureRepo failed: %v", err)
+	}
+
+	// Recreate the pre-builds layout: a real directory at ServingPath
+	build, err := filepath.EvalSymlinks(info.ServingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(info.ServingPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(build, info.ServingPath); err != nil {
+		t.Fatal(err)
+	}
+
+	commitToUpstream(t, upstreamPath, "commit 1")
+	_ = os.Remove(filepath.Join(info.ServingPath, "evergit-sha1-marks.txt"))
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo on legacy layout failed: %v", err)
+	}
+
+	fi, err := os.Lstat(info.ServingPath)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected ServingPath to be a symlink after migration (err %v)", err)
+	}
+	logOut, err := runCmd(info.ServingPath, "git", "--git-dir=.", "log", "--oneline", "-1")
+	if err != nil || !strings.Contains(logOut, "commit 1") {
+		t.Errorf("expected migrated repo to serve the latest commit, got %q (err %v)", logOut, err)
+	}
 }
