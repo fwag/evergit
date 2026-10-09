@@ -53,13 +53,8 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 	owner := strings.Join(ownerSegments, "/")
 
 	// Handle shorthands
-	switch domain {
-	case "github":
-		domain = "github.com"
-	case "gitlab":
-		domain = "gitlab.com"
-	case "bitbucket":
-		domain = "bitbucket.org"
+	if target, ok := cfg.Shorthands[domain]; ok {
+		domain = target
 	}
 
 	// Only proxy explicitly allowed upstreams, so clients cannot point Evergit at internal hosts

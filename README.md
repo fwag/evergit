@@ -42,6 +42,7 @@ go build -o evergit ./cmd/evergit
 - `-storage`: Directory path for storing host keys, cache mirrors, and converted repositories (default: `./storage`)
 - `-ttl`: Cache duration before checking upstream for updates (default: `5m`)
 - `-allowed-hosts`: Comma-separated upstream hosts clients may request; also settable via `EVERGIT_ALLOWED_HOSTS` (default: `github.com,gitlab.com,bitbucket.org`). Self-hosted forges must be added explicitly.
+- `-shorthands`: Comma-separated domain shorthand mappings in `alias=domain` format; also settable via `EVERGIT_SHORTHANDS` (default: `github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org`). Pass `none` to disable shorthands.
 
 ---
 

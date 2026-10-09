@@ -9,7 +9,11 @@ import (
 
 func TestParsePath(t *testing.T) {
 	storageRoot := "/tmp/evergit"
-	cfg := &config.Config{StorageRoot: storageRoot, AllowedHosts: config.DefaultAllowedHosts}
+	cfg := &config.Config{
+		StorageRoot:  storageRoot,
+		AllowedHosts: config.DefaultAllowedHosts,
+		Shorthands:   config.ParseShorthands(config.DefaultShorthands),
+	}
 
 	tests := []struct {
 		name        string
@@ -156,4 +160,38 @@ func TestParsePath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfigurableShorthands(t *testing.T) {
+	storageRoot := "/tmp/evergit"
+
+	t.Run("Custom shorthand resolves", func(t *testing.T) {
+		cfg := &config.Config{
+			StorageRoot:  storageRoot,
+			AllowedHosts: []string{"github.com"},
+			Shorthands:   map[string]string{"gh": "github.com"},
+		}
+		info, err := ParsePath("gh/user/repo", cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if info.Domain != "github.com" {
+			t.Errorf("Domain = %q, want github.com", info.Domain)
+		}
+		if info.RemoteURL != "https://github.com/user/repo.git" {
+			t.Errorf("RemoteURL = %q, want https://github.com/user/repo.git", info.RemoteURL)
+		}
+	})
+
+	t.Run("Disabled shorthands reject previously hardcoded aliases", func(t *testing.T) {
+		cfg := &config.Config{
+			StorageRoot:  storageRoot,
+			AllowedHosts: []string{"github.com"},
+			Shorthands:   map[string]string{}, // empty, no shorthands
+		}
+		_, err := ParsePath("github/user/repo", cfg)
+		if err == nil {
+			t.Fatalf("expected error when shorthands are disabled, got nil")
+		}
+	})
 }

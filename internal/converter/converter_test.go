@@ -856,3 +856,94 @@ func TestSubmodulesAreRejectedWithClearError(t *testing.T) {
 		t.Errorf("error should name the submodule path, got: %v", err)
 	}
 }
+
+func newTestUpstreamSHA256(t *testing.T) string {
+	t.Helper()
+	upstreamPath := filepath.Join(t.TempDir(), "upstream.git")
+	if _, err := runCmd("", "git", "init", "--initial-branch=main", "--object-format=sha256", upstreamPath); err != nil {
+		t.Fatalf("failed to init sha256 upstream: %v", err)
+	}
+	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
+	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
+	commitToUpstream(t, upstreamPath, "commit 0")
+	return upstreamPath
+}
+
+func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
+	upstreamPath := newTestUpstreamSHA256(t)
+	upstreamHead, err := runCmd(upstreamPath, "git", "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("failed to get upstream HEAD: %v", err)
+	}
+
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager(0)
+
+	// Initial sync
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("initial EnsureRepo failed: %v", err)
+	}
+
+	// Verify serving repo has sha256 format
+	format, err := runCmd(info.ServingPath, "git", "--git-dir=.", "rev-parse", "--show-object-format")
+	if err != nil || format != "sha256" {
+		t.Fatalf("serving repo format = %q (err %v), want sha256", format, err)
+	}
+
+	// Verify serving HEAD commit hash matches upstream HEAD commit hash directly
+	servingHead, err := runCmd(info.ServingPath, "git", "--git-dir=.", "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("failed to get serving HEAD: %v", err)
+	}
+	if servingHead != upstreamHead {
+		t.Fatalf("serving HEAD %q != upstream HEAD %q", servingHead, upstreamHead)
+	}
+
+	// Verify marks files were NOT created (fast-export / fast-import bypassed)
+	sha1MarksPath := filepath.Join(info.ServingPath, "evergit-sha1-marks.txt")
+	if _, err := os.Stat(sha1MarksPath); !os.IsNotExist(err) {
+		t.Errorf("evergit-sha1-marks.txt exists at %s; fast-export/fast-import was not bypassed", sha1MarksPath)
+	}
+	sha256MarksPath := filepath.Join(info.ServingPath, "evergit-sha256-marks.txt")
+	if _, err := os.Stat(sha256MarksPath); !os.IsNotExist(err) {
+		t.Errorf("evergit-sha256-marks.txt exists at %s; fast-export/fast-import was not bypassed", sha256MarksPath)
+	}
+
+	// Test incremental sync
+	commitToUpstream(t, upstreamPath, "commit 1")
+	newUpstreamHead, err := runCmd(upstreamPath, "git", "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("failed to get updated upstream HEAD: %v", err)
+	}
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("incremental EnsureRepo failed: %v", err)
+	}
+	newServingHead, err := runCmd(info.ServingPath, "git", "--git-dir=.", "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("failed to get updated serving HEAD: %v", err)
+	}
+	if newServingHead != newUpstreamHead {
+		t.Fatalf("updated serving HEAD %q != upstream HEAD %q", newServingHead, newUpstreamHead)
+	}
+
+	// Test branch deletion and archival on native SHA-256
+	_, _ = runCmd(upstreamPath, "git", "branch", "feature", newUpstreamHead)
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo for new branch failed: %v", err)
+	}
+	// Delete branch upstream
+	_, _ = runCmd(upstreamPath, "git", "branch", "-D", "feature")
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo after branch deletion failed: %v", err)
+	}
+	servingRefs, err := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		t.Fatalf("failed to read serving refs: %v", err)
+	}
+	if strings.Contains(servingRefs, "refs/heads/feature") {
+		t.Errorf("deleted branch feature still present in serving refs:\n%s", servingRefs)
+	}
+	if !strings.Contains(servingRefs, "refs/evergit-backups/heads/feature/") {
+		t.Errorf("deleted branch feature not archived in refs/evergit-backups/:\n%s", servingRefs)
+	}
+}

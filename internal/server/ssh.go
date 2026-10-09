@@ -97,14 +97,17 @@ func (s *SSHServer) handleConn(nConn net.Conn) {
 		log.Printf("[SSH] Handshake failed: %v", err)
 		return
 	}
+	// disable deadline
 	_ = nConn.SetDeadline(time.Time{})
 	defer conn.Close()
 
 	log.Printf("[SSH] New session established from %s", conn.RemoteAddr())
 
+	// discard out-of-band requests (like port forwarding requests or keep-alives)
 	go ssh.DiscardRequests(reqs)
 
 	for newChan := range chans {
+		// session: Used for interactive shells, executing single commands, SCP, and SFTP
 		if newChan.ChannelType() != "session" {
 			newChan.Reject(ssh.UnknownChannelType, "unsupported channel type")
 			continue
@@ -176,10 +179,6 @@ func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
 	// Ensure the repository is cloned & converted with explicit user-friendly progress logs sent to client's SSH stderr
 	log.Printf("[SSH] Ensuring repository %s is available & converted...", info.RepoName)
 	_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: Checking cache for %s...\n", info.RepoName)
-
-	if _, err := os.Stat(filepath.Join(info.ServingPath, "HEAD")); os.IsNotExist(err) {
-		_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: First-time clone. Performing JIT SHA-1 -> SHA-256 history conversion, please wait...\n")
-	}
 
 	if err := s.converter.EnsureRepo(info, ch.Stderr()); err != nil {
 		log.Printf("[SSH] JIT conversion failed for %s: %v", info.RepoName, err)

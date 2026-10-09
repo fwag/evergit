@@ -62,6 +62,11 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 		return err
 	}
 
+	// If the upstream mirror is natively SHA-256, bypass the fast-export | fast-import pipeline
+	if isRepoSHA256(info.MirrorPath) {
+		return m.syncNativeSHA256(info, changed, progressWriter)
+	}
+
 	// Skip conversion when the serving repo exists and the mirror did not change (or the fetch
 	// failed and we fall back to the cache). Touching HEAD restarts the TTL.
 	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
@@ -85,6 +90,82 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 		return err
 	}
 
+	return nil
+}
+
+// isRepoSHA256 checks if a git repository is configured with the sha256 object format.
+func isRepoSHA256(repoPath string) bool {
+	format, err := runCmd(repoPath, "git", "--git-dir=.", "rev-parse", "--show-object-format")
+	return err == nil && strings.TrimSpace(format) == "sha256"
+}
+
+// syncNativeSHA256 creates or updates the serving repository for an upstream repository that is
+// already in SHA-256 format, bypassing the CPU- and memory-intensive fast-export | fast-import pipeline.
+func (m *Manager) syncNativeSHA256(info *resolver.RepositoryInfo, changed bool, progressWriter io.Writer) error {
+	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
+	if _, err := os.Stat(servingHeadPath); err == nil {
+		if !changed {
+			now := time.Now()
+			_ = os.Chtimes(servingHeadPath, now, now)
+			return nil
+		}
+
+		log.Printf("Syncing native SHA256 updates for repository %s...", info.RepoName)
+		if progressWriter != nil {
+			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Syncing native SHA-256 updates...\n")
+		}
+		refspecs := []string{
+			"+refs/heads/*:refs/heads/*",
+			"+refs/tags/*:refs/tags/*",
+			"+refs/evergit-backups/*:refs/evergit-backups/*",
+		}
+		args := append([]string{"fetch", "--prune", "--", info.MirrorPath}, refspecs...)
+		if _, err := runCmd(info.ServingPath, "git", args...); err != nil {
+			return fmt.Errorf("failed to fetch native sha256 updates into %s: %w", info.ServingPath, err)
+		}
+
+		if headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
+			_, _ = runCmd(info.ServingPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
+		}
+
+		now := time.Now()
+		_ = os.Chtimes(servingHeadPath, now, now)
+		m.logBackupRefs(info)
+		return nil
+	}
+
+	// Serving repo does not exist: clone directly from the mirror into a new build
+	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
+		return fmt.Errorf("failed to create repos directory: %w", err)
+	}
+
+	buildPath := filepath.Join(info.BuildsPath, strconv.FormatInt(time.Now().UnixNano(), 10))
+	if err := os.MkdirAll(filepath.Dir(buildPath), 0755); err != nil {
+		return fmt.Errorf("failed to create builds directory: %w", err)
+	}
+
+	log.Printf("Creating native SHA256 serving repository for %s...", info.RepoName)
+	if progressWriter != nil {
+		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Upstream is native SHA-256. Bypassing conversion pipeline...\n")
+	}
+	if _, err := runCmd("", "git", "clone", "--bare", "--", info.MirrorPath, buildPath); err != nil {
+		os.RemoveAll(buildPath)
+		return fmt.Errorf("failed to clone native sha256 repository %s: %w", info.RepoName, err)
+	}
+
+	if headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
+		_, _ = runCmd(buildPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
+	}
+
+	now := time.Now()
+	_ = os.Chtimes(filepath.Join(buildPath, "HEAD"), now, now)
+
+	if err := publishBuild(info, buildPath); err != nil {
+		os.RemoveAll(buildPath)
+		return err
+	}
+
+	m.logBackupRefs(info)
 	return nil
 }
 
@@ -177,7 +258,7 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 		// Clone as a bare mirror
 		// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
 		// thousands of refs/pull/* from forks
-		_, err := runCmdTimeout(upstreamTimeout, "", "git", "clone", "--bare", info.RemoteURL, info.MirrorPath)
+		_, err := runCmdTimeout(upstreamTimeout, "", "git", "clone", "--bare", "--", info.RemoteURL, info.MirrorPath)
 		if err != nil {
 			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, err)
 		}
@@ -341,7 +422,7 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		targetPath = filepath.Join(info.BuildsPath, strconv.FormatInt(time.Now().UnixNano(), 10))
 		log.Printf("Starting full conversion for repository %s...", info.RepoName)
 		if progressWriter != nil {
-			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Updates found. Performing full JIT conversion...\n")
+			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Performing full JIT SHA-1 -> SHA-256 history conversion, please wait...\n")
 		}
 
 		// Init bare SHA256 repo

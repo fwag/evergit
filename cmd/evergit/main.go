@@ -22,6 +22,7 @@ func main() {
 	storageRoot := flag.String("storage", "", "Storage root directory")
 	cacheTTLStr := flag.String("ttl", "5m", "Cache TTL (e.g. 5m, 1h)")
 	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
+	shorthands := flag.String("shorthands", "", "Comma-separated domain shorthand mappings in alias=domain format (default: github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org)")
 	flag.Parse()
 
 	cfg := config.Load()
@@ -54,11 +55,15 @@ func main() {
 	if *allowedHosts != "" {
 		cfg.AllowedHosts = config.ParseHostList(*allowedHosts)
 	}
+	if *shorthands != "" {
+		cfg.Shorthands = config.ParseShorthands(*shorthands)
+	}
 
 	log.Printf("Initializing Evergit Daemon...")
-	log.Printf("Storage Root: %s", cfg.StorageRoot)
-	log.Printf("Cache TTL:    %v", cfg.CacheTTL)
+	log.Printf("Storage Root:  %s", cfg.StorageRoot)
+	log.Printf("Cache TTL:     %v", cfg.CacheTTL)
 	log.Printf("Allowed hosts: %s", strings.Join(cfg.AllowedHosts, ", "))
+	log.Printf("Shorthands:    %s", config.FormatShorthands(cfg.Shorthands))
 
 	// Ensure Storage Root exists
 	if err := os.MkdirAll(cfg.StorageRoot, 0755); err != nil {
