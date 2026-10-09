@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // flakyListener fails Accept with a transient error a few times, then reports itself closed.
@@ -70,5 +72,27 @@ func TestHostKeyIsNotReplacedWhenUnreadable(t *testing.T) {
 	}
 	if string(current) != string(original) {
 		t.Error("unreadable host key was overwritten with a new one")
+	}
+}
+
+func TestHostKeyGenerationUsesEd25519(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "host_key.pem")
+	signer, err := getOrCreateHostKey(path)
+	if err != nil {
+		t.Fatalf("failed to create host key: %v", err)
+	}
+
+	pubKey := signer.PublicKey()
+	if pubKey.Type() != ssh.KeyAlgoED25519 {
+		t.Errorf("host key type = %q, want %q", pubKey.Type(), ssh.KeyAlgoED25519)
+	}
+
+	// Verify that the generated key file can be reloaded and retains the same public key
+	reloadedSigner, err := getOrCreateHostKey(path)
+	if err != nil {
+		t.Fatalf("failed to reload generated host key: %v", err)
+	}
+	if string(reloadedSigner.PublicKey().Marshal()) != string(pubKey.Marshal()) {
+		t.Errorf("reloaded public key does not match generated public key")
 	}
 }

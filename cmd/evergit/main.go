@@ -101,6 +101,7 @@ func lockStorage(root string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// LOCK_EX: exclusive lock, LOCK_NB: non blocking
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("%s is locked, is another Evergit instance using this storage? (%w)", path, err)

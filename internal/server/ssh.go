@@ -1,9 +1,8 @@
 package server
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
 	"errors"
@@ -251,15 +250,15 @@ func getOrCreateHostKey(path string) (ssh.Signer, error) {
 		return nil, fmt.Errorf("failed to read SSH host key %s: %w", path, err)
 	}
 
-	log.Println("[SSH] Generating new RSA host key...")
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	log.Println("[SSH] Generating new Ed25519 host key...")
+	_, privKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
 
-	privateKeyPEM := &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	privateKeyPEM, err := ssh.MarshalPrivateKey(privKey, "")
+	if err != nil {
+		return nil, err
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
@@ -271,6 +270,7 @@ func getOrCreateHostKey(path string) (ssh.Signer, error) {
 		return nil, err
 	}
 
+	// convert the in-memory pem Block and save the pem file on disk
 	if err := pem.Encode(f, privateKeyPEM); err != nil {
 		f.Close()
 		os.Remove(path)
@@ -281,5 +281,5 @@ func getOrCreateHostKey(path string) (ssh.Signer, error) {
 		return nil, err
 	}
 
-	return ssh.NewSignerFromKey(key)
+	return ssh.NewSignerFromKey(privKey)
 }
