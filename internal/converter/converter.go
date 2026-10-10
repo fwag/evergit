@@ -114,14 +114,20 @@ func (m *Manager) syncNativeSHA256(info *resolver.RepositoryInfo, changed bool, 
 		if progressWriter != nil {
 			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Syncing native SHA-256 updates...\n")
 		}
-		refspecs := []string{
+		// Fetch branches and tags, pruning any deleted upstream branches/tags
+		if _, err := runCmd(info.ServingPath, "git", "fetch", "--prune", "--", info.MirrorPath,
 			"+refs/heads/*:refs/heads/*",
 			"+refs/tags/*:refs/tags/*",
-			"+refs/evergit-backups/*:refs/evergit-backups/*",
-		}
-		args := append([]string{"fetch", "--prune", "--", info.MirrorPath}, refspecs...)
-		if _, err := runCmd(info.ServingPath, "git", args...); err != nil {
+		); err != nil {
 			return fmt.Errorf("failed to fetch native sha256 updates into %s: %w", info.ServingPath, err)
+		}
+
+		// Backup refs are never pruned: older versions or re-cloned mirrors may lose them,
+		// leaving the serving repo as their only copy. Fetch them additively without --prune.
+		if _, err := runCmd(info.ServingPath, "git", "fetch", "--", info.MirrorPath,
+			"+refs/evergit-backups/*:refs/evergit-backups/*",
+		); err != nil {
+			log.Printf("WARNING: failed to fetch backup refs for native sha256 repo %s: %v", info.RepoName, err)
 		}
 
 		if headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
@@ -152,6 +158,9 @@ func (m *Manager) syncNativeSHA256(info *resolver.RepositoryInfo, changed bool, 
 		os.RemoveAll(buildPath)
 		return fmt.Errorf("failed to clone native sha256 repository %s: %w", info.RepoName, err)
 	}
+
+	// clone --bare only copies heads and tags; also copy any existing backup refs
+	_, _ = runCmd(buildPath, "git", "fetch", "--", info.MirrorPath, "+refs/evergit-backups/*:refs/evergit-backups/*")
 
 	if headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
 		_, _ = runCmd(buildPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)

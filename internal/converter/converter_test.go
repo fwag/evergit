@@ -945,4 +945,24 @@ func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
 	if !strings.Contains(servingRefs, "refs/evergit-backups/heads/feature/") {
 		t.Errorf("deleted branch feature not archived in refs/evergit-backups/:\n%s", servingRefs)
 	}
+
+	// Verify that backup refs in serving repo are preserved even if the mirror loses them
+	// (e.g. mirror was re-cloned after corruption)
+	mirrorRefs, _ := runCmd(info.MirrorPath, "git", "for-each-ref", "--format=%(refname)")
+	for _, ref := range strings.Split(mirrorRefs, "\n") {
+		if strings.HasPrefix(ref, "refs/evergit-backups/") {
+			_, _ = runCmd(info.MirrorPath, "git", "update-ref", "-d", ref)
+		}
+	}
+	commitToUpstream(t, upstreamPath, "commit 2")
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo after mirror backup loss failed: %v", err)
+	}
+	servingRefsAfter, err := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		t.Fatalf("failed to read serving refs after sync: %v", err)
+	}
+	if !strings.Contains(servingRefsAfter, "refs/evergit-backups/heads/feature/") {
+		t.Errorf("backup ref was pruned from serving repo when mirror lost it:\n%s", servingRefsAfter)
+	}
 }
