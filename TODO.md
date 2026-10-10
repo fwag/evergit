@@ -9,7 +9,7 @@ This checklist tracks security, rate-limiting, and hardening improvements across
 - [ ] **[High] Nested repository paths can corrupt existing mirrors**
   - [ ] `resolver.ParsePath` accepts `.git` in non-final segments, so `/github/torvalds/linux.git/commondir/x` resolves to `mirrors/github.com/torvalds/linux.git/commondir/x.git`.
   - [ ] `syncMirror` runs `os.MkdirAll(filepath.Dir(MirrorPath))` before cloning, creating a `commondir` directory inside the real mirror; git then fails with `failed to read .../commondir: Is a directory`.
-  - [ ] The broken mirror still passes `looksLikeBareRepo`, so it is never repaired: after the TTL `configureMirrorRefs` fails and the repo is unservable until manual cleanup. The request also takes a different repo lock.
+  - [ ] The broken mirror still passes `looksLikeBareRepo`, so it is never repaired: after the TTL `syncMirror` fails and the repo is unservable until manual cleanup. The request also takes a different repo lock.
   - [ ] Fix: reject any non-final segment ending in `.git`, plus a resolver test.
 
 - [ ] **[Medium] Force-pushed history is served publicly**

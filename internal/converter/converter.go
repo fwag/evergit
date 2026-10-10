@@ -262,16 +262,8 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, err)
 		}
-		if err := configureMirrorRefs(info.MirrorPath); err != nil {
-			return false, err
-		}
 		return true, nil // Newly cloned, definitely changed
 	} else {
-		// Also applied here to migrate mirrors created by earlier versions with "clone --mirror"
-		if err := configureMirrorRefs(info.MirrorPath); err != nil {
-			return false, err
-		}
-
 		// Read current refs before fetching: without this baseline, force-pushes cannot be archived
 		oldRefs, err := listRefs(info.MirrorPath)
 		if err != nil {
@@ -283,7 +275,8 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 		}
 
 		// Fetch updates
-		_, err = runCmdTimeout(upstreamTimeout, info.MirrorPath, "git", "fetch", "--prune")
+		fetchArgs := append([]string{"fetch", "--prune", "origin"}, mirrorRefspecs...)
+		_, err = runCmdTimeout(upstreamTimeout, info.MirrorPath, "git", fetchArgs...)
 
 		// Archive overwritten/deleted refs even if the fetch failed midway, since it may already
 		// have pruned or updated some of them
@@ -331,51 +324,10 @@ func looksLikeBareRepo(path string) bool {
 	return err == nil && fi.IsDir()
 }
 
-// mirrorRefspecs restrict the mirror to branches and tags. Forge refs (refs/pull/*,
+// mirrorRefspecs restrict mirror fetches to branches and tags. Forge refs (refs/pull/*,
 // refs/merge-requests/*, ...) are not needed and can number in the tens of thousands. Being
 // scoped to heads and tags, "git fetch --prune" can never delete refs/evergit-backups/*.
 var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
-
-// configureMirrorRefs sets the mirror's fetch refspecs and, for mirrors created by earlier
-// versions with "clone --mirror", deletes the refs outside of them once.
-func configureMirrorRefs(mirrorPath string) error {
-	current, _ := runCmd(mirrorPath, "git", "config", "--get-all", "remote.origin.fetch")
-	if current == strings.Join(mirrorRefspecs, "\n") {
-		return nil
-	}
-
-	if _, err := runCmd(mirrorPath, "git", "config", "--replace-all", "remote.origin.fetch", mirrorRefspecs[0]); err != nil {
-		return fmt.Errorf("failed to configure fetch refspecs in %s: %w", mirrorPath, err)
-	}
-	for _, refspec := range mirrorRefspecs[1:] {
-		if _, err := runCmd(mirrorPath, "git", "config", "--add", "remote.origin.fetch", refspec); err != nil {
-			return fmt.Errorf("failed to configure fetch refspecs in %s: %w", mirrorPath, err)
-		}
-	}
-
-	refs, err := listRefs(mirrorPath)
-	if err != nil {
-		return err
-	}
-	var deletions strings.Builder
-	for ref := range refs {
-		if !strings.HasPrefix(ref, "refs/heads/") && !strings.HasPrefix(ref, "refs/tags/") && !strings.HasPrefix(ref, "refs/evergit-backups/") {
-			fmt.Fprintf(&deletions, "delete %s\n", ref)
-		}
-	}
-	if deletions.Len() == 0 {
-		return nil
-	}
-	log.Printf("Migrating mirror %s to branches and tags only", mirrorPath)
-	cmd := exec.Command("git", "update-ref", "--stdin")
-	cmd.Dir = mirrorPath
-	cmd.Env = GitEnv()
-	cmd.Stdin = strings.NewReader(deletions.String())
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to remove non-branch refs from %s: %w (output: %q)", mirrorPath, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
 
 func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.Writer) error {
 	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {

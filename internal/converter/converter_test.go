@@ -811,7 +811,8 @@ func TestOnlyBranchesAndTagsAreMirrored(t *testing.T) {
 	_, _ = runCmd(upstreamPath, "git", "update-ref", "refs/merge-requests/1/head", head)
 
 	info := newTestRepoInfo(t, upstreamPath)
-	if err := NewManager(0).EnsureRepo(info, nil); err != nil {
+	mgr := NewManager(0)
+	if err := mgr.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("EnsureRepo failed: %v", err)
 	}
 	assertOnlyBranchesAndTags(t, "mirror", info.MirrorPath)
@@ -819,23 +820,21 @@ func TestOnlyBranchesAndTagsAreMirrored(t *testing.T) {
 	if refs, _ := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)"); !strings.Contains(refs, "refs/tags/v1.0") {
 		t.Errorf("tag missing from serving repo:\n%s", refs)
 	}
-}
 
-func TestLegacyFullMirrorIsMigrated(t *testing.T) {
-	upstreamPath := newTestUpstream(t)
-	head, _ := runCmd(upstreamPath, "git", "rev-parse", "HEAD")
-	_, _ = runCmd(upstreamPath, "git", "update-ref", "refs/pull/1/head", head)
-	info := newTestRepoInfo(t, upstreamPath)
+	// Incremental fetch: upstream adds another branch, tag, and forge ref
+	commitToUpstream(t, upstreamPath, "second commit")
+	head2, _ := runCmd(upstreamPath, "git", "rev-parse", "HEAD")
+	_, _ = runCmd(upstreamPath, "git", "tag", "v2.0")
+	_, _ = runCmd(upstreamPath, "git", "update-ref", "refs/pull/2/head", head2)
 
-	// Mirror as created by earlier versions: every upstream ref
-	if _, err := runCmd("", "git", "clone", "-q", "--mirror", upstreamPath, info.MirrorPath); err != nil {
-		t.Fatal(err)
+	if err := mgr.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo incremental failed: %v", err)
 	}
-	if err := NewManager(0).EnsureRepo(info, nil); err != nil {
-		t.Fatalf("EnsureRepo failed: %v", err)
+	assertOnlyBranchesAndTags(t, "mirror after fetch", info.MirrorPath)
+	assertOnlyBranchesAndTags(t, "serving repo after fetch", info.ServingPath)
+	if refs, _ := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)"); !strings.Contains(refs, "refs/tags/v2.0") {
+		t.Errorf("tag v2.0 missing from serving repo:\n%s", refs)
 	}
-	assertOnlyBranchesAndTags(t, "migrated mirror", info.MirrorPath)
-	assertOnlyBranchesAndTags(t, "serving repo", info.ServingPath)
 }
 
 func TestSubmodulesAreRejectedWithClearError(t *testing.T) {
