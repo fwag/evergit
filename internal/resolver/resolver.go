@@ -58,9 +58,12 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 	if len(parts) < 3 {
 		return nil, errors.New("invalid repository path: must be in the format 'domain/owner/repo' or 'shorthand/owner/repo'")
 	}
-	for _, part := range parts {
+	for i, part := range parts {
 		if part == "." || part == ".." || !validSegment.MatchString(part) {
 			return nil, fmt.Errorf("invalid repository path segment %q", part)
+		}
+		if i < len(parts)-1 && strings.HasSuffix(strings.ToLower(part), ".git") {
+			return nil, fmt.Errorf("invalid repository path: non-final segment %q cannot end in .git", part)
 		}
 	}
 

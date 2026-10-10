@@ -6,11 +6,11 @@ This checklist tracks security, rate-limiting, and hardening improvements across
 
 ## 0. Known Vulnerabilities (from security review)
 
-- [ ] **[High] Nested repository paths can corrupt existing mirrors**
-  - [ ] `resolver.ParsePath` accepts `.git` in non-final segments, so `/github/torvalds/linux.git/commondir/x` resolves to `mirrors/github.com/torvalds/linux.git/commondir/x.git`.
-  - [ ] `syncMirror` runs `os.MkdirAll(filepath.Dir(MirrorPath))` before cloning, creating a `commondir` directory inside the real mirror; git then fails with `failed to read .../commondir: Is a directory`.
-  - [ ] The broken mirror still passes `looksLikeBareRepo`, so it is never repaired: after the TTL `syncMirror` fails and the repo is unservable until manual cleanup. The request also takes a different repo lock.
-  - [ ] Fix: reject any non-final segment ending in `.git`, plus a resolver test.
+- [x] **[High] Nested repository paths can corrupt existing mirrors**
+  - [x] `resolver.ParsePath` accepts `.git` in non-final segments, so `/github/torvalds/linux.git/commondir/x` resolves to `mirrors/github.com/torvalds/linux.git/commondir/x.git`.
+  - [x] `syncMirror` runs `os.MkdirAll(filepath.Dir(MirrorPath))` before cloning, creating a `commondir` directory inside the real mirror; git then fails with `failed to read .../commondir: Is a directory`.
+  - [x] The broken mirror still passes `looksLikeBareRepo`, so it is never repaired: after the TTL `syncMirror` fails and the repo is unservable until manual cleanup. The request also takes a different repo lock.
+  - [x] Fix: reject any non-final segment ending in `.git`, plus a resolver test.
 
 - [ ] **[Medium] Force-pushed history is served publicly**
   - [ ] `refs/evergit-backups/*` reaches the serving repo (`fast-export --all`, and the explicit refspec in `syncNativeSHA256`), so clients can fetch commits that upstream removed, e.g. leaked secrets or DMCA takedowns.
@@ -34,14 +34,14 @@ This checklist tracks security, rate-limiting, and hardening improvements across
 
 Because HAProxy cannot inspect Git conversion costs or encrypted SSH application state, Evergit must guard its own internal resources.
 
-- [ ] **Global JIT Conversion Concurrency Limiter**
-  - [ ] Implement a global semaphore (e.g., using `golang.org/x/sync/semaphore`) to bound simultaneous `git-fast-export | git-fast-import` pipelines across all repositories.
-  - [ ] Default concurrency cap to `runtime.NumCPU()` (or expose via `-max-conversions` flag).
-  - [ ] Queue incoming conversions with timeout rather than spawning unbounded subprocesses.
+- [x] **Global JIT Conversion Concurrency Limiter**
+  - [x] Implement a global semaphore (e.g., using `golang.org/x/sync/semaphore`) to bound simultaneous `git-fast-export | git-fast-import` pipelines across all repositories.
+  - [x] Default concurrency cap to `runtime.NumCPU()` (or expose via `-max-conversions` flag).
+  - [x] Queue incoming conversions with timeout rather than spawning unbounded subprocesses.
 
-- [ ] **Graceful Load Shedding & Informative Errors**
-  - [ ] For HTTP: return `HTTP 429 Too Many Requests` or `HTTP 503 Service Unavailable` with `Retry-After` header when conversion queues are saturated.
-  - [ ] For SSH: write user-friendly rejection messages to `stderr` channel (e.g., `error: server busy, please retry later`) before closing sessions.
+- [x] **Graceful Load Shedding & Informative Errors**
+  - [x] For HTTP: return `HTTP 429 Too Many Requests` or `HTTP 503 Service Unavailable` with `Retry-After` header when conversion queues are saturated.
+  - [x] For SSH: write user-friendly rejection messages to `stderr` channel (e.g., `error: server busy, please retry later`) before closing sessions.
 
 - [ ] **Disk Space Safeguards & Storage Quotas**
   - [ ] Inspect available storage using `syscall.Statfs` before initiating a new upstream mirror clone.

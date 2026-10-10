@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,10 +21,18 @@ import (
 	"evergit/internal/resolver"
 )
 
+// ErrServerBusy is returned when all conversion worker slots are occupied and the queue times out.
+var ErrServerBusy = errors.New("server is busy performing other conversions, please retry shortly")
+
+// DefaultConversionTimeout is the maximum time a request will wait in the conversion queue before shedding load.
+const DefaultConversionTimeout = 30 * time.Second
+
 type Manager struct {
-	cacheTTL  time.Duration
-	locksMu   sync.Mutex
-	repoLocks map[string]*repoLock
+	cacheTTL       time.Duration
+	conversionSem  chan struct{}
+	conversionWait time.Duration
+	locksMu        sync.Mutex
+	repoLocks      map[string]*repoLock
 }
 
 // repoLock is a per-repository mutex, reference-counted so idle entries can be dropped.
@@ -32,10 +41,48 @@ type repoLock struct {
 	users int
 }
 
-func NewManager(cacheTTL time.Duration) *Manager {
+func NewManager(cacheTTL time.Duration, maxConversions ...int) *Manager {
+	limit := runtime.NumCPU()
+	if len(maxConversions) > 0 && maxConversions[0] > 0 {
+		limit = maxConversions[0]
+	}
+	if limit < 1 {
+		limit = 1
+	}
 	return &Manager{
-		cacheTTL:  cacheTTL,
-		repoLocks: make(map[string]*repoLock),
+		cacheTTL:       cacheTTL,
+		conversionSem:  make(chan struct{}, limit),
+		conversionWait: DefaultConversionTimeout,
+		repoLocks:      make(map[string]*repoLock),
+	}
+}
+
+// SetConversionTimeout configures the maximum time an incoming conversion request waits in queue.
+func (m *Manager) SetConversionTimeout(d time.Duration) {
+	m.conversionWait = d
+}
+
+// TryAcquireConversionSlot acquires a conversion concurrency slot if available.
+func (m *Manager) TryAcquireConversionSlot() bool {
+	if m.conversionSem == nil {
+		return false
+	}
+	select {
+	case m.conversionSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// ReleaseConversionSlot releases a conversion concurrency slot.
+func (m *Manager) ReleaseConversionSlot() {
+	if m.conversionSem == nil {
+		return
+	}
+	select {
+	case <-m.conversionSem:
+	default:
 	}
 }
 
@@ -345,6 +392,20 @@ type conversionPlan struct {
 }
 
 func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+	// Guard against unbounded concurrent conversions across all repositories
+	if m.conversionSem != nil {
+		wait := m.conversionWait
+		if wait <= 0 {
+			wait = DefaultConversionTimeout
+		}
+		select {
+		case m.conversionSem <- struct{}{}:
+			defer func() { <-m.conversionSem }()
+		case <-time.After(wait):
+			return ErrServerBusy
+		}
+	}
+
 	plan, err := prepareConversion(info, progressWriter)
 	if err != nil {
 		return err

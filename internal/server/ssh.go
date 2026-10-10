@@ -182,6 +182,9 @@ func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
 
 	if err := s.converter.EnsureRepo(info, ch.Stderr()); err != nil {
 		log.Printf("[SSH] JIT conversion failed for %s: %v", info.RepoName, err)
+		if errors.Is(err, converter.ErrServerBusy) {
+			_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: error: server busy with other conversions, please retry shortly\n")
+		}
 		writeError(ch, fmt.Errorf("gitconv failed: %w", err))
 		return err
 	}

@@ -95,6 +95,11 @@ func writeConversionError(w http.ResponseWriter, info *resolver.RepositoryInfo, 
 		http.Error(w, "Evergit: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if errors.Is(err, converter.ErrServerBusy) {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "Evergit: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	http.Error(w, "Internal Server Error (gitconv failure)", http.StatusInternalServerError)
 }
 

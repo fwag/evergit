@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,10 +17,11 @@ var DefaultAllowedHosts = []string{"github.com", "gitlab.com", "bitbucket.org"}
 const DefaultShorthands = "github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org"
 
 type Config struct {
-	HTTPAddr    string
-	SSHAddr     string
-	StorageRoot string
-	CacheTTL    time.Duration
+	HTTPAddr       string
+	SSHAddr        string
+	StorageRoot    string
+	CacheTTL       time.Duration
+	MaxConversions int
 	// AllowedHosts lists the upstream hosts clients may request; anything else is rejected
 	AllowedHosts []string
 	// Shorthands maps short prefix aliases to their target domains (e.g. "github" -> "github.com")
@@ -35,13 +38,21 @@ func Load() *Config {
 	}
 	storageRoot, _ = filepath.Abs(storageRoot)
 
+	maxConversions := runtime.NumCPU()
+	if envMax := os.Getenv("EVERGIT_MAX_CONVERSIONS"); envMax != "" {
+		if val, err := strconv.Atoi(envMax); err == nil && val > 0 {
+			maxConversions = val
+		}
+	}
+
 	return &Config{
-		HTTPAddr:     getEnv("EVERGIT_HTTP_ADDR", ":8080"),
-		SSHAddr:      getEnv("EVERGIT_SSH_ADDR", ":2222"),
-		StorageRoot:  storageRoot,
-		CacheTTL:     5 * time.Minute,
-		AllowedHosts: ParseHostList(getEnv("EVERGIT_ALLOWED_HOSTS", strings.Join(DefaultAllowedHosts, ","))),
-		Shorthands:   ParseShorthands(getEnv("EVERGIT_SHORTHANDS", DefaultShorthands)),
+		HTTPAddr:       getEnv("EVERGIT_HTTP_ADDR", ":8080"),
+		SSHAddr:        getEnv("EVERGIT_SSH_ADDR", ":2222"),
+		StorageRoot:    storageRoot,
+		CacheTTL:       5 * time.Minute,
+		MaxConversions: maxConversions,
+		AllowedHosts:   ParseHostList(getEnv("EVERGIT_ALLOWED_HOSTS", strings.Join(DefaultAllowedHosts, ","))),
+		Shorthands:     ParseShorthands(getEnv("EVERGIT_SHORTHANDS", DefaultShorthands)),
 	}
 }
 

@@ -943,3 +943,30 @@ func TestConversionEmitsProgress(t *testing.T) {
 		t.Errorf("expected initial conversion notice in progress output, got:\n%s", progressOutput)
 	}
 }
+
+func TestConversionConcurrencyLimiter(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+
+	manager := NewManager(0, 1)
+	manager.SetConversionTimeout(10 * time.Millisecond)
+
+	// Acquire the single conversion slot
+	if !manager.TryAcquireConversionSlot() {
+		t.Fatal("expected slot acquisition to succeed")
+	}
+
+	// EnsureRepo must time out waiting for slot and return ErrServerBusy
+	err := manager.EnsureRepo(info, nil)
+	if !errors.Is(err, ErrServerBusy) {
+		t.Fatalf("expected ErrServerBusy when semaphore is full, got: %v", err)
+	}
+
+	// Release slot
+	manager.ReleaseConversionSlot()
+
+	// EnsureRepo should now proceed and succeed
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("expected EnsureRepo to succeed after slot release: %v", err)
+	}
+}

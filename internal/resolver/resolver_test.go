@@ -90,6 +90,21 @@ func TestParsePath(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "Non-final segment ending in .git (mirror corruption DoS attack)",
+			rawPath: "/github/torvalds/linux.git/commondir/x",
+			wantErr: true,
+		},
+		{
+			name:    "Non-final segment ending in .git with .git suffix",
+			rawPath: "/github/torvalds/linux.git/commondir/x.git",
+			wantErr: true,
+		},
+		{
+			name:    "Owner segment ending in .git",
+			rawPath: "github.com/user.git/repo",
+			wantErr: true,
+		},
+		{
 			name:    "Empty segment",
 			rawPath: "github.com/org//repo",
 			wantErr: true,

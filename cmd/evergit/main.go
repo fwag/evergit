@@ -21,6 +21,7 @@ func main() {
 	sshAddr := flag.String("ssh", "", "SSH listen address (e.g. :2222)")
 	storageRoot := flag.String("storage", "", "Storage root directory")
 	cacheTTLStr := flag.String("ttl", "5m", "Cache TTL (e.g. 5m, 1h)")
+	maxConversionsFlag := flag.Int("max-conversions", 0, "Maximum concurrent JIT conversions (0 = CPU count)")
 	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
 	shorthands := flag.String("shorthands", "", "Comma-separated domain shorthand mappings in alias=domain format (default: github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org)")
 	flag.Parse()
@@ -52,6 +53,10 @@ func main() {
 		cfg.CacheTTL = ttl
 	}
 
+	if *maxConversionsFlag > 0 {
+		cfg.MaxConversions = *maxConversionsFlag
+	}
+
 	if *allowedHosts != "" {
 		cfg.AllowedHosts = config.ParseHostList(*allowedHosts)
 	}
@@ -60,10 +65,11 @@ func main() {
 	}
 
 	log.Printf("Initializing Evergit Daemon...")
-	log.Printf("Storage Root:  %s", cfg.StorageRoot)
-	log.Printf("Cache TTL:     %v", cfg.CacheTTL)
-	log.Printf("Allowed hosts: %s", strings.Join(cfg.AllowedHosts, ", "))
-	log.Printf("Shorthands:    %s", config.FormatShorthands(cfg.Shorthands))
+	log.Printf("Storage Root:    %s", cfg.StorageRoot)
+	log.Printf("Cache TTL:       %v", cfg.CacheTTL)
+	log.Printf("Max conversions: %d", cfg.MaxConversions)
+	log.Printf("Allowed hosts:   %s", strings.Join(cfg.AllowedHosts, ", "))
+	log.Printf("Shorthands:      %s", config.FormatShorthands(cfg.Shorthands))
 
 	// Ensure Storage Root exists
 	if err := os.MkdirAll(cfg.StorageRoot, 0755); err != nil {
@@ -77,7 +83,7 @@ func main() {
 	// Also keeps the file referenced: a garbage-collected *os.File would close and release the lock
 	defer lockFile.Close()
 
-	convManager := converter.NewManager(cfg.CacheTTL)
+	convManager := converter.NewManager(cfg.CacheTTL, cfg.MaxConversions)
 
 	// Start SSH Server
 	sshServer, err := server.NewSSHServer(cfg, convManager)

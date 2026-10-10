@@ -140,3 +140,51 @@ func TestCloneOfRepoWithSubmodulesExplainsFailure(t *testing.T) {
 		t.Errorf("clone should fail explaining submodules are unsupported, got: %v", err)
 	}
 }
+
+func TestLoadSheddingReturns503(t *testing.T) {
+	tempDir := t.TempDir()
+	upstreamPath := filepath.Join(tempDir, "upstream")
+	if _, err := runCmd("", "git", "init", "-q", "--initial-branch=main", "--object-format=sha1", upstreamPath); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
+	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
+	_ = os.WriteFile(filepath.Join(upstreamPath, "f.txt"), []byte("hello"), 0644)
+	_, _ = runCmd(upstreamPath, "git", "add", "f.txt")
+	if _, err := runCmd(upstreamPath, "git", "commit", "-q", "-m", "initial"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		StorageRoot:       filepath.Join(tempDir, "storage"),
+		CacheTTL:          0,
+		AllowedHosts:      []string{"github.com"},
+		Shorthands:        config.ParseShorthands(config.DefaultShorthands),
+		UpstreamOverrides: map[string]string{"github.com": upstreamPath},
+	}
+
+	conv := converter.NewManager(0, 1)
+	conv.SetConversionTimeout(10 * time.Millisecond)
+
+	// Acquire the conversion slot
+	if !conv.TryAcquireConversionSlot() {
+		t.Fatal("expected slot acquisition to succeed")
+	}
+	defer conv.ReleaseConversionSlot()
+
+	httpServer, err := server.NewHTTPServer(cfg, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/github.com/owner/repo.git/info/refs?service=git-upload-pack", nil)
+	rec := httptest.NewRecorder()
+	httpServer.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if retryAfter := rec.Header().Get("Retry-After"); retryAfter != "5" {
+		t.Errorf("Retry-After = %q, want %q", retryAfter, "5")
+	}
+}
