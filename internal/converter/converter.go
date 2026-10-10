@@ -335,28 +335,56 @@ func looksLikeBareRepo(path string) bool {
 // scoped to heads and tags, "git fetch --prune" can never delete refs/evergit-backups/*.
 var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
+type conversionPlan struct {
+	targetPath    string
+	isIncremental bool
+	exportFlags   []string
+	importFlags   []string
+	failed        bool
+}
+
 func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.Writer) error {
-	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
-		return fmt.Errorf("failed to create repos directory: %w", err)
+	plan, err := prepareConversion(info, progressWriter)
+	if err != nil {
+		return err
+	}
+	if !plan.isIncremental {
+		defer func() {
+			if plan.failed {
+				os.RemoveAll(plan.targetPath)
+			}
+		}()
 	}
 
-	// Paths for persistent marks files inside the repository directory
-	sha1MarksPath := filepath.Join(info.ServingPath, "evergit-sha1-marks.txt")
-	sha256MarksPath := filepath.Join(info.ServingPath, "evergit-sha256-marks.txt")
+	if err := runConversionPipeline(info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, progressWriter); err != nil {
+		plan.failed = true
+		return err
+	}
 
-	// Check if we are doing incremental conversion
-	isIncremental := false
-	if _, err := os.Stat(filepath.Join(info.ServingPath, "HEAD")); err == nil {
-		if _, err1 := os.Stat(sha1MarksPath); err1 == nil {
-			if _, err2 := os.Stat(sha256MarksPath); err2 == nil {
-				isIncremental = true
-			}
+	if err := m.finalizeConversion(info, plan.targetPath, plan.isIncremental); err != nil {
+		plan.failed = true
+		return err
+	}
+
+	return nil
+}
+
+func isIncrementalConversion(servingPath string) bool {
+	for _, file := range []string{"HEAD", "evergit-sha1-marks.txt", "evergit-sha256-marks.txt"} {
+		if _, err := os.Stat(filepath.Join(servingPath, file)); err != nil {
+			return false
 		}
 	}
+	return true
+}
 
+func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) (*conversionPlan, error) {
+	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create repos directory: %w", err)
+	}
+
+	isIncremental := isIncrementalConversion(info.ServingPath)
 	var targetPath string
-	var exportFlags []string
-	var importFlags []string
 
 	if isIncremental {
 		targetPath = info.ServingPath
@@ -364,36 +392,47 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		if progressWriter != nil {
 			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Incremental update found. Performing incremental JIT conversion...\n")
 		}
-
-		exportFlags = []string{"--all", "--signed-commits=strip", "--tag-of-filtered-object=rewrite", "--import-marks=" + sha1MarksPath, "--export-marks=" + sha1MarksPath}
-		importFlags = []string{"--force", "--import-marks=" + sha256MarksPath, "--export-marks=" + sha256MarksPath}
 	} else {
-		// Full conversion into a fresh build directory, published by publishBuild once complete
 		targetPath = filepath.Join(info.BuildsPath, strconv.FormatInt(time.Now().UnixNano(), 10))
 		log.Printf("Starting full conversion for repository %s...", info.RepoName)
 		if progressWriter != nil {
 			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Performing full JIT SHA-1 -> SHA-256 history conversion, please wait...\n")
 		}
-
-		// Init bare SHA256 repo
-		_, err := runCmd("", "git", "init", "--bare", "--object-format=sha256", targetPath)
-		if err != nil {
-			return fmt.Errorf("failed to initialize bare sha256 repository: %w", err)
+		if _, err := runCmd("", "git", "init", "--bare", "--object-format=sha256", targetPath); err != nil {
+			return nil, fmt.Errorf("failed to initialize bare sha256 repository: %w", err)
 		}
-
-		// (We will enable compatibility mapping ONLY after fast-import completes successfully)
-
-		sha1TmpMarksPath := filepath.Join(targetPath, "evergit-sha1-marks.txt")
-		sha256TmpMarksPath := filepath.Join(targetPath, "evergit-sha256-marks.txt")
-
-		exportFlags = []string{"--all", "--signed-commits=strip", "--tag-of-filtered-object=rewrite", "--export-marks=" + sha1TmpMarksPath}
-		importFlags = []string{"--export-marks=" + sha256TmpMarksPath}
 	}
 
-	// Run fast-export and fast-import
+	sha1Marks := filepath.Join(targetPath, "evergit-sha1-marks.txt")
+	sha256Marks := filepath.Join(targetPath, "evergit-sha256-marks.txt")
+
+	exportFlags := []string{
+		"--all",
+		"--signed-commits=strip",
+		"--tag-of-filtered-object=rewrite",
+		"--export-marks=" + sha1Marks,
+	}
+	importFlags := []string{
+		"--export-marks=" + sha256Marks,
+	}
+
+	if isIncremental {
+		exportFlags = append(exportFlags, "--import-marks="+sha1Marks)
+		importFlags = append([]string{"--force", "--import-marks=" + sha256Marks}, importFlags...)
+	}
+
+	return &conversionPlan{
+		targetPath:    targetPath,
+		isIncremental: isIncremental,
+		exportFlags:   exportFlags,
+		importFlags:   importFlags,
+	}, nil
+}
+
+func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, progressWriter io.Writer) error {
 	exportCmd := exec.Command("git", append([]string{"fast-export"}, exportFlags...)...)
 	exportCmd.Env = GitEnv()
-	exportCmd.Dir = info.MirrorPath
+	exportCmd.Dir = mirrorPath
 
 	importCmd := exec.Command("git", append([]string{"fast-import"}, importFlags...)...)
 	importCmd.Env = GitEnv()
@@ -406,7 +445,6 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 	var exportErrBuf, importErrBuf strings.Builder
 	exportCmd.Stderr = &exportErrBuf
 
-	// Stream fast-import progress to progressWriter in real-time
 	importStderrPipe, err := importCmd.StderrPipe()
 	if err != nil {
 		_ = r.Close()
@@ -427,7 +465,6 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		return fmt.Errorf("failed to start git fast-import: %w", err)
 	}
 
-	// Stream stderr of fast-import in real-time, keeping it for error reporting
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
@@ -435,7 +472,7 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		for scanner.Scan() {
 			line := scanner.Text()
 			importErrBuf.WriteString(line + "\n")
-			log.Printf("[%s fast-import] %s", info.RepoName, line)
+			log.Printf("[%s fast-import] %s", repoName, line)
 			if progressWriter != nil {
 				_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [Progress] %s\n", line)
 			}
@@ -449,72 +486,55 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		exportErrChan <- err
 	}()
 
-	// All stderr reads must complete before Wait closes the pipe
 	<-stderrDone
 	importErr := importCmd.Wait()
 	_ = r.Close()
 
 	exportErr := <-exportErrChan
 
-	// Check fast-import first: when it fails, fast-export usually fails too, on a broken pipe
 	if importErr != nil {
-		if !isIncremental {
-			os.RemoveAll(targetPath)
-		}
 		if m := gitlinkRejection.FindStringSubmatch(importErrBuf.String()); m != nil {
 			return fmt.Errorf("%w: %s records SHA-1 commit %s at %q, which has no SHA-256 equivalent",
-				ErrSubmodulesUnsupported, info.RepoName, m[1], m[2])
+				ErrSubmodulesUnsupported, repoName, m[1], m[2])
 		}
 		return fmt.Errorf("git fast-import failed: %v (stderr: %q)", importErr, strings.TrimSpace(importErrBuf.String()))
 	}
 	if exportErr != nil {
-		if !isIncremental {
-			os.RemoveAll(targetPath)
-		}
 		return fmt.Errorf("git fast-export failed: %v (stderr: %q)", exportErr, strings.TrimSpace(exportErrBuf.String()))
 	}
+	return nil
+}
 
-	// fast-import never deletes refs, so drop the ones that no longer exist in the mirror
+func (m *Manager) finalizeConversion(info *resolver.RepositoryInfo, targetPath string, isIncremental bool) error {
 	if isIncremental {
 		if err := pruneServingRefs(info); err != nil {
 			return err
 		}
 	}
 
-	// Get HEAD symbolic-ref from mirror
 	headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD")
 	if err != nil {
 		headRef = "refs/heads/main"
 	}
 
-	// Regenerate the loose-object-idx translation map from the complete marks files
 	if err := generateLooseObjectIdx(targetPath); err != nil {
-		if !isIncremental {
-			os.RemoveAll(targetPath)
-		}
 		return fmt.Errorf("failed to generate loose-object-idx compatibility map: %w", err)
 	}
 
-	// Set the default branch (HEAD) symbolic ref
-	_, err = runCmd(targetPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
-	if err != nil {
+	if _, err := runCmd(targetPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef); err != nil {
 		log.Printf("WARNING: failed to set symbolic-ref HEAD in %s to %s: %v", targetPath, headRef, err)
 	}
 
-	// Update the mtime of the HEAD file to represent our sync/cache point
 	now := time.Now()
 	_ = os.Chtimes(filepath.Join(targetPath, "HEAD"), now, now)
 
 	if !isIncremental {
 		if err := publishBuild(info, targetPath); err != nil {
-			os.RemoveAll(targetPath)
 			return err
 		}
 	}
 
-	// Log the translated backup refs to show both SHA256 and SHA1 mappings
 	m.logBackupRefs(info)
-
 	return nil
 }
 
