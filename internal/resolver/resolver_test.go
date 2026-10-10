@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"evergit/internal/config"
@@ -11,7 +12,7 @@ func TestParsePath(t *testing.T) {
 	storageRoot := "/tmp/evergit"
 	cfg := &config.Config{
 		StorageRoot:  storageRoot,
-		AllowedHosts: config.DefaultAllowedHosts,
+		AllowedHosts: append(slices.Clone(config.DefaultAllowedHosts), "git.custom.org"),
 		Shorthands:   config.ParseShorthands(config.DefaultShorthands),
 	}
 
@@ -102,6 +103,46 @@ func TestParsePath(t *testing.T) {
 			wantRemote:  "https://github.com/ta/evergit.git",
 			wantMirror:  filepath.Join(storageRoot, "mirrors", "github.com", "ta", "evergit.git"),
 			wantServing: filepath.Join(storageRoot, "repos", "github.com", "ta", "evergit.git"),
+		},
+		{
+			name:        "GitHub owner and repo are lowercased",
+			rawPath:     "github/Torvalds/Linux.git",
+			wantDomain:  "github.com",
+			wantOwner:   "torvalds",
+			wantRepo:    "linux",
+			wantRemote:  "https://github.com/torvalds/linux.git",
+			wantMirror:  filepath.Join(storageRoot, "mirrors", "github.com", "torvalds", "linux.git"),
+			wantServing: filepath.Join(storageRoot, "repos", "github.com", "torvalds", "linux.git"),
+		},
+		{
+			name:        "GitLab subgroup and repo are lowercased",
+			rawPath:     "gitlab.com/GitLab-Org/Sub1/Sub2/MyRepo.git",
+			wantDomain:  "gitlab.com",
+			wantOwner:   "gitlab-org/sub1/sub2",
+			wantRepo:    "myrepo",
+			wantRemote:  "https://gitlab.com/gitlab-org/sub1/sub2/myrepo.git",
+			wantMirror:  filepath.Join(storageRoot, "mirrors", "gitlab.com", "gitlab-org", "sub1", "sub2", "myrepo.git"),
+			wantServing: filepath.Join(storageRoot, "repos", "gitlab.com", "gitlab-org", "sub1", "sub2", "myrepo.git"),
+		},
+		{
+			name:        "Bitbucket workspace and repo are lowercased",
+			rawPath:     "bitbucket.org/MyTeam/MyRepo.git",
+			wantDomain:  "bitbucket.org",
+			wantOwner:   "myteam",
+			wantRepo:    "myrepo",
+			wantRemote:  "https://bitbucket.org/myteam/myrepo.git",
+			wantMirror:  filepath.Join(storageRoot, "mirrors", "bitbucket.org", "myteam", "myrepo.git"),
+			wantServing: filepath.Join(storageRoot, "repos", "bitbucket.org", "myteam", "myrepo.git"),
+		},
+		{
+			name:        "Generic host preserves case",
+			rawPath:     "git.custom.org/MyTeam/MyRepo.git",
+			wantDomain:  "git.custom.org",
+			wantOwner:   "MyTeam",
+			wantRepo:    "MyRepo",
+			wantRemote:  "https://git.custom.org/MyTeam/MyRepo.git",
+			wantMirror:  filepath.Join(storageRoot, "mirrors", "git.custom.org", "MyTeam", "MyRepo.git"),
+			wantServing: filepath.Join(storageRoot, "repos", "git.custom.org", "MyTeam", "MyRepo.git"),
 		},
 		{
 			name:    "Host not in allowlist",

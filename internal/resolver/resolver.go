@@ -24,6 +24,23 @@ type RepositoryInfo struct {
 	BuildsPath  string // e.g. <storageRoot>/builds/github.com/ta/evergit.git; holds full conversion builds
 }
 
+// caseInsensitiveHosts are known Git forge hosts where user/org names and repository names
+// are strictly case-insensitive (e.g. "Torvalds/Linux" is identical to "torvalds/linux").
+var caseInsensitiveHosts = []string{
+	"github.com",
+	"gitlab.com",
+	"bitbucket.org",
+}
+
+func isCaseInsensitiveHost(domain string) bool {
+	for _, host := range caseInsensitiveHosts {
+		if domain == host || strings.HasSuffix(domain, "."+host) {
+			return true
+		}
+	}
+	return false
+}
+
 // ParsePath parses a raw Git path (e.g. "github/owner/repo.git" or "github.com/org/sub/repo.git")
 // and resolves it into detailed repository information based on the configured storage root.
 // Only hosts listed in cfg.AllowedHosts are accepted.
@@ -60,6 +77,13 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 	// Only proxy explicitly allowed upstreams, so clients cannot point Evergit at internal hosts
 	if !slices.Contains(cfg.AllowedHosts, domain) {
 		return nil, fmt.Errorf("upstream host %q is not allowed", domain)
+	}
+
+	// Normalize owner and repo to lowercase for known case-insensitive hosts to avoid duplicate
+	// mirrors, duplicate conversions, and repo lock bypassing.
+	if isCaseInsensitiveHost(domain) {
+		owner = strings.ToLower(owner)
+		repoName = strings.ToLower(repoName)
 	}
 
 	// Rebuild remote URL

@@ -52,9 +52,9 @@ Because HAProxy cannot inspect Git conversion costs or encrypted SSH application
   - [ ] Implement background LRU or TTL-based garbage collection for stale cached mirrors under `storage/mirrors/` and `storage/builds/`.
   - [ ] Prevent runaway disk consumption from one-off repository clones.
 
-- [ ] **Case-Insensitive Path Normalization**
-  - [ ] `github/Torvalds/Linux` and `github/torvalds/linux` currently produce separate mirrors and conversions, multiplying resource usage and bypassing the per-repo lock.
-  - [ ] Lowercase owner and repo for hosts known to be case-insensitive (GitHub, GitLab, Bitbucket).
+- [x] **Case-Insensitive Path Normalization**
+  - [x] `github/Torvalds/Linux` and `github/torvalds/linux` currently produce separate mirrors and conversions, multiplying resource usage and bypassing the per-repo lock.
+  - [x] Lowercase owner and repo for hosts known to be case-insensitive (GitHub, GitLab, Bitbucket).
 
 - [ ] **SSH Session Limits**
   - [ ] Any key is accepted and a session that never sends `exec` is held forever: add an idle timeout for sessions awaiting a request.
