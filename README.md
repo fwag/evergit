@@ -103,11 +103,6 @@ git config evergit.url http://localhost:8080/github.com/owner/repo.git
 > submodule commits: with it enabled, `git fetch` / `git submodule update` and commits that pin a submodule fail with
 > `Failed to convert object from sha256 to sha1`. Use the lookups above instead; clones stay plain SHA-256 repositories.
 
-The full commit mapping is also downloadable as a plain-text table (`<sha256> <sha1>` per line) for offline lookups:
-```bash
-curl -s http://localhost:8080/github.com/owner/repo.git/objects/loose-object-idx | grep 722a661
-```
-
 ---
 
 ##  Security Architecture

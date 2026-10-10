@@ -80,13 +80,6 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 			return
 		}
 
-		// Hijack to serve loose-object-idx directly
-		if strings.HasSuffix(r.URL.Path, "/objects/loose-object-idx") {
-			idxPath := filepath.Join(info.ServingPath, "objects", "loose-object-idx")
-			http.ServeFile(w, r, idxPath)
-			return
-		}
-
 		// Serve using git-http-backend cgi
 		cgiHandler.ServeHTTP(w, r)
 	})
@@ -160,7 +153,6 @@ func extractRepoPath(urlPath string) (string, bool) {
 		"/info/refs",
 		"/git-upload-pack",
 		"/git-receive-pack",
-		"/objects/loose-object-idx",
 	}
 
 	for _, suffix := range suffixes {
