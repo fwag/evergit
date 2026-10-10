@@ -927,3 +927,19 @@ func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
 		t.Errorf("backup ref was pruned from serving repo when mirror lost it:\n%s", servingRefsAfter)
 	}
 }
+
+func TestConversionEmitsProgress(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager(0)
+
+	var progressBuf strings.Builder
+	if err := manager.EnsureRepo(info, &progressBuf); err != nil {
+		t.Fatalf("EnsureRepo failed: %v", err)
+	}
+
+	progressOutput := progressBuf.String()
+	if !strings.Contains(progressOutput, "history conversion, please wait...") {
+		t.Errorf("expected initial conversion notice in progress output, got:\n%s", progressOutput)
+	}
+}

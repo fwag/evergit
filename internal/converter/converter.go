@@ -340,6 +340,7 @@ type conversionPlan struct {
 	isIncremental bool
 	exportFlags   []string
 	importFlags   []string
+	totalObjects  int
 	failed        bool
 }
 
@@ -356,7 +357,7 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		}()
 	}
 
-	if err := runConversionPipeline(info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, progressWriter); err != nil {
+	if err := runConversionPipeline(info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, plan.totalObjects, plan.isIncremental, progressWriter); err != nil {
 		plan.failed = true
 		return err
 	}
@@ -378,6 +379,22 @@ func isIncrementalConversion(servingPath string) bool {
 	return true
 }
 
+func countExportableObjects(mirrorPath string) int {
+	commitsOut, err := runCmd(mirrorPath, "git", "rev-list", "--all", "--count")
+	if err != nil {
+		return 0
+	}
+	commits, _ := strconv.Atoi(strings.TrimSpace(commitsOut))
+
+	blobsOut, err := runCmd(mirrorPath, "git", "rev-list", "--objects", "--filter=object:type=blob", "--all", "--count")
+	if err != nil {
+		return commits
+	}
+	blobs, _ := strconv.Atoi(strings.TrimSpace(blobsOut))
+
+	return commits + blobs
+}
+
 func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) (*conversionPlan, error) {
 	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create repos directory: %w", err)
@@ -385,6 +402,7 @@ func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) 
 
 	isIncremental := isIncrementalConversion(info.ServingPath)
 	var targetPath string
+	totalObjects := 0
 
 	if isIncremental {
 		targetPath = info.ServingPath
@@ -401,6 +419,7 @@ func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) 
 		if _, err := runCmd("", "git", "init", "--bare", "--object-format=sha256", targetPath); err != nil {
 			return nil, fmt.Errorf("failed to initialize bare sha256 repository: %w", err)
 		}
+		totalObjects = countExportableObjects(info.MirrorPath)
 	}
 
 	sha1Marks := filepath.Join(targetPath, "evergit-sha1-marks.txt")
@@ -410,6 +429,7 @@ func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) 
 		"--all",
 		"--signed-commits=strip",
 		"--tag-of-filtered-object=rewrite",
+		fmt.Sprintf("--progress=%d", progressObjectInterval),
 		"--export-marks=" + sha1Marks,
 	}
 	importFlags := []string{
@@ -426,10 +446,11 @@ func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) 
 		isIncremental: isIncremental,
 		exportFlags:   exportFlags,
 		importFlags:   importFlags,
+		totalObjects:  totalObjects,
 	}, nil
 }
 
-func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, progressWriter io.Writer) error {
+func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, totalObjects int, isIncremental bool, progressWriter io.Writer) error {
 	exportCmd := exec.Command("git", append([]string{"fast-export"}, exportFlags...)...)
 	exportCmd.Env = GitEnv()
 	exportCmd.Dir = mirrorPath
@@ -445,10 +466,18 @@ func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFla
 	var exportErrBuf, importErrBuf strings.Builder
 	exportCmd.Stderr = &exportErrBuf
 
+	importStdoutPipe, err := importCmd.StdoutPipe()
+	if err != nil {
+		_ = r.Close()
+		_ = w.Close()
+		return fmt.Errorf("failed to create stdout pipe for git fast-import: %w", err)
+	}
+
 	importStderrPipe, err := importCmd.StderrPipe()
 	if err != nil {
 		_ = r.Close()
 		_ = w.Close()
+		_ = importStdoutPipe.Close()
 		return fmt.Errorf("failed to create stderr pipe for git fast-import: %w", err)
 	}
 
@@ -465,17 +494,43 @@ func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFla
 		return fmt.Errorf("failed to start git fast-import: %w", err)
 	}
 
-	stderrDone := make(chan struct{})
+	var pipesWg sync.WaitGroup
+	pipesWg.Add(2)
+
+	// Stream stdout of fast-import in real-time (contains "--progress" statements from fast-export)
 	go func() {
-		defer close(stderrDone)
+		defer pipesWg.Done()
+		scanner := bufio.NewScanner(importStdoutPipe)
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("[%s fast-import] %s", repoName, line)
+			if progressWriter != nil {
+				if totalObjects > 0 {
+					fields := strings.Fields(line)
+					if len(fields) >= 2 {
+						if current, err := strconv.Atoi(fields[1]); err == nil {
+							pct := int((float64(current) / float64(totalObjects)) * 100)
+							if pct > 99 {
+								pct = 99
+							}
+							_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting repository: %2d%%...", pct)
+						}
+					}
+				} else if isIncremental {
+					_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting incremental updates...\r")
+				}
+			}
+		}
+	}()
+
+	// Stream stderr of fast-import in real-time, keeping it for error reporting and stats logging
+	go func() {
+		defer pipesWg.Done()
 		scanner := bufio.NewScanner(importStderrPipe)
 		for scanner.Scan() {
 			line := scanner.Text()
 			importErrBuf.WriteString(line + "\n")
 			log.Printf("[%s fast-import] %s", repoName, line)
-			if progressWriter != nil {
-				_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [Progress] %s\n", line)
-			}
 		}
 	}()
 
@@ -486,9 +541,18 @@ func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFla
 		exportErrChan <- err
 	}()
 
-	<-stderrDone
+	// All stdout and stderr reads must complete before Wait closes the pipes
+	pipesWg.Wait()
 	importErr := importCmd.Wait()
 	_ = r.Close()
+
+	if progressWriter != nil {
+		if totalObjects > 0 {
+			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting repository: 100%%, done.\n")
+		} else if isIncremental {
+			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting incremental updates, done.\n")
+		}
+	}
 
 	exportErr := <-exportErrChan
 
@@ -674,6 +738,8 @@ const (
 	sha256HexLen = 64
 	// maxMarkID caps mark numbers to prevent corrupt marks files from creating runaway sparse scratch files.
 	maxMarkID = 100_000_000
+	// progressObjectInterval specifies how often fast-export emits progress statements (in objects).
+	progressObjectInterval = 1000
 )
 
 // generateLooseObjectIdx rebuilds objects/loose-object-idx by pairing the SHA1 and SHA256 marks files.
