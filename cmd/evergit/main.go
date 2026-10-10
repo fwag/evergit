@@ -22,6 +22,7 @@ func main() {
 	storageRoot := flag.String("storage", "", "Storage root directory")
 	cacheTTLStr := flag.String("ttl", "5m", "Cache TTL (e.g. 5m, 1h)")
 	maxConversionsFlag := flag.Int("max-conversions", 0, "Maximum concurrent JIT conversions (0 = CPU count)")
+	minFreeDiskFlag := flag.Int("min-free-disk", -1, "Minimum free disk space in GB required before cloning new mirrors (default: 1)")
 	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
 	shorthands := flag.String("shorthands", "", "Comma-separated domain shorthand mappings in alias=domain format (default: github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org)")
 	flag.Parse()
@@ -56,6 +57,9 @@ func main() {
 	if *maxConversionsFlag > 0 {
 		cfg.MaxConversions = *maxConversionsFlag
 	}
+	if *minFreeDiskFlag >= 0 {
+		cfg.MinFreeDiskGB = *minFreeDiskFlag
+	}
 
 	if *allowedHosts != "" {
 		cfg.AllowedHosts = config.ParseHostList(*allowedHosts)
@@ -68,6 +72,7 @@ func main() {
 	log.Printf("Storage Root:    %s", cfg.StorageRoot)
 	log.Printf("Cache TTL:       %v", cfg.CacheTTL)
 	log.Printf("Max conversions: %d", cfg.MaxConversions)
+	log.Printf("Min free disk:   %d GB", cfg.MinFreeDiskGB)
 	log.Printf("Allowed hosts:   %s", strings.Join(cfg.AllowedHosts, ", "))
 	log.Printf("Shorthands:      %s", config.FormatShorthands(cfg.Shorthands))
 
@@ -84,6 +89,7 @@ func main() {
 	defer lockFile.Close()
 
 	convManager := converter.NewManager(cfg.CacheTTL, cfg.MaxConversions)
+	convManager.SetMinFreeDisk(uint64(cfg.MinFreeDiskGB) * 1024 * 1024 * 1024)
 
 	// Start SSH Server
 	sshServer, err := server.NewSSHServer(cfg, convManager)

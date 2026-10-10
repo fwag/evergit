@@ -22,6 +22,7 @@ type Config struct {
 	StorageRoot    string
 	CacheTTL       time.Duration
 	MaxConversions int
+	MinFreeDiskGB  int
 	// AllowedHosts lists the upstream hosts clients may request; anything else is rejected
 	AllowedHosts []string
 	// Shorthands maps short prefix aliases to their target domains (e.g. "github" -> "github.com")
@@ -45,12 +46,20 @@ func Load() *Config {
 		}
 	}
 
+	minFreeDiskGB := 1
+	if envDisk := os.Getenv("EVERGIT_MIN_FREE_DISK_GB"); envDisk != "" {
+		if val, err := strconv.Atoi(envDisk); err == nil && val >= 0 {
+			minFreeDiskGB = val
+		}
+	}
+
 	return &Config{
 		HTTPAddr:       getEnv("EVERGIT_HTTP_ADDR", ":8080"),
 		SSHAddr:        getEnv("EVERGIT_SSH_ADDR", ":2222"),
 		StorageRoot:    storageRoot,
 		CacheTTL:       5 * time.Minute,
 		MaxConversions: maxConversions,
+		MinFreeDiskGB:  minFreeDiskGB,
 		AllowedHosts:   ParseHostList(getEnv("EVERGIT_ALLOWED_HOSTS", strings.Join(DefaultAllowedHosts, ","))),
 		Shorthands:     ParseShorthands(getEnv("EVERGIT_SHORTHANDS", DefaultShorthands)),
 	}

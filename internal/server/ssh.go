@@ -123,39 +123,61 @@ func (s *SSHServer) handleConn(nConn net.Conn) {
 	}
 }
 
+const sshRequestTimeout = 30 * time.Second
+
 func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 
-	for req := range reqs {
-		switch req.Type {
-		case "exec":
-			var payload struct {
-				Value string
-			}
-			if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
-				log.Printf("[SSH] Failed to unmarshal exec payload: %v", err)
-				req.Reply(false, nil)
+	timer := time.NewTimer(sshRequestTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case req, ok := <-reqs:
+			if !ok {
 				return
 			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(sshRequestTimeout)
 
-			req.Reply(true, nil)
+			switch req.Type {
+			case "exec":
+				var payload struct {
+					Value string
+				}
+				if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+					log.Printf("[SSH] Failed to unmarshal exec payload: %v", err)
+					req.Reply(false, nil)
+					return
+				}
 
-			err := s.executeGitCommand(ch, payload.Value)
-			sendExitStatus(ch, err)
+				req.Reply(true, nil)
+
+				err := s.executeGitCommand(ch, payload.Value)
+				sendExitStatus(ch, err)
+				return
+
+			case "env":
+				// Environment variables are not applied, so do not claim otherwise
+				req.Reply(false, nil)
+
+			default:
+				req.Reply(false, nil)
+			}
+		case <-timer.C:
+			log.Printf("[SSH] Session timed out waiting for request")
 			return
-
-		case "env":
-			// Environment variables are not applied, so do not claim otherwise
-			req.Reply(false, nil)
-
-		default:
-			req.Reply(false, nil)
 		}
 	}
 }
 
 func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
-	log.Printf("[SSH] Command: %s", rawCmd)
+	log.Printf("[SSH] Command: %q", rawCmd)
 
 	verb, repoPath, err := parseGitCommand(rawCmd)
 	if err != nil {

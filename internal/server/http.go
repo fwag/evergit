@@ -73,6 +73,12 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 			return
 		}
 
+		// Reject push attempts immediately before triggering any clone or conversion
+		if r.URL.Query().Get("service") == "git-receive-pack" || strings.HasSuffix(r.URL.Path, "/git-receive-pack") {
+			http.Error(w, "Evergit is read-only: push operations are not permitted", http.StatusForbidden)
+			return
+		}
+
 		// Run JIT clone and conversion if necessary
 		log.Printf("[HTTP] Ensuring repository %s is available & converted...", info.RepoName)
 		if err := conv.EnsureRepo(info, nil); err != nil {

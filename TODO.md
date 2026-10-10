@@ -16,14 +16,14 @@ This checklist tracks security, rate-limiting, and hardening improvements across
   - [ ] `refs/evergit-backups/*` reaches the serving repo (`fast-export --all`, and the explicit refspec in `syncNativeSHA256`), so clients can fetch commits that upstream removed, e.g. leaked secrets or DMCA takedowns.
   - [ ] Decide: keep backups in the mirror only and stop serving them, or document the behavior explicitly.
 
-- [ ] **[Low] Reject `/git-receive-pack` before `EnsureRepo`**
-  - [ ] Push is currently refused only by `git-http-backend` (no `REMOTE_USER`), after a sync/conversion has already been triggered. Return `403` immediately.
+- [x] **[Low] Reject `/git-receive-pack` before `EnsureRepo`**
+  - [x] Push is currently refused only by `git-http-backend` (no `REMOTE_USER`), after a sync/conversion has already been triggered. Return `403` immediately.
 
-- [ ] **[Low] Disable upstream HTTP redirects**
-  - [ ] git follows the initial redirect (`http.followRedirects=initial`), so a self-hosted allowed host could redirect Evergit to an internal address. Pass `-c http.followRedirects=false` on clone/fetch.
+- [x] **[Low] Disable upstream HTTP redirects**
+  - [x] git follows the initial redirect (`http.followRedirects=initial`), so a self-hosted allowed host could redirect Evergit to an internal address. Pass `-c http.followRedirects=false` on clone/fetch.
 
-- [ ] **[Low] Log injection via SSH command**
-  - [ ] `executeGitCommand` logs `rawCmd` with `%s`; a client can forge log lines with embedded newlines. Use `%q`.
+- [x] **[Low] Log injection via SSH command**
+  - [x] `executeGitCommand` logs `rawCmd` with `%s`; a client can forge log lines with embedded newlines. Use `%q`.
 
 - [ ] **[Low] `LookupID` scans the whole `loose-object-idx` per request**
   - [ ] Expensive on very large repositories; consider an index or sorted file with binary search.
@@ -43,10 +43,10 @@ Because HAProxy cannot inspect Git conversion costs or encrypted SSH application
   - [x] For HTTP: return `HTTP 429 Too Many Requests` or `HTTP 503 Service Unavailable` with `Retry-After` header when conversion queues are saturated.
   - [x] For SSH: write user-friendly rejection messages to `stderr` channel (e.g., `error: server busy, please retry later`) before closing sessions.
 
-- [ ] **Disk Space Safeguards & Storage Quotas**
-  - [ ] Inspect available storage using `syscall.Statfs` before initiating a new upstream mirror clone.
-  - [ ] Define minimum free disk threshold (e.g., 5 GB or 10% disk capacity).
-  - [ ] Abort new clones with clear diagnostic logging when capacity threshold is breached.
+- [x] **Disk Space Safeguards & Storage Quotas**
+  - [x] Inspect available storage using `syscall.Statfs` before initiating a new upstream mirror clone.
+  - [x] Define minimum free disk threshold (e.g., 5 GB or 10% disk capacity).
+  - [x] Abort new clones with clear diagnostic logging when capacity threshold is breached.
 
 - [ ] **Cache Maintenance & Pruning**
   - [ ] Implement background LRU or TTL-based garbage collection for stale cached mirrors under `storage/mirrors/` and `storage/builds/`.
@@ -56,8 +56,8 @@ Because HAProxy cannot inspect Git conversion costs or encrypted SSH application
   - [x] `github/Torvalds/Linux` and `github/torvalds/linux` currently produce separate mirrors and conversions, multiplying resource usage and bypassing the per-repo lock.
   - [x] Lowercase owner and repo for hosts known to be case-insensitive (GitHub, GitLab, Bitbucket).
 
-- [ ] **SSH Session Limits**
-  - [ ] Any key is accepted and a session that never sends `exec` is held forever: add an idle timeout for sessions awaiting a request.
+- [x] **SSH Session Limits**
+  - [x] Any key is accepted and a session that never sends `exec` is held forever: add an idle timeout for sessions awaiting a request.
   - [ ] Cap concurrent connections and channels per connection.
 
 ---

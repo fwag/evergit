@@ -970,3 +970,23 @@ func TestConversionConcurrencyLimiter(t *testing.T) {
 		t.Fatalf("expected EnsureRepo to succeed after slot release: %v", err)
 	}
 }
+
+func TestDiskSpaceSafeguard(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+
+	manager := NewManager(0)
+	// Require an impossible amount of free space (1 Exabyte)
+	manager.SetMinFreeDisk(1000 * 1024 * 1024 * 1024 * 1024 * 1024)
+
+	err := manager.EnsureRepo(info, nil)
+	if !errors.Is(err, ErrDiskSpaceExhausted) {
+		t.Fatalf("expected ErrDiskSpaceExhausted when disk threshold is breached, got: %v", err)
+	}
+
+	// Reset to 0 (disabled) and verify clone succeeds
+	manager.SetMinFreeDisk(0)
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("expected EnsureRepo to succeed when threshold disabled: %v", err)
+	}
+}

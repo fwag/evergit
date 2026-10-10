@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"evergit/internal/resolver"
@@ -24,11 +25,15 @@ import (
 // ErrServerBusy is returned when all conversion worker slots are occupied and the queue times out.
 var ErrServerBusy = errors.New("server is busy performing other conversions, please retry shortly")
 
+// ErrDiskSpaceExhausted is returned when free disk space is below the safety threshold.
+var ErrDiskSpaceExhausted = errors.New("storage disk space exhausted")
+
 // DefaultConversionTimeout is the maximum time a request will wait in the conversion queue before shedding load.
 const DefaultConversionTimeout = 30 * time.Second
 
 type Manager struct {
 	cacheTTL       time.Duration
+	minFreeDisk    uint64
 	conversionSem  chan struct{}
 	conversionWait time.Duration
 	locksMu        sync.Mutex
@@ -55,6 +60,41 @@ func NewManager(cacheTTL time.Duration, maxConversions ...int) *Manager {
 		conversionWait: DefaultConversionTimeout,
 		repoLocks:      make(map[string]*repoLock),
 	}
+}
+
+// SetMinFreeDisk configures the minimum free disk space in bytes required before cloning mirrors.
+func (m *Manager) SetMinFreeDisk(bytes uint64) {
+	m.minFreeDisk = bytes
+}
+
+// checkDiskSpace verifies that available disk space meets minFreeDisk threshold.
+func (m *Manager) checkDiskSpace(path string) error {
+	if m.minFreeDisk == 0 {
+		return nil
+	}
+	var stat syscall.Statfs_t
+	checkDir := path
+	for {
+		if fi, err := os.Stat(checkDir); err == nil && fi.IsDir() {
+			break
+		}
+		parent := filepath.Dir(checkDir)
+		if parent == checkDir {
+			break
+		}
+		checkDir = parent
+	}
+	if err := syscall.Statfs(checkDir, &stat); err != nil {
+		return nil
+	}
+	available := uint64(stat.Bavail) * uint64(stat.Bsize)
+	if available < m.minFreeDisk {
+		return fmt.Errorf("%w: available space (%.2f GB) is below minimum threshold (%.2f GB)",
+			ErrDiskSpaceExhausted,
+			float64(available)/(1024*1024*1024),
+			float64(m.minFreeDisk)/(1024*1024*1024))
+	}
+	return nil
 }
 
 // SetConversionTimeout configures the maximum time an incoming conversion request waits in queue.
@@ -308,10 +348,13 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 	}
 
 	if os.IsNotExist(statErr) {
+		if err := m.checkDiskSpace(info.MirrorPath); err != nil {
+			return false, err
+		}
 		// Clone as a bare mirror
 		// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
 		// thousands of refs/pull/* from forks
-		_, err := runCmdTimeout(upstreamTimeout, "", "git", "clone", "--bare", "--", info.RemoteURL, info.MirrorPath)
+		_, err := runCmdTimeout(upstreamTimeout, "", "git", "-c", "http.followRedirects=false", "clone", "--bare", "--", info.RemoteURL, info.MirrorPath)
 		if err != nil {
 			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, err)
 		}
@@ -328,7 +371,7 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 		}
 
 		// Fetch updates
-		fetchArgs := append([]string{"fetch", "--prune", "origin"}, mirrorRefspecs...)
+		fetchArgs := append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", "origin"}, mirrorRefspecs...)
 		_, err = runCmdTimeout(upstreamTimeout, info.MirrorPath, "git", fetchArgs...)
 
 		// Archive overwritten/deleted refs even if the fetch failed midway, since it may already

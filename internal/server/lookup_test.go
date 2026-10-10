@@ -188,3 +188,47 @@ func TestLoadSheddingReturns503(t *testing.T) {
 		t.Errorf("Retry-After = %q, want %q", retryAfter, "5")
 	}
 }
+
+func TestPushRequestsAreRejectedEarlyWith403(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		StorageRoot:  filepath.Join(tempDir, "storage"),
+		CacheTTL:     0,
+		AllowedHosts: []string{"github.com"},
+		Shorthands:   config.ParseShorthands(config.DefaultShorthands),
+	}
+
+	conv := converter.NewManager(0)
+	httpServer, err := server.NewHTTPServer(cfg, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pushEndpoints := []struct {
+		method string
+		url    string
+	}{
+		{"GET", "/github.com/owner/repo.git/info/refs?service=git-receive-pack"},
+		{"POST", "/github.com/owner/repo.git/git-receive-pack"},
+	}
+
+	for _, ep := range pushEndpoints {
+		t.Run(ep.method+" "+ep.url, func(t *testing.T) {
+			req := httptest.NewRequest(ep.method, ep.url, nil)
+			rec := httptest.NewRecorder()
+			httpServer.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusForbidden)
+			}
+			if !strings.Contains(rec.Body.String(), "read-only") {
+				t.Errorf("body = %q, want read-only explanation", rec.Body.String())
+			}
+
+			// Verify that no repository was created on disk
+			if _, err := os.Stat(filepath.Join(cfg.StorageRoot, "mirrors", "github.com", "owner", "repo.git")); err == nil {
+				t.Errorf("mirror directory was created for rejected push request")
+			}
+		})
+	}
+}
