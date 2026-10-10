@@ -541,19 +541,8 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 // older builds are removed.
 func publishBuild(info *resolver.RepositoryInfo, buildPath string) error {
 	previous := ""
-	if fi, err := os.Lstat(info.ServingPath); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			if target, err := os.Readlink(info.ServingPath); err == nil {
-				previous = filepath.Join(filepath.Dir(info.ServingPath), target)
-			}
-		} else {
-			// Serving repo created before builds existed: move it aside so the symlink can replace it
-			previous = filepath.Join(info.BuildsPath, "legacy")
-			os.RemoveAll(previous)
-			if err := os.Rename(info.ServingPath, previous); err != nil {
-				return fmt.Errorf("failed to move legacy serving repository %s aside: %w", info.ServingPath, err)
-			}
-		}
+	if target, err := os.Readlink(info.ServingPath); err == nil {
+		previous = filepath.Join(filepath.Dir(info.ServingPath), target)
 	}
 
 	target, err := filepath.Rel(filepath.Dir(info.ServingPath), buildPath)
@@ -570,8 +559,7 @@ func publishBuild(info *resolver.RepositoryInfo, buildPath string) error {
 		return fmt.Errorf("failed to publish build %s to %s: %w", buildPath, info.ServingPath, err)
 	}
 
-	// Leftover from versions that built next to the serving repo
-	os.RemoveAll(info.ServingPath + ".tmp")
+	// Garbage collection of stale builds: only keep current buildPath and previous one
 	builds, err := os.ReadDir(info.BuildsPath)
 	if err != nil {
 		return nil

@@ -578,43 +578,6 @@ func TestFullConversionNeverHidesServingRepo(t *testing.T) {
 	}
 }
 
-func TestFullConversionMigratesLegacyServingDirectory(t *testing.T) {
-	upstreamPath := newTestUpstream(t)
-	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager(0)
-
-	if err := manager.EnsureRepo(info, nil); err != nil {
-		t.Fatalf("initial EnsureRepo failed: %v", err)
-	}
-
-	// Recreate the pre-builds layout: a real directory at ServingPath
-	build, err := filepath.EvalSymlinks(info.ServingPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(info.ServingPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(build, info.ServingPath); err != nil {
-		t.Fatal(err)
-	}
-
-	commitToUpstream(t, upstreamPath, "commit 1")
-	_ = os.Remove(filepath.Join(info.ServingPath, "evergit-sha1-marks.txt"))
-	if err := manager.EnsureRepo(info, nil); err != nil {
-		t.Fatalf("EnsureRepo on legacy layout failed: %v", err)
-	}
-
-	fi, err := os.Lstat(info.ServingPath)
-	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("expected ServingPath to be a symlink after migration (err %v)", err)
-	}
-	logOut, err := runCmd(info.ServingPath, "git", "--git-dir=.", "log", "--oneline", "-1")
-	if err != nil || !strings.Contains(logOut, "commit 1") {
-		t.Errorf("expected migrated repo to serve the latest commit, got %q (err %v)", logOut, err)
-	}
-}
-
 func TestRunCmdTimeout(t *testing.T) {
 	start := time.Now()
 	if _, err := runCmdTimeout(100*time.Millisecond, "", "sleep", "10"); err == nil {
