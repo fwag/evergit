@@ -20,9 +20,10 @@ func main() {
 	httpAddr := flag.String("http", "", "HTTP listen address (e.g. :8080)")
 	sshAddr := flag.String("ssh", "", "SSH listen address (e.g. :2222)")
 	storageRoot := flag.String("storage", "", "Storage root directory")
-	cacheTTLStr := flag.String("ttl", "5m", "Cache TTL (e.g. 5m, 1h)")
+	cacheTTLStr := flag.String("ttl", "", "Cache TTL (e.g. 30s, 5m, 1h, 0 to disable cache; default: 30s)")
 	maxConversionsFlag := flag.Int("max-conversions", 0, "Maximum concurrent JIT conversions (0 = CPU count)")
 	minFreeDiskFlag := flag.Int("min-free-disk", -1, "Minimum free disk space in GB required before cloning new mirrors (default: 1)")
+	debugFlag := flag.Bool("debug", false, "Enable debug mode and fast-import statistics")
 	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
 	shorthands := flag.String("shorthands", "", "Comma-separated domain shorthand mappings in alias=domain format (default: github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org)")
 	flag.Parse()
@@ -48,8 +49,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("Invalid TTL duration %q: %v", *cacheTTLStr, err)
 		}
-		if ttl <= 0 {
-			log.Fatalf("Invalid TTL duration %q: must be positive", *cacheTTLStr)
+		if ttl < 0 {
+			log.Fatalf("Invalid TTL duration %q: must be non-negative", *cacheTTLStr)
 		}
 		cfg.CacheTTL = ttl
 	}
@@ -59,6 +60,9 @@ func main() {
 	}
 	if *minFreeDiskFlag >= 0 {
 		cfg.MinFreeDiskGB = *minFreeDiskFlag
+	}
+	if *debugFlag {
+		cfg.Debug = true
 	}
 
 	if *allowedHosts != "" {
@@ -73,6 +77,7 @@ func main() {
 	log.Printf("Cache TTL:       %v", cfg.CacheTTL)
 	log.Printf("Max conversions: %d", cfg.MaxConversions)
 	log.Printf("Min free disk:   %d GB", cfg.MinFreeDiskGB)
+	log.Printf("Debug:           %v", cfg.Debug)
 	log.Printf("Allowed hosts:   %s", strings.Join(cfg.AllowedHosts, ", "))
 	log.Printf("Shorthands:      %s", config.FormatShorthands(cfg.Shorthands))
 
@@ -90,6 +95,7 @@ func main() {
 
 	convManager := converter.NewManager(cfg.CacheTTL, cfg.MaxConversions)
 	convManager.SetMinFreeDisk(uint64(cfg.MinFreeDiskGB) * 1024 * 1024 * 1024)
+	convManager.SetDebug(cfg.Debug)
 
 	// Start SSH Server
 	sshServer, err := server.NewSSHServer(cfg, convManager)

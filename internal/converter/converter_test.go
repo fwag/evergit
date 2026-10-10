@@ -3,6 +3,7 @@ package converter
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -988,5 +989,37 @@ func TestDiskSpaceSafeguard(t *testing.T) {
 	manager.SetMinFreeDisk(0)
 	if err := manager.EnsureRepo(info, nil); err != nil {
 		t.Fatalf("expected EnsureRepo to succeed when threshold disabled: %v", err)
+	}
+}
+
+func TestFastImportStatisticsGatedByDebug(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+
+	// With debug disabled (default)
+	manager := NewManager(0)
+	var logBuf strings.Builder
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo failed: %v", err)
+	}
+
+	if strings.Contains(logBuf.String(), "fast-import statistics") {
+		t.Errorf("fast-import statistics logged when debug is disabled:\n%s", logBuf.String())
+	}
+
+	// With debug enabled
+	commitToUpstream(t, upstreamPath, "commit for debug")
+	manager.SetDebug(true)
+	logBuf.Reset()
+
+	if err := manager.EnsureRepo(info, nil); err != nil {
+		t.Fatalf("EnsureRepo with debug failed: %v", err)
+	}
+
+	if !strings.Contains(logBuf.String(), "fast-import statistics") {
+		t.Errorf("expected fast-import statistics when debug is enabled, got:\n%s", logBuf.String())
 	}
 }

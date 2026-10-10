@@ -23,6 +23,7 @@ type Config struct {
 	CacheTTL       time.Duration
 	MaxConversions int
 	MinFreeDiskGB  int
+	Debug          bool
 	// AllowedHosts lists the upstream hosts clients may request; anything else is rejected
 	AllowedHosts []string
 	// Shorthands maps short prefix aliases to their target domains (e.g. "github" -> "github.com")
@@ -53,13 +54,23 @@ func Load() *Config {
 		}
 	}
 
+	cacheTTL := 30 * time.Second
+	if envTTL := os.Getenv("EVERGIT_CACHE_TTL"); envTTL != "" {
+		if val, err := time.ParseDuration(envTTL); err == nil && val >= 0 {
+			cacheTTL = val
+		}
+	}
+
+	debug := os.Getenv("EVERGIT_DEBUG") == "1" || strings.EqualFold(os.Getenv("EVERGIT_DEBUG"), "true")
+
 	return &Config{
 		HTTPAddr:       getEnv("EVERGIT_HTTP_ADDR", ":8080"),
 		SSHAddr:        getEnv("EVERGIT_SSH_ADDR", ":2222"),
 		StorageRoot:    storageRoot,
-		CacheTTL:       5 * time.Minute,
+		CacheTTL:       cacheTTL,
 		MaxConversions: maxConversions,
 		MinFreeDiskGB:  minFreeDiskGB,
+		Debug:          debug,
 		AllowedHosts:   ParseHostList(getEnv("EVERGIT_ALLOWED_HOSTS", strings.Join(DefaultAllowedHosts, ","))),
 		Shorthands:     ParseShorthands(getEnv("EVERGIT_SHORTHANDS", DefaultShorthands)),
 	}

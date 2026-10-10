@@ -33,14 +33,17 @@ go build -o evergit ./cmd/evergit
 
 ### 2. Run the Daemon
 ```bash
-./evergit -http :8080 -ssh :2222 -storage ./storage -ttl 5m
+./evergit -http :8080 -ssh :2222 -storage ./storage -ttl 30s
 ```
 
 ### Command-Line Flags
 - `-http`: HTTP listen address (default: `:8080`)
 - `-ssh`: SSH listen address (default: `:2222`)
 - `-storage`: Directory path for storing host keys, cache mirrors, and converted repositories (default: `./storage`)
-- `-ttl`: Cache duration before checking upstream for updates (default: `5m`)
+- `-ttl`: Cache duration before checking upstream for updates; also settable via `EVERGIT_CACHE_TTL` (default: `30s`, pass `0` to check upstream on every fetch)
+- `-max-conversions`: Maximum concurrent JIT conversions; also settable via `EVERGIT_MAX_CONVERSIONS` (default: CPU count)
+- `-min-free-disk`: Minimum free disk in GB required before cloning new mirrors; also settable via `EVERGIT_MIN_FREE_DISK_GB` (default: `1`)
+- `-debug`: Enable debug logging and verbose fast-import statistics; also settable via `EVERGIT_DEBUG` (default: `false`)
 - `-allowed-hosts`: Comma-separated upstream hosts clients may request; also settable via `EVERGIT_ALLOWED_HOSTS` (default: `github.com,gitlab.com,bitbucket.org`). Self-hosted forges must be added explicitly.
 - `-shorthands`: Comma-separated domain shorthand mappings in `alias=domain` format; also settable via `EVERGIT_SHORTHANDS` (default: `github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org`). Pass `none` to disable shorthands.
 

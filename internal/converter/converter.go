@@ -34,6 +34,7 @@ const DefaultConversionTimeout = 30 * time.Second
 type Manager struct {
 	cacheTTL       time.Duration
 	minFreeDisk    uint64
+	debug          bool
 	conversionSem  chan struct{}
 	conversionWait time.Duration
 	locksMu        sync.Mutex
@@ -60,6 +61,11 @@ func NewManager(cacheTTL time.Duration, maxConversions ...int) *Manager {
 		conversionWait: DefaultConversionTimeout,
 		repoLocks:      make(map[string]*repoLock),
 	}
+}
+
+// SetDebug enables or disables debug mode (including fast-import statistics logging).
+func (m *Manager) SetDebug(enabled bool) {
+	m.debug = enabled
 }
 
 // SetMinFreeDisk configures the minimum free disk space in bytes required before cloning mirrors.
@@ -449,7 +455,7 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		}
 	}
 
-	plan, err := prepareConversion(info, progressWriter)
+	plan, err := m.prepareConversion(info, progressWriter)
 	if err != nil {
 		return err
 	}
@@ -461,7 +467,7 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		}()
 	}
 
-	if err := runConversionPipeline(info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, plan.totalObjects, plan.isIncremental, progressWriter); err != nil {
+	if err := runConversionPipeline(info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, plan.totalObjects, plan.isIncremental, m.debug, progressWriter); err != nil {
 		plan.failed = true
 		return err
 	}
@@ -499,7 +505,7 @@ func countExportableObjects(mirrorPath string) int {
 	return commits + blobs
 }
 
-func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) (*conversionPlan, error) {
+func (m *Manager) prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) (*conversionPlan, error) {
 	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create repos directory: %w", err)
 	}
@@ -539,6 +545,11 @@ func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) 
 	importFlags := []string{
 		"--export-marks=" + sha256Marks,
 	}
+	if m.debug {
+		importFlags = append(importFlags, "--stats")
+	} else {
+		importFlags = append(importFlags, "--quiet")
+	}
 
 	if isIncremental {
 		exportFlags = append(exportFlags, "--import-marks="+sha1Marks)
@@ -554,7 +565,7 @@ func prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) 
 	}, nil
 }
 
-func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, totalObjects int, isIncremental bool, progressWriter io.Writer) error {
+func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, totalObjects int, isIncremental, debug bool, progressWriter io.Writer) error {
 	exportCmd := exec.Command("git", append([]string{"fast-export"}, exportFlags...)...)
 	exportCmd.Env = GitEnv()
 	exportCmd.Dir = mirrorPath
@@ -634,7 +645,9 @@ func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFla
 		for scanner.Scan() {
 			line := scanner.Text()
 			importErrBuf.WriteString(line + "\n")
-			log.Printf("[%s fast-import] %s", repoName, line)
+			if debug {
+				log.Printf("[%s fast-import] %s", repoName, line)
+			}
 		}
 	}()
 
