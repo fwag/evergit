@@ -72,11 +72,8 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
 	if _, err := os.Stat(servingHeadPath); err == nil {
 		if !changed {
+			// loose object idx healing if daemon is killed
 			if err := ensureLooseObjectIdx(info.ServingPath); err != nil {
-				return err
-			}
-			// Repairs the setting if a previous conversion was killed mid-import
-			if err := enableCompatObjectFormat(info.ServingPath); err != nil {
 				return err
 			}
 			now := time.Now()
@@ -368,14 +365,6 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Incremental update found. Performing incremental JIT conversion...\n")
 		}
 
-		// Temporarily unset compatObjectFormat so git fast-import does not crash on existing tree mapping checks
-		_, _ = runCmd(targetPath, "git", "--git-dir=.", "config", "--unset", "extensions.compatObjectFormat")
-		defer func() {
-			if err := enableCompatObjectFormat(targetPath); err != nil {
-				log.Printf("WARNING: %v", err)
-			}
-		}()
-
 		exportFlags = []string{"--all", "--signed-commits=strip", "--tag-of-filtered-object=rewrite", "--import-marks=" + sha1MarksPath, "--export-marks=" + sha1MarksPath}
 		importFlags = []string{"--force", "--import-marks=" + sha256MarksPath, "--export-marks=" + sha256MarksPath}
 	} else {
@@ -492,13 +481,6 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		}
 	}
 
-	// Enable SHA1 compatibility mapping on the new repository (restored by the deferred call when incremental)
-	if !isIncremental {
-		if err := enableCompatObjectFormat(targetPath); err != nil {
-			log.Printf("WARNING: %v", err)
-		}
-	}
-
 	// Get HEAD symbolic-ref from mirror
 	headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD")
 	if err != nil {
@@ -569,17 +551,6 @@ func publishBuild(info *resolver.RepositoryInfo, buildPath string) error {
 		if path != buildPath && path != previous {
 			os.RemoveAll(path)
 		}
-	}
-	return nil
-}
-
-// enableCompatObjectFormat sets extensions.compatObjectFormat=sha1 unless it is already set.
-func enableCompatObjectFormat(repoPath string) error {
-	if format, err := runCmd(repoPath, "git", "--git-dir=.", "config", "extensions.compatObjectFormat"); err == nil && format == "sha1" {
-		return nil
-	}
-	if _, err := runCmd(repoPath, "git", "--git-dir=.", "config", "extensions.compatObjectFormat", "sha1"); err != nil {
-		return fmt.Errorf("failed to configure extensions.compatObjectFormat in %s: %w", repoPath, err)
 	}
 	return nil
 }
@@ -678,55 +649,150 @@ func runCmdTimeout(timeout time.Duration, dir, name string, args ...string) (str
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+const (
+	sha1HexLen   = 40
+	sha256HexLen = 64
+	// maxMarkID caps mark numbers to prevent corrupt marks files from creating runaway sparse scratch files.
+	maxMarkID = 100_000_000
+)
+
 // generateLooseObjectIdx rebuilds objects/loose-object-idx by pairing the SHA1 and SHA256 marks files.
-// Both files always hold every mark (fast-export/fast-import rewrite them in full), so the map is
-// rebuilt from scratch rather than appended to, and swapped in atomically for concurrent readers.
-// Only the SHA1 marks are held in memory (fast-export writes them unordered); the SHA256 marks are
-// streamed in mark order straight to the output. Malformed lines, e.g. truncated by a crash, are skipped.
+// It uses a fixed-offset scratch file on disk so the pairing runs in O(1) RAM without loading maps into memory.
+// Pass 1 streams SHA1 marks into the scratch file at offset (markID-1)*sha1HexLen.
+// Pass 2 streams the sequential SHA256 marks, matching each against the scratch file and emitting loose-object-idx.
 func generateLooseObjectIdx(repoPath string) error {
-	sha1Marks, err := parseMarksFile(filepath.Join(repoPath, "evergit-sha1-marks.txt"), 40)
+	scratchPath := filepath.Join(repoPath, "objects", "loose-object-idx-scratch.tmp")
+	scratchFile, err := os.Create(scratchPath)
 	if err != nil {
-		return fmt.Errorf("failed to parse SHA1 marks: %w", err)
+		return fmt.Errorf("failed to create marks scratch file: %w", err)
+	}
+	defer func() {
+		_ = scratchFile.Close()
+		_ = os.Remove(scratchPath)
+	}()
+
+	sha1Path := filepath.Join(repoPath, "evergit-sha1-marks.txt")
+	scratchSize, err := indexSHA1Marks(sha1Path, scratchFile)
+	if err != nil {
+		return err
 	}
 
-	sha256File, err := os.Open(filepath.Join(repoPath, "evergit-sha256-marks.txt"))
+	sha256Path := filepath.Join(repoPath, "evergit-sha256-marks.txt")
+	idxPath := filepath.Join(repoPath, "objects", "loose-object-idx")
+	return writeLooseObjectIdx(sha256Path, scratchFile, scratchSize, idxPath)
+}
+
+// indexSHA1Marks streams unordered SHA1 marks into the scratch file at mark-indexed offsets (O(1) RAM).
+func indexSHA1Marks(path string, scratch *os.File) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open SHA1 marks: %w", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		mark, hash, ok := parseMarkLine(scanner.Text(), sha1HexLen)
+		if !ok {
+			continue
+		}
+		id, ok := parseMarkID(mark)
+		if !ok {
+			continue
+		}
+		offset := (id - 1) * sha1HexLen
+		if _, err := scratch.WriteAt([]byte(hash), offset); err != nil {
+			return 0, fmt.Errorf("failed to write mark %s to scratch file: %w", mark, err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("failed to read SHA1 marks: %w", err)
+	}
+
+	info, err := scratch.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat scratch file: %w", err)
+	}
+	return info.Size(), nil
+}
+
+// writeLooseObjectIdx streams sequential SHA256 marks, looks up SHA1 hashes by offset, and atomically writes the index.
+func writeLooseObjectIdx(sha256Path string, scratch *os.File, scratchSize int64, outPath string) error {
+	sha256File, err := os.Open(sha256Path)
 	if err != nil {
 		return fmt.Errorf("failed to open SHA256 marks: %w", err)
 	}
 	defer sha256File.Close()
 
-	idxPath := filepath.Join(repoPath, "objects", "loose-object-idx")
-	tmpPath := idxPath + ".tmp"
+	tmpPath := outPath + ".tmp"
 	out, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("failed to create loose-object-idx file: %w", err)
 	}
-	defer os.Remove(tmpPath) // No-op once renamed
+	defer os.Remove(tmpPath)
 
 	w := bufio.NewWriter(out)
-	_, _ = w.WriteString("# loose-object-idx\n")
+	if _, err := w.WriteString("# loose-object-idx\n"); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("failed to write header to loose-object-idx: %w", err)
+	}
+
+	sha1Reader := bufio.NewReaderSize(scratch, 256*1024)
+	var currentOffset int64
+	var sha1Buf [sha1HexLen]byte
+
 	scanner := bufio.NewScanner(sha256File)
 	for scanner.Scan() {
-		mark, sha256Hash, ok := parseMarkLine(scanner.Text(), 64)
+		mark, sha256Hash, ok := parseMarkLine(scanner.Text(), sha256HexLen)
 		if !ok {
 			continue
 		}
-		if sha1Hash, ok := sha1Marks[mark]; ok {
-			_, _ = fmt.Fprintf(w, "%s %s\n", sha256Hash, sha1Hash)
+		id, ok := parseMarkID(mark)
+		if !ok {
+			continue
 		}
+		targetOffset := (id - 1) * sha1HexLen
+		if targetOffset+sha1HexLen > scratchSize {
+			continue
+		}
+
+		// Handling Gaps or Out-of-Order Marks
+		if targetOffset != currentOffset {
+			if _, err := scratch.Seek(targetOffset, io.SeekStart); err != nil {
+				_ = out.Close()
+				return fmt.Errorf("failed to seek in scratch file: %w", err)
+			}
+			sha1Reader.Reset(scratch)
+			currentOffset = targetOffset
+		}
+
+		if _, err := io.ReadFull(sha1Reader, sha1Buf[:]); err != nil {
+			_ = out.Close()
+			return fmt.Errorf("failed to read from scratch file: %w", err)
+		}
+		currentOffset += sha1HexLen
+
+		if sha1Buf[0] == 0 {
+			continue
+		}
+
+		_, _ = w.WriteString(sha256Hash)
+		_ = w.WriteByte(' ')
+		_, _ = w.Write(sha1Buf[:])
+		_ = w.WriteByte('\n')
 	}
 	if err := scanner.Err(); err != nil {
-		out.Close()
+		_ = out.Close()
 		return fmt.Errorf("failed to read SHA256 marks: %w", err)
 	}
 	if err := w.Flush(); err != nil {
-		out.Close()
+		_ = out.Close()
 		return fmt.Errorf("failed to write loose-object-idx file: %w", err)
 	}
 	if err := out.Close(); err != nil {
-		return fmt.Errorf("failed to write loose-object-idx file: %w", err)
+		return fmt.Errorf("failed to close loose-object-idx file: %w", err)
 	}
-	if err := os.Rename(tmpPath, idxPath); err != nil {
+	if err := os.Rename(tmpPath, outPath); err != nil {
 		return fmt.Errorf("failed to install loose-object-idx file: %w", err)
 	}
 
@@ -750,22 +816,16 @@ func ensureLooseObjectIdx(repoPath string) error {
 	return nil
 }
 
-// parseMarksFile reads a marks file into a mark -> hash map, skipping malformed lines.
-func parseMarksFile(path string, hashLen int) (map[string]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+// parseMarkID parses the integer ID from ":<id>".
+func parseMarkID(mark string) (int64, bool) {
+	if len(mark) < 2 || mark[0] != ':' {
+		return 0, false
 	}
-	defer f.Close()
-
-	marks := make(map[string]string)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		if mark, hash, ok := parseMarkLine(scanner.Text(), hashLen); ok {
-			marks[mark] = hash
-		}
+	id, err := strconv.ParseInt(mark[1:], 10, 64)
+	if err != nil || id <= 0 || id > maxMarkID {
+		return 0, false
 	}
-	return marks, scanner.Err()
+	return id, true
 }
 
 // parseMarkLine parses ":<mark> <hash>", requiring hash to be hashLen lowercase hex digits.
@@ -899,9 +959,9 @@ func LookupID(repoPath, format, id string) (string, error) {
 	var column, maxLen int
 	switch format {
 	case "sha1":
-		column, maxLen = 1, 40
+		column, maxLen = 1, sha1HexLen
 	case "sha256":
-		column, maxLen = 0, 64
+		column, maxLen = 0, sha256HexLen
 	default:
 		return "", fmt.Errorf("%w: unknown hash format %q", ErrIDInvalid, format)
 	}

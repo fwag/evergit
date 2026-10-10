@@ -471,15 +471,7 @@ func TestDeletedBranchIsNoLongerServed(t *testing.T) {
 	}
 }
 
-func assertCompatObjectFormat(t *testing.T, servingPath string) {
-	t.Helper()
-	format, err := runCmd(servingPath, "git", "--git-dir=.", "config", "extensions.compatObjectFormat")
-	if err != nil || format != "sha1" {
-		t.Errorf("extensions.compatObjectFormat = %q (err %v), want sha1", format, err)
-	}
-}
-
-func TestCompatObjectFormatRestoredAfterFailedImport(t *testing.T) {
+func TestFastImportFailureIncludesStderr(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
 	manager := NewManager(0)
@@ -500,25 +492,6 @@ func TestCompatObjectFormatRestoredAfterFailedImport(t *testing.T) {
 	if strings.Contains(err.Error(), `stderr: ""`) {
 		t.Errorf("fast-import failure should include its stderr, got: %v", err)
 	}
-	assertCompatObjectFormat(t, info.ServingPath)
-}
-
-func TestCompatObjectFormatRestoredOnNoOpSync(t *testing.T) {
-	upstreamPath := newTestUpstream(t)
-	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager(0)
-
-	if err := manager.EnsureRepo(info, nil); err != nil {
-		t.Fatalf("initial EnsureRepo failed: %v", err)
-	}
-	// Simulate a crash during a previous incremental conversion
-	if _, err := runCmd(info.ServingPath, "git", "--git-dir=.", "config", "--unset", "extensions.compatObjectFormat"); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.EnsureRepo(info, nil); err != nil {
-		t.Fatalf("no-op EnsureRepo failed: %v", err)
-	}
-	assertCompatObjectFormat(t, info.ServingPath)
 }
 
 func TestFullConversionNeverHidesServingRepo(t *testing.T) {
@@ -724,6 +697,31 @@ func TestGenerateLooseObjectIdxSkipsMalformedMarks(t *testing.T) {
 	}
 	idx, _ := os.ReadFile(filepath.Join(repo, "objects", "loose-object-idx"))
 	want := "# loose-object-idx\n" + sha256A + " " + sha1A + "\n" + sha256B + " " + sha1B + "\n"
+	if string(idx) != want {
+		t.Errorf("loose-object-idx =\n%s\nwant\n%s", idx, want)
+	}
+}
+
+func TestGenerateLooseObjectIdxOutOfOrderMarks(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "objects"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	sha1A, sha256A := strings.Repeat("a", 40), strings.Repeat("1", 64)
+	sha1B, sha256B := strings.Repeat("b", 40), strings.Repeat("2", 64)
+	sha1C, sha256C := strings.Repeat("c", 40), strings.Repeat("3", 64)
+
+	// SHA-1 marks are unordered
+	sha1Marks := ":3 " + sha1C + "\n:1 " + sha1A + "\n:2 " + sha1B + "\n"
+	sha256Marks := ":1 " + sha256A + "\n:2 " + sha256B + "\n:3 " + sha256C + "\n"
+	_ = os.WriteFile(filepath.Join(repo, "evergit-sha1-marks.txt"), []byte(sha1Marks), 0644)
+	_ = os.WriteFile(filepath.Join(repo, "evergit-sha256-marks.txt"), []byte(sha256Marks), 0644)
+
+	if err := generateLooseObjectIdx(repo); err != nil {
+		t.Fatal(err)
+	}
+	idx, _ := os.ReadFile(filepath.Join(repo, "objects", "loose-object-idx"))
+	want := "# loose-object-idx\n" + sha256A + " " + sha1A + "\n" + sha256B + " " + sha1B + "\n" + sha256C + " " + sha1C + "\n"
 	if string(idx) != want {
 		t.Errorf("loose-object-idx =\n%s\nwant\n%s", idx, want)
 	}
