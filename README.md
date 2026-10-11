@@ -83,11 +83,13 @@ curl http://localhost:8080/github.com/owner/repo.git/sha1/722a661     # SHA-1 (f
 curl http://localhost:8080/github.com/owner/repo.git/sha256/<sha256>  # SHA-256 (full or ≥7 chars) -> SHA-1
 ```
 
-For convenience, set up two global Git aliases (they need `curl`):
+For convenience, configure two Git aliases (they need `curl`). You can include the repository's shared `.gitconfig`:
+
 ```bash
-git config --global alias.from-sha1 '!f() { base=$(git config evergit.url || git remote get-url origin); curl -fsS "${base%/}/sha1/$1"; }; f'
-git config --global alias.to-sha1   '!f() { base=$(git config evergit.url || git remote get-url origin); curl -fsS "${base%/}/sha256/$(git rev-parse "${1:-HEAD}")"; }; f'
+git config --local include.path ../.gitconfig
 ```
+
+*(Alternatively, you can configure them globally via `git config --global alias.from-sha1 ...` and `alias.to-sha1 ...`)*
 
 Then, inside a clone of a converted repository (e.g. a submodule):
 ```bash
@@ -96,7 +98,7 @@ git to-sha1                             # legacy SHA-1 id of HEAD
 git to-sha1 v1.2.0                      # ...or of any revision
 ```
 
-The aliases derive the Evergit URL from the `origin` remote. For clones made over SSH, point them at the HTTP server once per clone:
+The aliases derive the Evergit URL from the `origin` remote. For clones made over SSH, point them at the HTTP server once per clone (or set `url` under `[evergit]` in `.gitconfig`):
 ```bash
 git config evergit.url http://localhost:8080/github.com/owner/repo.git
 ```

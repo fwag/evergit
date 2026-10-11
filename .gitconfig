@@ -1,0 +1,7 @@
+[alias]
+	from-sha1 = "!f() { base=$(git config evergit.url || git remote get-url origin); curl -fsS \"${base%/}/sha1/$1\"; }; f"
+	to-sha1 = "!f() { base=$(git config evergit.url || git remote get-url origin); curl -fsS \"${base%/}/sha256/$(git rev-parse \"${1:-HEAD}\")\"; }; f"
+
+[evergit]
+	# Placeholder: set when cloning over SSH or pointing to a custom Evergit instance URL
+	# url = http://localhost:8080/github.com/owner/repo.git
