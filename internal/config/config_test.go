@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -57,6 +58,36 @@ func TestLoadShorthandsFromEnv(t *testing.T) {
 	if !reflect.DeepEqual(cfg.Shorthands, want) {
 		t.Errorf("cfg.Shorthands = %v, want %v", cfg.Shorthands, want)
 	}
+}
+
+func TestLoadStorageRootHierarchy(t *testing.T) {
+	t.Run("Default fallback", func(t *testing.T) {
+		t.Setenv("EVERGIT_STORAGE_ROOT", "")
+		t.Setenv("STATE_DIRECTORY", "")
+		cfg := Load()
+		want, _ := filepath.Abs("./storage")
+		if cfg.StorageRoot != want {
+			t.Errorf("StorageRoot = %q, want %q", cfg.StorageRoot, want)
+		}
+	})
+
+	t.Run("StateDirectory fallback", func(t *testing.T) {
+		t.Setenv("EVERGIT_STORAGE_ROOT", "")
+		t.Setenv("STATE_DIRECTORY", "/var/lib/evergit")
+		cfg := Load()
+		if cfg.StorageRoot != "/var/lib/evergit" {
+			t.Errorf("StorageRoot = %q, want %q", cfg.StorageRoot, "/var/lib/evergit")
+		}
+	})
+
+	t.Run("EvergitStorageRoot takes precedence over StateDirectory", func(t *testing.T) {
+		t.Setenv("EVERGIT_STORAGE_ROOT", "/data/evergit")
+		t.Setenv("STATE_DIRECTORY", "/var/lib/evergit")
+		cfg := Load()
+		if cfg.StorageRoot != "/data/evergit" {
+			t.Errorf("StorageRoot = %q, want %q", cfg.StorageRoot, "/data/evergit")
+		}
+	})
 }
 
 func TestFormatShorthands(t *testing.T) {

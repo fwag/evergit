@@ -36,7 +36,11 @@ type Config struct {
 func Load() *Config {
 	storageRoot := os.Getenv("EVERGIT_STORAGE_ROOT")
 	if storageRoot == "" {
-		storageRoot = "./storage"
+		if stateDir := os.Getenv("STATE_DIRECTORY"); stateDir != "" {
+			storageRoot = stateDir
+		} else {
+			storageRoot = "./storage"
+		}
 	}
 	storageRoot, _ = filepath.Abs(storageRoot)
 
