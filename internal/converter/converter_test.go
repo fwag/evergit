@@ -1,6 +1,7 @@
 package converter
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -74,7 +75,7 @@ func TestConverter(t *testing.T) {
 	}
 
 	// 3. Ensure the repository converts successfully
-	err = manager.EnsureRepo(info, nil)
+	err = manager.EnsureRepo(context.Background(), info, nil)
 	if err != nil {
 		t.Fatalf("EnsureRepo failed: %v", err)
 	}
@@ -151,7 +152,7 @@ func TestConverterForcePushBackup(t *testing.T) {
 	}
 
 	// First JIT conversion (Initial sync)
-	err = manager.EnsureRepo(info, nil)
+	err = manager.EnsureRepo(context.Background(), info, nil)
 	if err != nil {
 		t.Fatalf("First EnsureRepo failed: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestConverterForcePushBackup(t *testing.T) {
 	}
 
 	// Second JIT conversion (Triggers fetch and backup check!)
-	err = manager.EnsureRepo(info, nil)
+	err = manager.EnsureRepo(context.Background(), info, nil)
 	if err != nil {
 		t.Fatalf("Second EnsureRepo failed: %v", err)
 	}
@@ -241,7 +242,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 	}
 
 	// First JIT conversion (Commit A is imported)
-	err = manager.EnsureRepo(info, nil)
+	err = manager.EnsureRepo(context.Background(), info, nil)
 	if err != nil {
 		t.Fatalf("First EnsureRepo failed: %v", err)
 	}
@@ -252,7 +253,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 	_, _ = runCmd(upstreamPath, "git", "commit", "--amend", "-m", "commit B (amended)")
 
 	// Sync a second time
-	err = manager.EnsureRepo(info, nil)
+	err = manager.EnsureRepo(context.Background(), info, nil)
 	if err != nil {
 		t.Fatalf("Second EnsureRepo failed: %v", err)
 	}
@@ -285,7 +286,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 	_, _ = runCmd(upstreamPath, "git", "commit", "-m", "commit C (regular update)")
 
 	// Sync a third time
-	err = manager.EnsureRepo(info, nil)
+	err = manager.EnsureRepo(context.Background(), info, nil)
 	if err != nil {
 		t.Fatalf("Third EnsureRepo failed: %v", err)
 	}
@@ -318,7 +319,7 @@ func TestConverterBackupPreservation(t *testing.T) {
 	if err := os.RemoveAll(info.ServingPath); err != nil {
 		t.Fatalf("failed to remove serving repo: %v", err)
 	}
-	err = manager.EnsureRepo(info, nil)
+	err = manager.EnsureRepo(context.Background(), info, nil)
 	if err != nil {
 		t.Fatalf("Full re-conversion EnsureRepo failed: %v", err)
 	}
@@ -392,13 +393,13 @@ func TestCompatMapCompleteAfterIncrementalConversion(t *testing.T) {
 	info := newTestRepoInfo(t, upstreamPath)
 	manager := NewManager(0)
 
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
 	}
 	for i := 1; i <= 40; i++ {
 		commitToUpstream(t, upstreamPath, fmt.Sprintf("commit %d", i))
 	}
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("incremental EnsureRepo failed: %v", err)
 	}
 	assertCompatMapComplete(t, info.ServingPath)
@@ -409,7 +410,7 @@ func TestCompatMapRecoversWhenMissing(t *testing.T) {
 	info := newTestRepoInfo(t, upstreamPath)
 	manager := NewManager(0)
 
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
 	}
 	if err := os.Remove(filepath.Join(info.ServingPath, "objects", "loose-object-idx")); err != nil {
@@ -418,7 +419,7 @@ func TestCompatMapRecoversWhenMissing(t *testing.T) {
 
 	// An incremental update must rebuild the map rather than fail to append to it
 	commitToUpstream(t, upstreamPath, "commit 1")
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("incremental EnsureRepo failed: %v", err)
 	}
 	assertCompatMapComplete(t, info.ServingPath)
@@ -427,7 +428,7 @@ func TestCompatMapRecoversWhenMissing(t *testing.T) {
 	if err := os.Remove(filepath.Join(info.ServingPath, "objects", "loose-object-idx")); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("no-op EnsureRepo failed: %v", err)
 	}
 	assertCompatMapComplete(t, info.ServingPath)
@@ -439,7 +440,7 @@ func TestDeletedBranchIsNoLongerServed(t *testing.T) {
 	info := newTestRepoInfo(t, upstreamPath)
 	manager := NewManager(0)
 
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
 	}
 
@@ -453,7 +454,7 @@ func TestDeletedBranchIsNoLongerServed(t *testing.T) {
 	if _, err := runCmd(upstreamPath, "git", "branch", "-D", "feature"); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo after deletion failed: %v", err)
 	}
 
@@ -477,7 +478,7 @@ func TestFastImportFailureIncludesStderr(t *testing.T) {
 	info := newTestRepoInfo(t, upstreamPath)
 	manager := NewManager(0)
 
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
 	}
 
@@ -486,7 +487,7 @@ func TestFastImportFailureIncludesStderr(t *testing.T) {
 		t.Fatal(err)
 	}
 	commitToUpstream(t, upstreamPath, "commit 1")
-	err := manager.EnsureRepo(info, nil)
+	err := manager.EnsureRepo(context.Background(), info, nil)
 	if err == nil {
 		t.Fatal("expected incremental EnsureRepo to fail with corrupted marks")
 	}
@@ -500,7 +501,7 @@ func TestFullConversionNeverHidesServingRepo(t *testing.T) {
 	info := newTestRepoInfo(t, upstreamPath)
 	manager := NewManager(0)
 
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
 	}
 
@@ -529,7 +530,7 @@ func TestFullConversionNeverHidesServingRepo(t *testing.T) {
 		commitToUpstream(t, upstreamPath, fmt.Sprintf("commit %d", i))
 		// Dropping the marks forces the full conversion path
 		_ = os.Remove(filepath.Join(info.ServingPath, "evergit-sha1-marks.txt"))
-		if err := manager.EnsureRepo(info, nil); err != nil {
+		if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 			t.Fatalf("EnsureRepo %d failed: %v", i, err)
 		}
 	}
@@ -577,7 +578,7 @@ func TestBrokenMirrorIsRecloned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo with a broken mirror failed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(info.MirrorPath, "HEAD")); err != nil {
@@ -649,7 +650,7 @@ func TestStalledProgressWriterDoesNotBlockConversion(t *testing.T) {
 	defer close(writer.release)
 
 	done := make(chan error, 1)
-	go func() { done <- manager.EnsureRepo(info, writer) }()
+	go func() { done <- manager.EnsureRepo(context.Background(), info, writer) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -665,13 +666,13 @@ func TestRepoLocksAreReleased(t *testing.T) {
 	manager := NewManager(0)
 
 	for i := 0; i < 5; i++ {
-		if err := manager.EnsureRepo(newTestRepoInfo(t, upstreamPath), nil); err != nil {
+		if err := manager.EnsureRepo(context.Background(), newTestRepoInfo(t, upstreamPath), nil); err != nil {
 			t.Fatalf("EnsureRepo failed: %v", err)
 		}
 	}
 	// Failing requests (unreachable upstream) must not leak entries either
 	for i := 0; i < 5; i++ {
-		_ = manager.EnsureRepo(newTestRepoInfo(t, filepath.Join(t.TempDir(), "missing")), nil)
+		_ = manager.EnsureRepo(context.Background(), newTestRepoInfo(t, filepath.Join(t.TempDir(), "missing")), nil)
 	}
 
 	manager.locksMu.Lock()
@@ -739,7 +740,7 @@ func TestInheritedGitEnvironmentIsIgnored(t *testing.T) {
 	// A stray variable in the daemon's environment would redirect every git operation
 	t.Setenv("GIT_DIR", decoy)
 	t.Setenv("GIT_OBJECT_DIRECTORY", filepath.Join(decoy, "objects"))
-	if err := NewManager(0).EnsureRepo(info, nil); err != nil {
+	if err := NewManager(0).EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo failed with GIT_DIR set: %v", err)
 	}
 	os.Unsetenv("GIT_DIR")
@@ -774,7 +775,7 @@ func TestOnlyBranchesAndTagsAreMirrored(t *testing.T) {
 
 	info := newTestRepoInfo(t, upstreamPath)
 	mgr := NewManager(0)
-	if err := mgr.EnsureRepo(info, nil); err != nil {
+	if err := mgr.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo failed: %v", err)
 	}
 	assertOnlyBranchesAndTags(t, "mirror", info.MirrorPath)
@@ -789,7 +790,7 @@ func TestOnlyBranchesAndTagsAreMirrored(t *testing.T) {
 	_, _ = runCmd(upstreamPath, "git", "tag", "v2.0")
 	_, _ = runCmd(upstreamPath, "git", "update-ref", "refs/pull/2/head", head2)
 
-	if err := mgr.EnsureRepo(info, nil); err != nil {
+	if err := mgr.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo incremental failed: %v", err)
 	}
 	assertOnlyBranchesAndTags(t, "mirror after fetch", info.MirrorPath)
@@ -799,22 +800,57 @@ func TestOnlyBranchesAndTagsAreMirrored(t *testing.T) {
 	}
 }
 
-func TestSubmodulesAreRejectedWithClearError(t *testing.T) {
+func TestSubmodulesAreConvertedWithSyntheticHash(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
+	sha1 := strings.Repeat("ab", 20)
 	// A submodule entry (gitlink) records a SHA-1 commit of another repository
-	if _, err := runCmd(upstreamPath, "git", "update-index", "--add", "--cacheinfo", "160000,"+strings.Repeat("ab", 20)+",libs/dependency"); err != nil {
+	if _, err := runCmd(upstreamPath, "git", "update-index", "--add", "--cacheinfo", "160000,"+sha1+",libs/dependency"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runCmd(upstreamPath, "git", "commit", "-q", "-m", "add submodule"); err != nil {
 		t.Fatal(err)
 	}
 
-	err := NewManager(0).EnsureRepo(newTestRepoInfo(t, upstreamPath), nil)
-	if !errors.Is(err, ErrSubmodulesUnsupported) {
-		t.Fatalf("err = %v, want ErrSubmodulesUnsupported", err)
+	info := newTestRepoInfo(t, upstreamPath)
+	err := NewManager(0).EnsureRepo(context.Background(), info, nil)
+	if err != nil {
+		t.Fatalf("EnsureRepo failed for repository with submodule: %v", err)
 	}
-	if !strings.Contains(err.Error(), "libs/dependency") {
-		t.Errorf("error should name the submodule path, got: %v", err)
+
+	// Verify the gitlink in the converted serving repository is zero-padded to 64 hex chars
+	out, err := runCmd(info.ServingPath, "git", "ls-tree", "HEAD", "libs/dependency")
+	if err != nil {
+		t.Fatalf("git ls-tree failed: %v", err)
+	}
+	expectedHash := sha1 + strings.Repeat("0", 24)
+	if !strings.Contains(out, expectedHash) {
+		t.Errorf("expected gitlink %s in ls-tree output, got: %q", expectedHash, out)
+	}
+}
+
+func TestNestedTagsWithMarkTagsConvertSuccessfully(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	// Create an annotated tag and a nested tag pointing to it
+	if _, err := runCmd(upstreamPath, "git", "tag", "-a", "v1.0", "-m", "tag v1.0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd(upstreamPath, "git", "tag", "-a", "v2.0", "v1.0", "-m", "nested tag v2.0"); err != nil {
+		t.Fatal(err)
+	}
+
+	info := newTestRepoInfo(t, upstreamPath)
+	err := NewManager(0).EnsureRepo(context.Background(), info, nil)
+	if err != nil {
+		t.Fatalf("EnsureRepo failed for repository with nested tags: %v", err)
+	}
+
+	// Verify both tags exist in serving repo
+	out, err := runCmd(info.ServingPath, "git", "tag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "v1.0") || !strings.Contains(out, "v2.0") {
+		t.Errorf("expected both tags in converted repo, got:\n%s", out)
 	}
 }
 
@@ -841,7 +877,7 @@ func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
 	manager := NewManager(0)
 
 	// Initial sync
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("initial EnsureRepo failed: %v", err)
 	}
 
@@ -876,7 +912,7 @@ func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get updated upstream HEAD: %v", err)
 	}
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("incremental EnsureRepo failed: %v", err)
 	}
 	newServingHead, err := runCmd(info.ServingPath, "git", "--git-dir=.", "rev-parse", "HEAD")
@@ -889,12 +925,12 @@ func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
 
 	// Test branch deletion and archival on native SHA-256
 	_, _ = runCmd(upstreamPath, "git", "branch", "feature", newUpstreamHead)
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo for new branch failed: %v", err)
 	}
 	// Delete branch upstream
 	_, _ = runCmd(upstreamPath, "git", "branch", "-D", "feature")
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo after branch deletion failed: %v", err)
 	}
 	servingRefs, err := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)")
@@ -917,7 +953,7 @@ func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
 		}
 	}
 	commitToUpstream(t, upstreamPath, "commit 2")
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo after mirror backup loss failed: %v", err)
 	}
 	servingRefsAfter, err := runCmd(info.ServingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(refname)")
@@ -935,7 +971,7 @@ func TestConversionEmitsProgress(t *testing.T) {
 	manager := NewManager(0)
 
 	var progressBuf strings.Builder
-	if err := manager.EnsureRepo(info, &progressBuf); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, &progressBuf); err != nil {
 		t.Fatalf("EnsureRepo failed: %v", err)
 	}
 
@@ -958,7 +994,7 @@ func TestConversionConcurrencyLimiter(t *testing.T) {
 	}
 
 	// EnsureRepo must time out waiting for slot and return ErrServerBusy
-	err := manager.EnsureRepo(info, nil)
+	err := manager.EnsureRepo(context.Background(), info, nil)
 	if !errors.Is(err, ErrServerBusy) {
 		t.Fatalf("expected ErrServerBusy when semaphore is full, got: %v", err)
 	}
@@ -967,7 +1003,7 @@ func TestConversionConcurrencyLimiter(t *testing.T) {
 	manager.ReleaseConversionSlot()
 
 	// EnsureRepo should now proceed and succeed
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("expected EnsureRepo to succeed after slot release: %v", err)
 	}
 }
@@ -980,14 +1016,14 @@ func TestDiskSpaceSafeguard(t *testing.T) {
 	// Require an impossible amount of free space (1 Exabyte)
 	manager.SetMinFreeDisk(1000 * 1024 * 1024 * 1024 * 1024 * 1024)
 
-	err := manager.EnsureRepo(info, nil)
+	err := manager.EnsureRepo(context.Background(), info, nil)
 	if !errors.Is(err, ErrDiskSpaceExhausted) {
 		t.Fatalf("expected ErrDiskSpaceExhausted when disk threshold is breached, got: %v", err)
 	}
 
 	// Reset to 0 (disabled) and verify clone succeeds
 	manager.SetMinFreeDisk(0)
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("expected EnsureRepo to succeed when threshold disabled: %v", err)
 	}
 }
@@ -1002,7 +1038,7 @@ func TestFastImportStatisticsGatedByDebug(t *testing.T) {
 	log.SetOutput(&logBuf)
 	defer log.SetOutput(os.Stderr)
 
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo failed: %v", err)
 	}
 
@@ -1015,11 +1051,59 @@ func TestFastImportStatisticsGatedByDebug(t *testing.T) {
 	manager.SetDebug(true)
 	logBuf.Reset()
 
-	if err := manager.EnsureRepo(info, nil); err != nil {
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatalf("EnsureRepo with debug failed: %v", err)
 	}
 
 	if !strings.Contains(logBuf.String(), "fast-import statistics") {
 		t.Errorf("expected fast-import statistics when debug is enabled, got:\n%s", logBuf.String())
 	}
+}
+
+func TestEnsureRepoCancelsWhenWaitersDisconnect(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager(0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-canceled context
+
+	err := manager.EnsureRepo(ctx, info, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+
+	// Wait for background worker cancellation and cleanup to complete before temp dir removal
+	manager.WaitIdle()
+}
+
+func TestEnsureRepoContinuesForRemainingWaiters(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager(0)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2 := context.Background()
+
+	errChan1 := make(chan error, 1)
+	errChan2 := make(chan error, 1)
+
+	go func() { errChan1 <- manager.EnsureRepo(ctx1, info, nil) }()
+	time.Sleep(10 * time.Millisecond)
+	go func() { errChan2 <- manager.EnsureRepo(ctx2, info, nil) }()
+
+	time.Sleep(10 * time.Millisecond)
+	cancel1() // cancel client 1
+
+	err1 := <-errChan1
+	if !errors.Is(err1, context.Canceled) {
+		t.Errorf("expected client 1 to be canceled, got: %v", err1)
+	}
+
+	err2 := <-errChan2
+	if err2 != nil {
+		t.Errorf("expected client 2 to succeed, got: %v", err2)
+	}
+
+	manager.WaitIdle()
 }

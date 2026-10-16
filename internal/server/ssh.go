@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
@@ -128,6 +129,9 @@ const sshRequestTimeout = 30 * time.Second
 func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	timer := time.NewTimer(sshRequestTimeout)
 	defer timer.Stop()
 
@@ -158,7 +162,14 @@ func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 
 				req.Reply(true, nil)
 
-				err := s.executeGitCommand(ch, payload.Value)
+				// When the client disconnects or closes the session, the reqs channel is closed by ssh.
+				go func() {
+					for range reqs {
+					}
+					cancel()
+				}()
+
+				err := s.executeGitCommand(ctx, ch, payload.Value)
 				sendExitStatus(ch, err)
 				return
 
@@ -176,7 +187,7 @@ func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	}
 }
 
-func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
+func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCmd string) error {
 	log.Printf("[SSH] Command: %q", rawCmd)
 
 	verb, repoPath, err := parseGitCommand(rawCmd)
@@ -202,7 +213,7 @@ func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
 	log.Printf("[SSH] Ensuring repository %s is available & converted...", info.RepoName)
 	_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: Checking cache for %s...\n", info.RepoName)
 
-	if err := s.converter.EnsureRepo(info, ch.Stderr()); err != nil {
+	if err := s.converter.EnsureRepo(ctx, info, ch.Stderr()); err != nil {
 		log.Printf("[SSH] JIT conversion failed for %s: %v", info.RepoName, err)
 		if errors.Is(err, converter.ErrServerBusy) {
 			_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: error: server busy with other conversions, please retry shortly\n")
@@ -212,7 +223,7 @@ func (s *SSHServer) executeGitCommand(ch ssh.Channel, rawCmd string) error {
 	}
 
 	// Execute git command directly against the safe path
-	cmd := exec.Command(verb, absServingPath)
+	cmd := exec.CommandContext(ctx, verb, absServingPath)
 	cmd.Env = converter.GitEnv()
 	cmd.Stdin = ch
 	cmd.Stdout = ch

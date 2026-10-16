@@ -111,7 +111,7 @@ func TestIDLookup(t *testing.T) {
 	}
 }
 
-func TestCloneOfRepoWithSubmodulesExplainsFailure(t *testing.T) {
+func TestCloneOfRepoWithSubmodulesSucceeds(t *testing.T) {
 	tempDir := t.TempDir()
 	upstreamPath := filepath.Join(tempDir, "upstream")
 	_, _ = runCmd("", "git", "init", "-q", "--initial-branch=main", "--object-format=sha1", upstreamPath)
@@ -135,9 +135,14 @@ func TestCloneOfRepoWithSubmodulesExplainsFailure(t *testing.T) {
 	ts := httptest.NewServer(httpServer)
 	defer ts.Close()
 
-	_, err = runCmd("", "git", "clone", "-q", ts.URL+"/local.test/test/repo.git", filepath.Join(tempDir, "clone"))
-	if err == nil || !strings.Contains(err.Error(), "submodule") {
-		t.Errorf("clone should fail explaining submodules are unsupported, got: %v", err)
+	cloneDir := filepath.Join(tempDir, "clone")
+	_, err = runCmd("", "git", "clone", "-q", ts.URL+"/local.test/test/repo.git", cloneDir)
+	if err != nil {
+		t.Fatalf("clone of repo with submodules failed: %v", err)
+	}
+	format, err := runCmd(cloneDir, "git", "rev-parse", "--show-object-format")
+	if err != nil || strings.TrimSpace(format) != "sha256" {
+		t.Errorf("cloned repository should be sha256, got: %s (err %v)", format, err)
 	}
 }
 

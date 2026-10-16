@@ -17,8 +17,8 @@ It is designed to solve a critical interoperability gap: **Git does not allow re
 
 ### Limitations
 
-- **Repositories containing submodules are not supported yet.** A submodule entry records a SHA-1 commit id of another repository, which has no SHA-256 equivalent unless that repository is converted too. Such repositories fail with an explicit `repositories containing submodules cannot be converted to SHA-256 yet` error naming the submodule path.
 - **Only branches and tags are mirrored.** Forge-specific refs such as GitHub's `refs/pull/*` or GitLab's `refs/merge-requests/*` are not served.
+- **Submodules are supported seamlessly via zero-padding.** Submodule gitlink tree entries are deterministically translated to 64-character SHA-256 hashes (`<sha1>` padded with 24 zeros). When clients run standard `git submodule update --init`, Git matches the 40-character SHA-1 prefix and checks out the exact legacy commit directly into the submodule without requiring extra flags, aliases, or configuration.
 
 ---
 
@@ -83,13 +83,13 @@ curl http://localhost:8080/github.com/owner/repo.git/sha1/722a661     # SHA-1 (f
 curl http://localhost:8080/github.com/owner/repo.git/sha256/<sha256>  # SHA-256 (full or ≥7 chars) -> SHA-1
 ```
 
-For convenience, configure two Git aliases (they need `curl`). You can include the repository's shared `.gitconfig`:
+For convenience, configure Git aliases (they need `curl`). You can include the repository's shared `.gitconfig`:
 
 ```bash
 git config --local include.path ../.gitconfig
 ```
 
-*(Alternatively, you can configure them globally via `git config --global alias.from-sha1 ...` and `alias.to-sha1 ...`)*
+*(Alternatively, you can configure them globally via `git config --global alias.from-sha1 ...`, `alias.to-sha1 ...`, and `alias.update-submodules ...`)*
 
 Then, inside a clone of a converted repository (e.g. a submodule):
 ```bash
@@ -102,6 +102,14 @@ The aliases derive the Evergit URL from the `origin` remote. For clones made ove
 ```bash
 git config evergit.url http://localhost:8080/github.com/owner/repo.git
 ```
+
+### Working with Submodules
+
+Submodules work out-of-the-box with standard Git commands:
+```bash
+git submodule update --init
+```
+Because Evergit preserves the original 40-character legacy SHA-1 in the prefix of the 64-character hash, Git's prefix-matching resolver automatically checks out the exact corresponding commit in the submodule, with `git status` remaining clean.
 
 > **Do not enable `extensions.compatObjectFormat` in your clones or in the superproject.** Git's SHA-1 compatibility mode
 > must compute a SHA-1 id for every object it writes, and it cannot do so for objects received by `git fetch` or for

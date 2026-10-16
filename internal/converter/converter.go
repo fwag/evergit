@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -31,20 +30,35 @@ var ErrDiskSpaceExhausted = errors.New("storage disk space exhausted")
 // DefaultConversionTimeout is the maximum time a request will wait in the conversion queue before shedding load.
 const DefaultConversionTimeout = 30 * time.Second
 
+// DefaultExecTimeout is the maximum time a repository conversion may run before being terminated.
+const DefaultExecTimeout = 1 * time.Hour
+
 type Manager struct {
 	cacheTTL       time.Duration
 	minFreeDisk    uint64
 	debug          bool
 	conversionSem  chan struct{}
 	conversionWait time.Duration
+	execTimeout    time.Duration
 	locksMu        sync.Mutex
 	repoLocks      map[string]*repoLock
+}
+
+// repoJob tracks an active conversion job and its waiting clients.
+type repoJob struct {
+	mu       sync.Mutex
+	waiters  int
+	cancel   context.CancelFunc
+	canceled bool
+	done     chan struct{}
+	err      error
 }
 
 // repoLock is a per-repository mutex, reference-counted so idle entries can be dropped.
 type repoLock struct {
 	mu    sync.Mutex
 	users int
+	job   *repoJob
 }
 
 func NewManager(cacheTTL time.Duration, maxConversions ...int) *Manager {
@@ -108,6 +122,11 @@ func (m *Manager) SetConversionTimeout(d time.Duration) {
 	m.conversionWait = d
 }
 
+// SetExecTimeout configures the maximum duration a conversion pipeline may run.
+func (m *Manager) SetExecTimeout(d time.Duration) {
+	m.execTimeout = d
+}
+
 // TryAcquireConversionSlot acquires a conversion concurrency slot if available.
 func (m *Manager) TryAcquireConversionSlot() bool {
 	if m.conversionSem == nil {
@@ -132,32 +151,150 @@ func (m *Manager) ReleaseConversionSlot() {
 	}
 }
 
+// WaitIdle blocks until all active background conversions are finished and locks are released.
+func (m *Manager) WaitIdle() {
+	for {
+		m.locksMu.Lock()
+		idle := len(m.repoLocks) == 0
+		m.locksMu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // EnsureRepo checks if the repository exists, is up-to-date, and is converted.
 // If not, it clones/fetches, converts it, and optionally streams progress.
-func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+// It accepts a context for cancellation (e.g. when all waiting clients disconnect).
+func (m *Manager) EnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if progressWriter != nil {
 		async := newAsyncWriter(progressWriter)
 		defer async.Close()
 		progressWriter = async
 	}
 
-	unlock := m.lockRepo(info.ServingPath)
-	defer unlock()
+	m.locksMu.Lock()
+	lock, exists := m.repoLocks[info.ServingPath]
+	if !exists {
+		lock = &repoLock{}
+		m.repoLocks[info.ServingPath] = lock
+	}
+	lock.users++
+	m.locksMu.Unlock()
 
+	defer func() {
+		m.locksMu.Lock()
+		lock.users--
+		if lock.users == 0 && lock.job == nil {
+			delete(m.repoLocks, info.ServingPath)
+		}
+		m.locksMu.Unlock()
+	}()
+
+	lock.mu.Lock()
+	if lock.job != nil {
+		job := lock.job
+		if !job.canceled {
+			lock.mu.Unlock()
+			return m.waitJob(ctx, lock, job)
+		}
+		// Previous job was canceled and is shutting down; wait for it to exit before starting anew
+		lock.mu.Unlock()
+		select {
+		case <-job.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		lock.mu.Lock()
+	}
+
+	// 1. Check if the repository already exists and is within its TTL
+	if !m.needsSync(info) {
+		lock.mu.Unlock()
+		return nil
+	}
+
+	job := &repoJob{done: make(chan struct{})}
+	timeout := m.execTimeout
+	if timeout <= 0 {
+		timeout = DefaultExecTimeout
+	}
+	jobCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	job.cancel = cancel
+	lock.job = job
+	lock.mu.Unlock()
+
+	go func() {
+		err := m.doEnsureRepo(jobCtx, info, progressWriter)
+		job.mu.Lock()
+		job.err = err
+		close(job.done)
+		job.mu.Unlock()
+
+		m.locksMu.Lock()
+		lock.mu.Lock()
+		if lock.job == job {
+			lock.job = nil
+		}
+		if lock.users == 0 {
+			delete(m.repoLocks, info.ServingPath)
+		}
+		lock.mu.Unlock()
+		m.locksMu.Unlock()
+	}()
+
+	return m.waitJob(ctx, lock, job)
+}
+
+func (m *Manager) waitJob(ctx context.Context, lock *repoLock, job *repoJob) error {
+	job.mu.Lock()
+	job.waiters++
+	job.mu.Unlock()
+
+	defer func() {
+		job.mu.Lock()
+		job.waiters--
+		if job.waiters == 0 {
+			select {
+			case <-job.done:
+			default:
+				job.canceled = true
+				job.cancel()
+			}
+		}
+		job.mu.Unlock()
+	}()
+
+	select {
+	case <-job.done:
+		job.mu.Lock()
+		err := job.err
+		job.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
 	// 1. Check if the repository already exists and is within its TTL
 	if !m.needsSync(info) {
 		return nil
 	}
 
 	// 2. Clone/Fetch the upstream mirror
-	changed, err := m.syncMirror(info)
+	changed, err := m.syncMirror(ctx, info)
 	if err != nil {
 		return err
 	}
 
 	// If the upstream mirror is natively SHA-256, bypass the fast-export | fast-import pipeline
 	if isRepoSHA256(info.MirrorPath) {
-		return m.syncNativeSHA256(info, changed, progressWriter)
+		return m.syncNativeSHA256(ctx, info, changed, progressWriter)
 	}
 
 	// Skip conversion when the serving repo exists and the mirror did not change (or the fetch
@@ -176,7 +313,7 @@ func (m *Manager) EnsureRepo(info *resolver.RepositoryInfo, progressWriter io.Wr
 	}
 
 	// 3. Convert mirror to serving repo (SHA1 -> SHA256 conversion)
-	if err := m.convertRepo(info, progressWriter); err != nil {
+	if err := m.convertRepo(ctx, info, progressWriter); err != nil {
 		return err
 	}
 
@@ -191,7 +328,7 @@ func isRepoSHA256(repoPath string) bool {
 
 // syncNativeSHA256 creates or updates the serving repository for an upstream repository that is
 // already in SHA-256 format, bypassing the CPU- and memory-intensive fast-export | fast-import pipeline.
-func (m *Manager) syncNativeSHA256(info *resolver.RepositoryInfo, changed bool, progressWriter io.Writer) error {
+func (m *Manager) syncNativeSHA256(ctx context.Context, info *resolver.RepositoryInfo, changed bool, progressWriter io.Writer) error {
 	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
 	if _, err := os.Stat(servingHeadPath); err == nil {
 		if !changed {
@@ -205,7 +342,7 @@ func (m *Manager) syncNativeSHA256(info *resolver.RepositoryInfo, changed bool, 
 			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Syncing native SHA-256 updates...\n")
 		}
 		// Fetch branches and tags, pruning any deleted upstream branches/tags
-		if _, err := runCmd(info.ServingPath, "git", "fetch", "--prune", "--", info.MirrorPath,
+		if _, err := runCmdContext(ctx, 0, info.ServingPath, "git", "fetch", "--prune", "--", info.MirrorPath,
 			"+refs/heads/*:refs/heads/*",
 			"+refs/tags/*:refs/tags/*",
 		); err != nil {
@@ -214,14 +351,14 @@ func (m *Manager) syncNativeSHA256(info *resolver.RepositoryInfo, changed bool, 
 
 		// Backup refs are never pruned: older versions or re-cloned mirrors may lose them,
 		// leaving the serving repo as their only copy. Fetch them additively without --prune.
-		if _, err := runCmd(info.ServingPath, "git", "fetch", "--", info.MirrorPath,
+		if _, err := runCmdContext(ctx, 0, info.ServingPath, "git", "fetch", "--", info.MirrorPath,
 			"+refs/evergit-backups/*:refs/evergit-backups/*",
 		); err != nil {
 			log.Printf("WARNING: failed to fetch backup refs for native sha256 repo %s: %v", info.RepoName, err)
 		}
 
-		if headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
-			_, _ = runCmd(info.ServingPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
+		if headRef, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
+			_, _ = runCmdContext(ctx, 0, info.ServingPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
 		}
 
 		now := time.Now()
@@ -244,16 +381,16 @@ func (m *Manager) syncNativeSHA256(info *resolver.RepositoryInfo, changed bool, 
 	if progressWriter != nil {
 		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Upstream is native SHA-256. Bypassing conversion pipeline...\n")
 	}
-	if _, err := runCmd("", "git", "clone", "--bare", "--", info.MirrorPath, buildPath); err != nil {
+	if _, err := runCmdContext(ctx, 0, "", "git", "clone", "--bare", "--", info.MirrorPath, buildPath); err != nil {
 		os.RemoveAll(buildPath)
 		return fmt.Errorf("failed to clone native sha256 repository %s: %w", info.RepoName, err)
 	}
 
 	// clone --bare only copies heads and tags; also copy any existing backup refs
-	_, _ = runCmd(buildPath, "git", "fetch", "--", info.MirrorPath, "+refs/evergit-backups/*:refs/evergit-backups/*")
+	_, _ = runCmdContext(ctx, 0, buildPath, "git", "fetch", "--", info.MirrorPath, "+refs/evergit-backups/*:refs/evergit-backups/*")
 
-	if headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
-		_, _ = runCmd(buildPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
+	if headRef, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
+		_, _ = runCmdContext(ctx, 0, buildPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
 	}
 
 	now := time.Now()
@@ -266,29 +403,6 @@ func (m *Manager) syncNativeSHA256(info *resolver.RepositoryInfo, changed bool, 
 
 	m.logBackupRefs(info)
 	return nil
-}
-
-// lockRepo acquires the repository's lock and returns its release function. Entries are removed
-// once unused, so the map does not grow with every distinct path ever requested.
-func (m *Manager) lockRepo(key string) func() {
-	m.locksMu.Lock()
-	lock, exists := m.repoLocks[key]
-	if !exists {
-		lock = &repoLock{}
-		m.repoLocks[key] = lock
-	}
-	lock.users++
-	m.locksMu.Unlock()
-
-	lock.mu.Lock()
-	return func() {
-		lock.mu.Unlock()
-		m.locksMu.Lock()
-		if lock.users--; lock.users == 0 {
-			delete(m.repoLocks, key)
-		}
-		m.locksMu.Unlock()
-	}
 }
 
 // asyncWriter forwards writes from a goroutine and drops them when its buffer is full, so a
@@ -335,7 +449,7 @@ func (m *Manager) needsSync(info *resolver.RepositoryInfo) bool {
 	return time.Since(fi.ModTime()) > m.cacheTTL
 }
 
-func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
+func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(info.MirrorPath), 0755); err != nil {
 		return false, fmt.Errorf("failed to create mirrors directory: %w", err)
 	}
@@ -360,8 +474,9 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 		// Clone as a bare mirror
 		// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
 		// thousands of refs/pull/* from forks
-		_, err := runCmdTimeout(upstreamTimeout, "", "git", "-c", "http.followRedirects=false", "clone", "--bare", "--", info.RemoteURL, info.MirrorPath)
+		_, err := runCmdContext(ctx, upstreamTimeout, "", "git", "-c", "http.followRedirects=false", "clone", "--bare", "--", info.RemoteURL, info.MirrorPath)
 		if err != nil {
+			_ = os.RemoveAll(info.MirrorPath)
 			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, err)
 		}
 		return true, nil // Newly cloned, definitely changed
@@ -378,7 +493,7 @@ func (m *Manager) syncMirror(info *resolver.RepositoryInfo) (bool, error) {
 
 		// Fetch updates
 		fetchArgs := append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", "origin"}, mirrorRefspecs...)
-		_, err = runCmdTimeout(upstreamTimeout, info.MirrorPath, "git", fetchArgs...)
+		_, err = runCmdContext(ctx, upstreamTimeout, info.MirrorPath, "git", fetchArgs...)
 
 		// Archive overwritten/deleted refs even if the fetch failed midway, since it may already
 		// have pruned or updated some of them
@@ -440,7 +555,7 @@ type conversionPlan struct {
 	failed        bool
 }
 
-func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
 	// Guard against unbounded concurrent conversions across all repositories
 	if m.conversionSem != nil {
 		wait := m.conversionWait
@@ -452,10 +567,12 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 			defer func() { <-m.conversionSem }()
 		case <-time.After(wait):
 			return ErrServerBusy
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 
-	plan, err := m.prepareConversion(info, progressWriter)
+	plan, err := m.prepareConversion(ctx, info, progressWriter)
 	if err != nil {
 		return err
 	}
@@ -467,7 +584,7 @@ func (m *Manager) convertRepo(info *resolver.RepositoryInfo, progressWriter io.W
 		}()
 	}
 
-	if err := runConversionPipeline(info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, plan.totalObjects, plan.isIncremental, m.debug, progressWriter); err != nil {
+	if err := runConversionPipeline(ctx, info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, plan.totalObjects, plan.isIncremental, m.debug, progressWriter); err != nil {
 		plan.failed = true
 		return err
 	}
@@ -489,14 +606,14 @@ func isIncrementalConversion(servingPath string) bool {
 	return true
 }
 
-func countExportableObjects(mirrorPath string) int {
-	commitsOut, err := runCmd(mirrorPath, "git", "rev-list", "--all", "--count")
+func countExportableObjects(ctx context.Context, mirrorPath string) int {
+	commitsOut, err := runCmdContext(ctx, 0, mirrorPath, "git", "rev-list", "--all", "--count")
 	if err != nil {
 		return 0
 	}
 	commits, _ := strconv.Atoi(strings.TrimSpace(commitsOut))
 
-	blobsOut, err := runCmd(mirrorPath, "git", "rev-list", "--objects", "--filter=object:type=blob", "--all", "--count")
+	blobsOut, err := runCmdContext(ctx, 0, mirrorPath, "git", "rev-list", "--objects", "--filter=object:type=blob", "--all", "--count")
 	if err != nil {
 		return commits
 	}
@@ -505,7 +622,7 @@ func countExportableObjects(mirrorPath string) int {
 	return commits + blobs
 }
 
-func (m *Manager) prepareConversion(info *resolver.RepositoryInfo, progressWriter io.Writer) (*conversionPlan, error) {
+func (m *Manager) prepareConversion(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) (*conversionPlan, error) {
 	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create repos directory: %w", err)
 	}
@@ -526,20 +643,31 @@ func (m *Manager) prepareConversion(info *resolver.RepositoryInfo, progressWrite
 		if progressWriter != nil {
 			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Performing full JIT SHA-1 -> SHA-256 history conversion, please wait...\n")
 		}
-		if _, err := runCmd("", "git", "init", "--bare", "--object-format=sha256", targetPath); err != nil {
+		if _, err := runCmdContext(ctx, 0, "", "git", "init", "--bare", "--object-format=sha256", targetPath); err != nil {
 			return nil, fmt.Errorf("failed to initialize bare sha256 repository: %w", err)
 		}
-		totalObjects = countExportableObjects(info.MirrorPath)
+		totalObjects = countExportableObjects(ctx, info.MirrorPath)
 	}
 
 	sha1Marks := filepath.Join(targetPath, "evergit-sha1-marks.txt")
 	sha256Marks := filepath.Join(targetPath, "evergit-sha256-marks.txt")
 
+	interval := progressObjectInterval
+	if totalObjects > 0 {
+		// Target ~50 progress updates across the conversion, but no more frequently than every 5,000 objects
+		calculated := totalObjects / 50
+		if calculated > interval {
+			interval = calculated
+		}
+	}
+
 	exportFlags := []string{
 		"--all",
 		"--signed-commits=strip",
+		"--signed-tags=strip",
 		"--tag-of-filtered-object=rewrite",
-		fmt.Sprintf("--progress=%d", progressObjectInterval),
+		"--mark-tags",
+		fmt.Sprintf("--progress=%d", interval),
 		"--export-marks=" + sha1Marks,
 	}
 	importFlags := []string{
@@ -565,49 +693,121 @@ func (m *Manager) prepareConversion(info *resolver.RepositoryInfo, progressWrite
 	}, nil
 }
 
-func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, totalObjects int, isIncremental, debug bool, progressWriter io.Writer) error {
-	exportCmd := exec.Command("git", append([]string{"fast-export"}, exportFlags...)...)
+const (
+	syntheticSHA256Padding = "000000000000000000000000" // 24 zeros
+	nullSHA1               = "0000000000000000000000000000000000000000"
+	nullSHA256             = "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+// transformFastExportStream filters the fast-export stream, zero-padding 40-character SHA-1
+// gitlinks (mode 160000) to 64-character synthetic SHA-256 hashes so that fast-import accepts
+// them into a SHA-256 repository without rejecting submodules. It also translates 40-character
+// null SHA-1 references (emitted e.g. when dereferencing nested tags with --mark-tags) to 64-character
+// null SHA-256 references. Binary data payloads are copied verbatim.
+func transformFastExportStream(r io.Reader, w io.Writer) error {
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		line, err := br.ReadString('\n')
+		if len(line) > 0 {
+			if strings.HasPrefix(line, "data ") {
+				if _, werr := io.WriteString(w, line); werr != nil {
+					return werr
+				}
+				sizeStr := strings.TrimSpace(line[5:])
+				size, parseErr := strconv.ParseInt(sizeStr, 10, 64)
+				if parseErr == nil && size > 0 {
+					if _, cerr := io.CopyN(w, br, size); cerr != nil {
+						return cerr
+					}
+				}
+				continue
+			} else if strings.HasPrefix(line, "M 160000 ") {
+				// M 160000 <dataref> <path>
+				parts := strings.SplitN(line, " ", 4)
+				if len(parts) == 4 && len(parts[2]) == 40 {
+					synthetic := parts[2] + syntheticSHA256Padding
+					line = fmt.Sprintf("M 160000 %s %s", synthetic, parts[3])
+				}
+			} else if strings.HasPrefix(line, "from ") || strings.HasPrefix(line, "merge ") {
+				parts := strings.SplitN(line, " ", 2)
+				if len(parts) == 2 && strings.TrimRight(parts[1], "\r\n ") == nullSHA1 {
+					line = parts[0] + " " + nullSHA256 + "\n"
+				}
+			}
+			if _, werr := io.WriteString(w, line); werr != nil {
+				return werr
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func runConversionPipeline(ctx context.Context, mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, totalObjects int, isIncremental, debug bool, progressWriter io.Writer) error {
+	exportCmd := exec.CommandContext(ctx, "git", append([]string{"fast-export"}, exportFlags...)...)
 	exportCmd.Env = GitEnv()
 	exportCmd.Dir = mirrorPath
 
-	importCmd := exec.Command("git", append([]string{"fast-import"}, importFlags...)...)
+	importCmd := exec.CommandContext(ctx, "git", append([]string{"fast-import"}, importFlags...)...)
 	importCmd.Env = GitEnv()
 	importCmd.Dir = targetPath
 
-	r, w := io.Pipe()
-	exportCmd.Stdout = w
-	importCmd.Stdin = r
+	exportReader, exportWriter := io.Pipe()
+	importReader, importWriter := io.Pipe()
+
+	exportCmd.Stdout = exportWriter
+	importCmd.Stdin = importReader
 
 	var exportErrBuf, importErrBuf strings.Builder
 	exportCmd.Stderr = &exportErrBuf
 
 	importStdoutPipe, err := importCmd.StdoutPipe()
 	if err != nil {
-		_ = r.Close()
-		_ = w.Close()
+		_ = exportReader.Close()
+		_ = exportWriter.Close()
+		_ = importReader.Close()
+		_ = importWriter.Close()
 		return fmt.Errorf("failed to create stdout pipe for git fast-import: %w", err)
 	}
 
 	importStderrPipe, err := importCmd.StderrPipe()
 	if err != nil {
-		_ = r.Close()
-		_ = w.Close()
+		_ = exportReader.Close()
+		_ = exportWriter.Close()
+		_ = importReader.Close()
+		_ = importWriter.Close()
 		_ = importStdoutPipe.Close()
 		return fmt.Errorf("failed to create stderr pipe for git fast-import: %w", err)
 	}
 
 	if err := exportCmd.Start(); err != nil {
-		_ = r.Close()
-		_ = w.Close()
+		_ = exportReader.Close()
+		_ = exportWriter.Close()
+		_ = importReader.Close()
+		_ = importWriter.Close()
 		return fmt.Errorf("failed to start git fast-export: %w", err)
 	}
 	if err := importCmd.Start(); err != nil {
-		_ = r.Close()
-		_ = w.Close()
+		_ = exportReader.Close()
+		_ = exportWriter.Close()
+		_ = importReader.Close()
+		_ = importWriter.Close()
 		_ = exportCmd.Process.Kill()
 		_ = exportCmd.Wait()
 		return fmt.Errorf("failed to start git fast-import: %w", err)
 	}
+
+	transformErrChan := make(chan error, 1)
+	go func() {
+		err := transformFastExportStream(exportReader, importWriter)
+		_ = exportReader.CloseWithError(err)
+		_ = importWriter.CloseWithError(err)
+		transformErrChan <- err
+	}()
 
 	var pipesWg sync.WaitGroup
 	pipesWg.Add(2)
@@ -618,7 +818,9 @@ func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFla
 		scanner := bufio.NewScanner(importStdoutPipe)
 		for scanner.Scan() {
 			line := scanner.Text()
-			log.Printf("[%s fast-import] %s", repoName, line)
+			if debug {
+				log.Printf("[%s fast-import] %s", repoName, line)
+			}
 			if progressWriter != nil {
 				if totalObjects > 0 {
 					fields := strings.Fields(line)
@@ -641,12 +843,17 @@ func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFla
 	// Stream stderr of fast-import in real-time, keeping it for error reporting and stats logging
 	go func() {
 		defer pipesWg.Done()
-		scanner := bufio.NewScanner(importStderrPipe)
-		for scanner.Scan() {
-			line := scanner.Text()
-			importErrBuf.WriteString(line + "\n")
-			if debug {
-				log.Printf("[%s fast-import] %s", repoName, line)
+		reader := bufio.NewReader(importStderrPipe)
+		for {
+			line, err := reader.ReadString('\n')
+			if len(line) > 0 {
+				importErrBuf.WriteString(line)
+				if debug {
+					log.Printf("[%s fast-import] %s", repoName, strings.TrimRight(line, "\r\n"))
+				}
+			}
+			if err != nil {
+				break
 			}
 		}
 	}()
@@ -654,14 +861,14 @@ func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFla
 	exportErrChan := make(chan error, 1)
 	go func() {
 		err := exportCmd.Wait()
-		_ = w.CloseWithError(err)
+		_ = exportWriter.CloseWithError(err)
 		exportErrChan <- err
 	}()
 
 	// All stdout and stderr reads must complete before Wait closes the pipes
 	pipesWg.Wait()
 	importErr := importCmd.Wait()
-	_ = r.Close()
+	_ = importReader.Close()
 
 	if progressWriter != nil {
 		if totalObjects > 0 {
@@ -672,18 +879,33 @@ func runConversionPipeline(mirrorPath, targetPath string, exportFlags, importFla
 	}
 
 	exportErr := <-exportErrChan
+	transformErr := <-transformErrChan
 
+	// If fast-export or stream transformation failed with a non-pipe error, report that first
+	if exportErr != nil && !isBrokenPipe(exportErr) {
+		return fmt.Errorf("git fast-export failed: %v (stderr: %q)", exportErr, strings.TrimSpace(exportErrBuf.String()))
+	}
+	if transformErr != nil && !errors.Is(transformErr, io.EOF) && !isBrokenPipe(transformErr) {
+		return fmt.Errorf("git fast-export stream transform failed: %w", transformErr)
+	}
 	if importErr != nil {
-		if m := gitlinkRejection.FindStringSubmatch(importErrBuf.String()); m != nil {
-			return fmt.Errorf("%w: %s records SHA-1 commit %s at %q, which has no SHA-256 equivalent",
-				ErrSubmodulesUnsupported, repoName, m[1], m[2])
-		}
 		return fmt.Errorf("git fast-import failed: %v (stderr: %q)", importErr, strings.TrimSpace(importErrBuf.String()))
 	}
 	if exportErr != nil {
 		return fmt.Errorf("git fast-export failed: %v (stderr: %q)", exportErr, strings.TrimSpace(exportErrBuf.String()))
 	}
+	if transformErr != nil && !errors.Is(transformErr, io.EOF) {
+		return fmt.Errorf("git fast-export stream transform failed: %w", transformErr)
+	}
 	return nil
+}
+
+func isBrokenPipe(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "broken pipe") || strings.Contains(msg, "closed pipe")
 }
 
 func (m *Manager) finalizeConversion(info *resolver.RepositoryInfo, targetPath string, isIncremental bool) error {
@@ -807,9 +1029,12 @@ var redirectingGitEnv = []string{
 	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
 	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
 	"GIT_QUARANTINE_PATH", "GIT_PREFIX", "GIT_DEFAULT_HASH",
+	"GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_PARAMETERS",
 }
 
 // GitEnv returns the process environment without redirecting git variables, plus extra.
+// It isolates internal Git processes from user and system gitconfigs (such as url.*.insteadOf
+// rules) to prevent recursive proxy loops where Evergit attempts to clone from itself.
 func GitEnv(extra ...string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
@@ -818,6 +1043,11 @@ func GitEnv(extra ...string) []string {
 			env = append(env, kv)
 		}
 	}
+	env = append(env,
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+	)
 	return append(env, extra...)
 }
 
@@ -827,7 +1057,14 @@ func runCmd(dir, name string, args ...string) (string, error) {
 
 // runCmdTimeout runs a command, killing it after timeout (0 means no limit).
 func runCmdTimeout(timeout time.Duration, dir, name string, args ...string) (string, error) {
-	ctx := context.Background()
+	return runCmdContext(context.Background(), timeout, dir, name, args...)
+}
+
+// runCmdContext runs a command with context cancellation and an optional timeout.
+func runCmdContext(ctx context.Context, timeout time.Duration, dir, name string, args ...string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -856,7 +1093,7 @@ const (
 	// maxMarkID caps mark numbers to prevent corrupt marks files from creating runaway sparse scratch files.
 	maxMarkID = 100_000_000
 	// progressObjectInterval specifies how often fast-export emits progress statements (in objects).
-	progressObjectInterval = 1000
+	progressObjectInterval = 5000
 )
 
 // generateLooseObjectIdx rebuilds objects/loose-object-idx by pairing the SHA1 and SHA256 marks files.
@@ -1137,14 +1374,6 @@ func (m *Manager) logBackupRefs(info *resolver.RepositoryInfo) {
 		log.Printf("[Backup] Preserved history: %s -> SHA256: %s (SHA1: %s)", refName, sha256, sha256ToSha1[sha256])
 	}
 }
-
-// ErrSubmodulesUnsupported is returned for repositories whose history contains submodules: a
-// submodule entry records a SHA-1 commit id of another repository, which cannot be translated
-// without converting that repository too.
-var ErrSubmodulesUnsupported = errors.New("repositories containing submodules cannot be converted to SHA-256 yet")
-
-// gitlinkRejection matches fast-import refusing a submodule entry ("M 160000 <sha1> <path>").
-var gitlinkRejection = regexp.MustCompile(`M 160000 ([0-9a-f]{40}) (.+)`)
 
 var (
 	ErrIDInvalid   = errors.New("invalid object id")

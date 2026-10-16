@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -54,7 +55,7 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 		// SHA-1 <-> SHA-256 id lookups: /<repo>/sha1/<id> and /<repo>/sha256/<id>
 		if m := idLookupPath.FindStringSubmatch(r.URL.Path); m != nil {
 			if info, err := resolver.ParsePath(m[1], cfg); err == nil {
-				serveIDLookup(w, conv, info, m[2], m[3])
+				serveIDLookup(w, r.Context(), conv, info, m[2], m[3])
 				return
 			}
 		}
@@ -81,7 +82,7 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 
 		// Run JIT clone and conversion if necessary
 		log.Printf("[HTTP] Ensuring repository %s is available & converted...", info.RepoName)
-		if err := conv.EnsureRepo(info, nil); err != nil {
+		if err := conv.EnsureRepo(r.Context(), info, nil); err != nil {
 			writeConversionError(w, info, err)
 			return
 		}
@@ -97,10 +98,6 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 // so known limitations are explained instead of reported as a generic failure.
 func writeConversionError(w http.ResponseWriter, info *resolver.RepositoryInfo, err error) {
 	log.Printf("[HTTP] JIT conversion failed for %s: %v", info.RepoName, err)
-	if errors.Is(err, converter.ErrSubmodulesUnsupported) {
-		http.Error(w, "Evergit: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
 	if errors.Is(err, converter.ErrServerBusy) {
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, "Evergit: "+err.Error(), http.StatusServiceUnavailable)
@@ -112,8 +109,8 @@ func writeConversionError(w http.ResponseWriter, info *resolver.RepositoryInfo, 
 var idLookupPath = regexp.MustCompile(`^/(.+)/(sha1|sha256)/([^/]+)$`)
 
 // serveIDLookup answers with the id of the same object in the other hash format, as plain text.
-func serveIDLookup(w http.ResponseWriter, conv *converter.Manager, info *resolver.RepositoryInfo, format, id string) {
-	if err := conv.EnsureRepo(info, nil); err != nil {
+func serveIDLookup(w http.ResponseWriter, ctx context.Context, conv *converter.Manager, info *resolver.RepositoryInfo, format, id string) {
+	if err := conv.EnsureRepo(ctx, info, nil); err != nil {
 		writeConversionError(w, info, err)
 		return
 	}
