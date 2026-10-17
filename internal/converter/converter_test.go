@@ -828,6 +828,130 @@ func TestSubmodulesAreConvertedWithSyntheticHash(t *testing.T) {
 	}
 }
 
+func TestSubmodulePreConversionWithRealSHA256(t *testing.T) {
+	// 1. Create a submodule upstream repository
+	subUpstream := newTestUpstream(t)
+	subCommitSHA1, err := runCmd(subUpstream, "git", "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subCommitSHA1 = strings.TrimSpace(subCommitSHA1)
+
+	// 2. Create a superproject upstream repository that references the submodule
+	superUpstream := newTestUpstream(t)
+	gitmodulesContent := fmt.Sprintf("[submodule \"libs/sub\"]\n\tpath = libs/sub\n\turl = %s\n", subUpstream)
+	_ = os.WriteFile(filepath.Join(superUpstream, ".gitmodules"), []byte(gitmodulesContent), 0644)
+	_, _ = runCmd(superUpstream, "git", "add", ".gitmodules")
+	if _, err := runCmd(superUpstream, "git", "update-index", "--add", "--cacheinfo", "160000,"+subCommitSHA1+",libs/sub"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd(superUpstream, "git", "commit", "-q", "-m", "add submodule libs/sub"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Convert superproject
+	superInfo := newTestRepoInfo(t, superUpstream)
+	mgr := NewManager(0)
+	err = mgr.EnsureRepo(context.Background(), superInfo, nil)
+	if err != nil {
+		t.Fatalf("EnsureRepo failed for superproject: %v", err)
+	}
+
+	// 4. Verify that the submodule was pre-converted and we can find its real SHA-256 hash
+	subRepoName := strings.TrimSuffix(filepath.Base(subUpstream), ".git")
+	subStorageRoot := filepath.Dir(filepath.Dir(filepath.Dir(superInfo.MirrorPath)))
+	subServingPath := filepath.Join(subStorageRoot, "repos", "local", "submodule", subRepoName+".git")
+	if _, err := os.Stat(subServingPath); err != nil {
+		t.Fatalf("expected submodule serving path to exist at %s: %v", subServingPath, err)
+	}
+
+	realSHA256, err := LookupID(subServingPath, "sha1", subCommitSHA1)
+	if err != nil {
+		t.Fatalf("expected to lookup real SHA256 of submodule commit %s: %v", subCommitSHA1, err)
+	}
+
+	// 5. Verify the gitlink in the converted superproject tree uses the REAL SHA-256 hash, NOT the zero-padded dummy hash!
+	out, err := runCmd(superInfo.ServingPath, "git", "ls-tree", "HEAD", "libs/sub")
+	if err != nil {
+		t.Fatalf("git ls-tree failed: %v", err)
+	}
+	if !strings.Contains(out, realSHA256) {
+		t.Errorf("expected gitlink to contain real SHA-256 %s, got: %q", realSHA256, out)
+	}
+	synthetic := subCommitSHA1 + strings.Repeat("0", 24)
+	if strings.Contains(out, synthetic) {
+		t.Errorf("gitlink unexpectedly contains synthetic zero-padded hash %s instead of real SHA-256 %s", synthetic, realSHA256)
+	}
+}
+
+func TestSubmoduleRecursionDepthLimit(t *testing.T) {
+	subUpstream := newTestUpstream(t)
+	subCommitSHA1, _ := runCmd(subUpstream, "git", "rev-parse", "HEAD")
+	subCommitSHA1 = strings.TrimSpace(subCommitSHA1)
+
+	superUpstream := newTestUpstream(t)
+	gitmodulesContent := fmt.Sprintf("[submodule \"libs/sub\"]\n\tpath = libs/sub\n\turl = %s\n", subUpstream)
+	_ = os.WriteFile(filepath.Join(superUpstream, ".gitmodules"), []byte(gitmodulesContent), 0644)
+	_, _ = runCmd(superUpstream, "git", "add", ".gitmodules")
+	_, _ = runCmd(superUpstream, "git", "update-index", "--add", "--cacheinfo", "160000,"+subCommitSHA1+",libs/sub")
+	_, _ = runCmd(superUpstream, "git", "commit", "-q", "-m", "add submodule")
+
+	superInfo := newTestRepoInfo(t, superUpstream)
+	mgr := NewManager(0)
+	mgr.SetMaxSubmoduleDepth(0) // Disable recursion
+	err := mgr.EnsureRepo(context.Background(), superInfo, nil)
+	if err != nil {
+		t.Fatalf("EnsureRepo failed: %v", err)
+	}
+
+	// When depth is 0, submodule is not pre-converted, and gitlink falls back to synthetic padding
+	out, err := runCmd(superInfo.ServingPath, "git", "ls-tree", "HEAD", "libs/sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSynthetic := subCommitSHA1 + strings.Repeat("0", 24)
+	if !strings.Contains(out, expectedSynthetic) {
+		t.Errorf("expected synthetic hash %s with depth=0, got: %q", expectedSynthetic, out)
+	}
+}
+
+func TestSubmoduleCircularReferencePrevention(t *testing.T) {
+	// Repo A references Repo B as a submodule, and Repo B references Repo A as a submodule
+	repoA := newTestUpstream(t)
+	repoB := newTestUpstream(t)
+
+	shaA, _ := runCmd(repoA, "git", "rev-parse", "HEAD")
+	shaA = strings.TrimSpace(shaA)
+	shaB, _ := runCmd(repoB, "git", "rev-parse", "HEAD")
+	shaB = strings.TrimSpace(shaB)
+
+	// Repo A points to Repo B
+	gitmodulesA := fmt.Sprintf("[submodule \"subB\"]\n\tpath = subB\n\turl = %s\n", repoB)
+	_ = os.WriteFile(filepath.Join(repoA, ".gitmodules"), []byte(gitmodulesA), 0644)
+	_, _ = runCmd(repoA, "git", "add", ".gitmodules")
+	_, _ = runCmd(repoA, "git", "update-index", "--add", "--cacheinfo", "160000,"+shaB+",subB")
+	_, _ = runCmd(repoA, "git", "commit", "-q", "-m", "add subB")
+
+	// Repo B points to Repo A
+	gitmodulesB := fmt.Sprintf("[submodule \"subA\"]\n\tpath = subA\n\turl = %s\n", repoA)
+	_ = os.WriteFile(filepath.Join(repoB, ".gitmodules"), []byte(gitmodulesB), 0644)
+	_, _ = runCmd(repoB, "git", "add", ".gitmodules")
+	_, _ = runCmd(repoB, "git", "update-index", "--add", "--cacheinfo", "160000,"+shaA+",subA")
+	_, _ = runCmd(repoB, "git", "commit", "-q", "-m", "add subA")
+
+	infoA := newTestRepoInfo(t, repoA)
+	mgr := NewManager(0)
+	mgr.SetMaxSubmoduleDepth(5) // High depth to test cycle prevention
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := mgr.EnsureRepo(ctx, infoA, nil)
+	if err != nil {
+		t.Fatalf("EnsureRepo failed during circular submodule resolution: %v", err)
+	}
+}
+
 func TestNestedTagsWithMarkTagsConvertSuccessfully(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	// Create an annotated tag and a nested tag pointing to it

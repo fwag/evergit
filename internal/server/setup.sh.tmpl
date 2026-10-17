@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Evergit client configuration installer
+# Generated dynamically by Evergit ({{.HttpBase}})
+set -euo pipefail
+
+HTTP_BASE="{{.HttpBase}}"
+SSH_BASE="{{.SshBase}}"
+ALLOWED_HOSTS=({{.AllowedHosts}})
+DEFAULT_CONFIG_FILE="$HOME/.config/evergit/gitconfig"
+
+MODE="install"
+PROTO="http"
+DRY_RUN=0
+TARGET_DIR=""
+SCOPE_GLOBAL=0
+CONFIG_FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir|-d)
+      TARGET_DIR="$2"
+      shift 2
+      ;;
+    --file|-f)
+      CONFIG_FILE="$2"
+      shift 2
+      ;;
+    --global|-g)
+      SCOPE_GLOBAL=1
+      shift
+      ;;
+    --uninstall|-u)
+      MODE="uninstall"
+      shift
+      ;;
+    --ssh)
+      PROTO="ssh"
+      shift
+      ;;
+    --http)
+      PROTO="http"
+      shift
+      ;;
+    --dry-run|-n)
+      DRY_RUN=1
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: $0 [--dir <path> | --global] [--file <config-file>] [--http | --ssh] [--dry-run] [--uninstall]"
+      echo ""
+      echo "Options:"
+      echo "  --dir <path>     Scope Evergit rules to repositories under <path> (default: current directory)"
+      echo "  --global         Apply Evergit rules globally across all repositories (intrusive)"
+      echo "  --file <path>    Write Evergit rules to a custom gitconfig file (default: ~/.config/evergit/gitconfig)"
+      echo "  --http / --ssh   Choose transfer protocol (default: http)"
+      echo "  --dry-run        Print commands without modifying any configuration"
+      echo "  --uninstall      Remove Evergit configuration and includeIf rules"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "$CONFIG_FILE" ]; then
+  CONFIG_FILE="$DEFAULT_CONFIG_FILE"
+fi
+
+run_cmd() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] $*"
+  else
+    "$@"
+  fi
+}
+
+resolve_dir() {
+  local d="$1"
+  if [[ "$d" == "~"* ]]; then
+    d="${d/#\~/$HOME}"
+  fi
+  if [ -d "$d" ]; then
+    d="$(cd "$d" && pwd)"
+  else
+    d="$(mkdir -p "$d" 2>/dev/null && cd "$d" && pwd || echo "$d")"
+  fi
+  echo "${d%/}/"
+}
+
+if [ "$MODE" = "uninstall" ]; then
+  echo "Uninstalling Evergit configuration..."
+
+  # Clean up legacy global insteadOf rules if present
+  for host in "${ALLOWED_HOSTS[@]}"; do
+    run_cmd git config --global --unset-all "url.${HTTP_BASE}/${host}/.insteadOf" 2>/dev/null || true
+    run_cmd git config --global --unset-all "url.${SSH_BASE}/${host}/.insteadOf" 2>/dev/null || true
+  done
+  run_cmd git config --global --unset-all evergit.url 2>/dev/null || true
+  run_cmd git config --global --unset-all alias.from-sha1 2>/dev/null || true
+  run_cmd git config --global --unset-all alias.to-sha1 2>/dev/null || true
+  run_cmd git config --global --unset-all include.path "$CONFIG_FILE" 2>/dev/null || true
+
+  # If a specific directory was specified, remove its includeIf rule; otherwise remove all pointing to CONFIG_FILE
+  if [ -n "$TARGET_DIR" ]; then
+    NORM_DIR="$(resolve_dir "$TARGET_DIR")"
+    run_cmd git config --global --unset-all "includeIf.gitdir:${NORM_DIR}.path" 2>/dev/null || true
+  else
+    if [ -f "$HOME/.gitconfig" ]; then
+      while IFS= read -r key; do
+        if [ -n "$key" ]; then
+          run_cmd git config --global --unset-all "$key" 2>/dev/null || true
+        fi
+      done < <(git config --global --get-regexp '^includeif\.gitdir:.*\.path$' 2>/dev/null | awk -v f="$CONFIG_FILE" '$2 == f {print $1}')
+    fi
+  fi
+
+  if [ -f "$CONFIG_FILE" ]; then
+    run_cmd rm -f "$CONFIG_FILE"
+  fi
+
+  echo "Evergit configuration uninstalled successfully."
+  exit 0
+fi
+
+# Clean up any legacy intrusive global rules from previous runs
+for host in "${ALLOWED_HOSTS[@]}"; do
+  git config --global --unset-all "url.${HTTP_BASE}/${host}/.insteadOf" 2>/dev/null || true
+  git config --global --unset-all "url.${SSH_BASE}/${host}/.insteadOf" 2>/dev/null || true
+done
+git config --global --unset-all evergit.url 2>/dev/null || true
+git config --global --unset-all alias.from-sha1 2>/dev/null || true
+git config --global --unset-all alias.to-sha1 2>/dev/null || true
+
+TARGET_BASE="$HTTP_BASE"
+if [ "$PROTO" = "ssh" ]; then
+  TARGET_BASE="$SSH_BASE"
+fi
+
+echo "Writing Evergit configuration to $CONFIG_FILE ($TARGET_BASE)..."
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+fi
+
+for host in "${ALLOWED_HOSTS[@]}"; do
+  if [ -f "$CONFIG_FILE" ]; then
+    git config --file "$CONFIG_FILE" --unset-all "url.${HTTP_BASE}/${host}/.insteadOf" 2>/dev/null || true
+    git config --file "$CONFIG_FILE" --unset-all "url.${SSH_BASE}/${host}/.insteadOf" 2>/dev/null || true
+  fi
+
+  run_cmd git config --file "$CONFIG_FILE" "url.${TARGET_BASE}/${host}/.insteadOf" "https://${host}/"
+  run_cmd git config --file "$CONFIG_FILE" --add "url.${TARGET_BASE}/${host}/.insteadOf" "http://${host}/"
+  run_cmd git config --file "$CONFIG_FILE" --add "url.${TARGET_BASE}/${host}/.insteadOf" "git@${host}:"
+done
+
+# Set Evergit HTTP URL for lookup aliases
+run_cmd git config --file "$CONFIG_FILE" evergit.url "${HTTP_BASE}"
+
+# Install SHA-1 <-> SHA-256 helper aliases into CONFIG_FILE
+run_cmd git config --file "$CONFIG_FILE" alias.from-sha1 '!f() { base=$(git config evergit.url || echo "'"${HTTP_BASE}"'"); if [[ "$base" == */*.*/*/* ]]; then u="${base%/}"; else rem=$(git remote get-url origin 2>/dev/null || true); p=$(echo "$rem" | sed -E "s#^[a-zA-Z0-9+.-]+://[^/]+/##; s#^git@[^:]+:##; s#^/##"); u="${base%/}/${p%/}"; fi; curl -fsS "$u/sha1/$1"; }; f'
+run_cmd git config --file "$CONFIG_FILE" alias.to-sha1 '!f() { base=$(git config evergit.url || echo "'"${HTTP_BASE}"'"); if [[ "$base" == */*.*/*/* ]]; then u="${base%/}"; else rem=$(git remote get-url origin 2>/dev/null || true); p=$(echo "$rem" | sed -E "s#^[a-zA-Z0-9+.-]+://[^/]+/##; s#^git@[^:]+:##; s#^/##"); u="${base%/}/${p%/}"; fi; curl -fsS "$u/sha256/$(git rev-parse "${1:-HEAD}")"; }; f'
+
+if [ "$SCOPE_GLOBAL" -eq 1 ]; then
+  echo "Enabling Evergit globally in ~/.gitconfig..."
+  run_cmd git config --global include.path "$CONFIG_FILE"
+else
+  if [ -z "$TARGET_DIR" ]; then
+    TARGET_DIR="."
+  fi
+  NORM_DIR="$(resolve_dir "$TARGET_DIR")"
+  echo "Enabling Evergit for directory: $NORM_DIR via includeIf in ~/.gitconfig..."
+  run_cmd git config --global "includeIf.gitdir:${NORM_DIR}.path" "$CONFIG_FILE"
+fi
+
+echo "Evergit setup complete! Repositories in the target directory will route through Evergit, leaving other projects unaffected."

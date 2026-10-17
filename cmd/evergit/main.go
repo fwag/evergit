@@ -19,6 +19,8 @@ func main() {
 	// CLI Flags
 	httpAddr := flag.String("http", "", "HTTP listen address (e.g. :8080)")
 	sshAddr := flag.String("ssh", "", "SSH listen address (e.g. :2222)")
+	publicURL := flag.String("public-url", "", "Public base URL of this Evergit HTTP service (e.g. http://evergit.local:8080)")
+	publicSSHURL := flag.String("public-ssh-url", "", "Public base URL of this Evergit SSH service (e.g. ssh://git@evergit.local:2222)")
 	storageRoot := flag.String("storage", "", "Storage root directory")
 	cacheTTLStr := flag.String("ttl", "", "Cache TTL (e.g. 30s, 5m, 1h, 0 to disable cache; default: 30s)")
 	maxConversionsFlag := flag.Int("max-conversions", 0, "Maximum concurrent JIT conversions (0 = CPU count)")
@@ -36,6 +38,12 @@ func main() {
 	}
 	if *sshAddr != "" {
 		cfg.SSHAddr = *sshAddr
+	}
+	if *publicURL != "" {
+		cfg.PublicURL = *publicURL
+	}
+	if *publicSSHURL != "" {
+		cfg.PublicSSHURL = *publicSSHURL
 	}
 	if *storageRoot != "" {
 		absPath, err := filepath.Abs(*storageRoot)
@@ -78,6 +86,12 @@ func main() {
 	log.Printf("Max conversions: %d", cfg.MaxConversions)
 	log.Printf("Min free disk:   %d GB", cfg.MinFreeDiskGB)
 	log.Printf("Debug:           %v", cfg.Debug)
+	if cfg.PublicURL != "" {
+		log.Printf("Public URL:      %s", cfg.PublicURL)
+	}
+	if cfg.PublicSSHURL != "" {
+		log.Printf("Public SSH URL:  %s", cfg.PublicSSHURL)
+	}
 	log.Printf("Allowed hosts:   %s", strings.Join(cfg.AllowedHosts, ", "))
 	log.Printf("Shorthands:      %s", config.FormatShorthands(cfg.Shorthands))
 
@@ -94,6 +108,7 @@ func main() {
 	defer lockFile.Close()
 
 	convManager := converter.NewManager(cfg.CacheTTL, cfg.MaxConversions)
+	convManager.SetConfig(cfg)
 	convManager.SetMinFreeDisk(uint64(cfg.MinFreeDiskGB) * 1024 * 1024 * 1024)
 	convManager.SetDebug(cfg.Debug)
 

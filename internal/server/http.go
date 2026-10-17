@@ -52,6 +52,12 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 	s.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[HTTP] Request: %s %s", r.Method, r.URL.Path)
 
+		// Client setup script: /setup.sh or /install.sh
+		if r.URL.Path == "/setup.sh" || r.URL.Path == "/install.sh" {
+			s.serveSetupScript(w, r)
+			return
+		}
+
 		// SHA-1 <-> SHA-256 id lookups: /<repo>/sha1/<id> and /<repo>/sha256/<id>
 		if m := idLookupPath.FindStringSubmatch(r.URL.Path); m != nil {
 			if info, err := resolver.ParsePath(m[1], cfg); err == nil {

@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -169,6 +170,103 @@ func TestIntegration(t *testing.T) {
 			t.Errorf("missing expected commit in logs: %q", logOut)
 		}
 	})
+}
+
+func TestServeSetupScript(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		HTTPAddr:     "127.0.0.1:0",
+		SSHAddr:      ":2222",
+		StorageRoot:  tempDir,
+		AllowedHosts: []string{"github.com", "gitlab.com"},
+	}
+
+	convManager := converter.NewManager(0)
+	httpServer, err := server.NewHTTPServer(cfg, convManager)
+	if err != nil {
+		t.Fatalf("failed to create http server: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	srv := &http.Server{Handler: httpServer}
+	go srv.Serve(listener)
+	defer srv.Close()
+
+	baseURL := "http://" + listener.Addr().String()
+
+	// 1. Test GET /setup.sh with dynamic Host fallback
+	resp, err := http.Get(baseURL + "/setup.sh")
+	if err != nil {
+		t.Fatalf("GET /setup.sh failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got: %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/x-shellscript") {
+		t.Errorf("expected text/x-shellscript, got: %q", ct)
+	}
+
+	scriptBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+	scriptContent := string(scriptBytes)
+
+	if !strings.Contains(scriptContent, baseURL) {
+		t.Errorf("expected script to contain detected base URL %q, got:\n%s", baseURL, scriptContent)
+	}
+	if !strings.Contains(scriptContent, "ALLOWED_HOSTS=(github.com gitlab.com)") {
+		t.Errorf("expected script to contain allowed hosts, got:\n%s", scriptContent)
+	}
+
+	// 2. Test running script in bash with --dry-run --dir ~/tmp
+	cmd := exec.Command("bash", "-s", "--", "--dry-run", "--dir", "~/tmp")
+	cmd.Stdin = strings.NewReader(scriptContent)
+	dryRunOut, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running script with --dry-run failed: %v\nOutput: %s", err, string(dryRunOut))
+	}
+	if !strings.Contains(string(dryRunOut), "Writing Evergit configuration to ") || !strings.Contains(string(dryRunOut), ".config/evergit/gitconfig") {
+		t.Errorf("expected script to target ~/.config/evergit/gitconfig:\n%s", string(dryRunOut))
+	}
+	if !strings.Contains(string(dryRunOut), "git config --global includeIf.gitdir:") {
+		t.Errorf("expected includeIf rule in dry-run output:\n%s", string(dryRunOut))
+	}
+
+	// 3. Test running script in bash with --dry-run --ssh
+	cmdSSH := exec.Command("bash", "-s", "--", "--dry-run", "--ssh")
+	cmdSSH.Stdin = strings.NewReader(scriptContent)
+	dryRunSSHOut, err := cmdSSH.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running script with --dry-run --ssh failed: %v\nOutput: %s", err, string(dryRunSSHOut))
+	}
+	if !strings.Contains(string(dryRunSSHOut), "ssh://git@") {
+		t.Errorf("expected ssh dry-run output, got:\n%s", string(dryRunSSHOut))
+	}
+
+	// 4. Test explicit PublicURL override
+	cfg.PublicURL = "https://evergit.corp:8443"
+	resp2, err := http.Get(baseURL + "/install.sh")
+	if err != nil {
+		t.Fatalf("GET /install.sh failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	scriptBytes2, err := io.ReadAll(resp2.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+	scriptContent2 := string(scriptBytes2)
+	if !strings.Contains(scriptContent2, `HTTP_BASE="https://evergit.corp:8443"`) {
+		t.Errorf("expected script to contain PublicURL override, got:\n%s", scriptContent2)
+	}
 }
 
 func runCmd(dir, name string, args ...string) (string, error) {

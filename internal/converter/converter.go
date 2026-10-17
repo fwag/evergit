@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -18,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"evergit/internal/config"
 	"evergit/internal/resolver"
 )
 
@@ -33,15 +36,20 @@ const DefaultConversionTimeout = 30 * time.Second
 // DefaultExecTimeout is the maximum time a repository conversion may run before being terminated.
 const DefaultExecTimeout = 1 * time.Hour
 
+// DefaultMaxSubmoduleDepth is the maximum recursion depth for discovering and pre-converting active submodules.
+const DefaultMaxSubmoduleDepth = 1
+
 type Manager struct {
-	cacheTTL       time.Duration
-	minFreeDisk    uint64
-	debug          bool
-	conversionSem  chan struct{}
-	conversionWait time.Duration
-	execTimeout    time.Duration
-	locksMu        sync.Mutex
-	repoLocks      map[string]*repoLock
+	cacheTTL          time.Duration
+	minFreeDisk       uint64
+	debug             bool
+	conversionSem     chan struct{}
+	conversionWait    time.Duration
+	execTimeout       time.Duration
+	maxSubmoduleDepth int
+	cfg               *config.Config
+	locksMu           sync.Mutex
+	repoLocks         map[string]*repoLock
 }
 
 // repoJob tracks an active conversion job and its waiting clients.
@@ -70,11 +78,22 @@ func NewManager(cacheTTL time.Duration, maxConversions ...int) *Manager {
 		limit = 1
 	}
 	return &Manager{
-		cacheTTL:       cacheTTL,
-		conversionSem:  make(chan struct{}, limit),
-		conversionWait: DefaultConversionTimeout,
-		repoLocks:      make(map[string]*repoLock),
+		cacheTTL:          cacheTTL,
+		conversionSem:     make(chan struct{}, limit),
+		conversionWait:    DefaultConversionTimeout,
+		maxSubmoduleDepth: DefaultMaxSubmoduleDepth,
+		repoLocks:         make(map[string]*repoLock),
 	}
+}
+
+// SetMaxSubmoduleDepth sets the maximum recursion depth for active submodule conversions.
+func (m *Manager) SetMaxSubmoduleDepth(depth int) {
+	m.maxSubmoduleDepth = depth
+}
+
+// SetConfig sets the configuration used for resolving submodule paths and allowed hosts.
+func (m *Manager) SetConfig(cfg *config.Config) {
+	m.cfg = cfg
 }
 
 // SetDebug enables or disables debug mode (including fast-import statistics logging).
@@ -164,13 +183,48 @@ func (m *Manager) WaitIdle() {
 	}
 }
 
+type visitedReposKey struct{}
+
+func withVisitedRepo(ctx context.Context, canonicalID string) (context.Context, bool) {
+	visited, _ := ctx.Value(visitedReposKey{}).(map[string]bool)
+	if visited == nil {
+		visited = make(map[string]bool)
+	}
+	if visited[canonicalID] {
+		return ctx, false
+	}
+	newVisited := make(map[string]bool, len(visited)+1)
+	for k, v := range visited {
+		newVisited[k] = v
+	}
+	newVisited[canonicalID] = true
+	return context.WithValue(ctx, visitedReposKey{}, newVisited), true
+}
+
 // EnsureRepo checks if the repository exists, is up-to-date, and is converted.
 // If not, it clones/fetches, converts it, and optionally streams progress.
 // It accepts a context for cancellation (e.g. when all waiting clients disconnect).
 func (m *Manager) EnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+	depth := m.maxSubmoduleDepth
+	if depth < 0 {
+		depth = DefaultMaxSubmoduleDepth
+	}
+	return m.EnsureRepoWithDepth(ctx, info, progressWriter, depth)
+}
+
+// EnsureRepoWithDepth checks or converts a repository with bounded recursion depth for active submodules.
+func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	canonicalID := info.Domain + "/" + info.Owner + "/" + info.RepoName
+	ctxWithVisited, ok := withVisitedRepo(ctx, canonicalID)
+	if !ok {
+		// Cycle detected: this repository is already in the parent conversion chain
+		return nil
+	}
+	ctx = ctxWithVisited
+
 	if progressWriter != nil {
 		async := newAsyncWriter(progressWriter)
 		defer async.Close()
@@ -229,7 +283,7 @@ func (m *Manager) EnsureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	lock.mu.Unlock()
 
 	go func() {
-		err := m.doEnsureRepo(jobCtx, info, progressWriter)
+		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth)
 		job.mu.Lock()
 		job.err = err
 		close(job.done)
@@ -280,7 +334,7 @@ func (m *Manager) waitJob(ctx context.Context, lock *repoLock, job *repoJob) err
 	}
 }
 
-func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
 	// 1. Check if the repository already exists and is within its TTL
 	if !m.needsSync(info) {
 		return nil
@@ -312,8 +366,11 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 		}
 	}
 
-	// 3. Convert mirror to serving repo (SHA1 -> SHA256 conversion)
-	if err := m.convertRepo(ctx, info, progressWriter); err != nil {
+	// 3. Opportunistically pre-convert active submodules and load their commit translation maps
+	submoduleCommitMap := m.prepareSubmodules(ctx, info, progressWriter, depth)
+
+	// 4. Convert mirror to serving repo (SHA1 -> SHA256 conversion)
+	if err := m.convertRepo(ctx, info, progressWriter, submoduleCommitMap); err != nil {
 		return err
 	}
 
@@ -339,7 +396,7 @@ func (m *Manager) syncNativeSHA256(ctx context.Context, info *resolver.Repositor
 
 		log.Printf("Syncing native SHA256 updates for repository %s...", info.RepoName)
 		if progressWriter != nil {
-			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Syncing native SHA-256 updates...\n")
+			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Syncing native SHA-256 updates for %s...\n", info.RepoName)
 		}
 		// Fetch branches and tags, pruning any deleted upstream branches/tags
 		if _, err := runCmdContext(ctx, 0, info.ServingPath, "git", "fetch", "--prune", "--", info.MirrorPath,
@@ -379,7 +436,7 @@ func (m *Manager) syncNativeSHA256(ctx context.Context, info *resolver.Repositor
 
 	log.Printf("Creating native SHA256 serving repository for %s...", info.RepoName)
 	if progressWriter != nil {
-		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Upstream is native SHA-256. Bypassing conversion pipeline...\n")
+		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Upstream %s is native SHA-256. Bypassing conversion pipeline...\n", info.RepoName)
 	}
 	if _, err := runCmdContext(ctx, 0, "", "git", "clone", "--bare", "--", info.MirrorPath, buildPath); err != nil {
 		os.RemoveAll(buildPath)
@@ -555,7 +612,207 @@ type conversionPlan struct {
 	failed        bool
 }
 
-func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+type submoduleEntry struct {
+	Name string
+	Path string
+	URL  string
+}
+
+func listActiveSubmodules(ctx context.Context, mirrorPath string) ([]submoduleEntry, error) {
+	out, err := runCmdContext(ctx, 10*time.Second, mirrorPath, "git", "config", "--blob", "HEAD:.gitmodules", "--list")
+	if err != nil {
+		return nil, nil // No .gitmodules found at HEAD or invalid
+	}
+	subMap := make(map[string]*submoduleEntry)
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		key, val, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		parts := strings.Split(key, ".")
+		if len(parts) >= 3 && parts[0] == "submodule" {
+			name := strings.Join(parts[1:len(parts)-1], ".")
+			prop := parts[len(parts)-1]
+			entry := subMap[name]
+			if entry == nil {
+				entry = &submoduleEntry{Name: name}
+				subMap[name] = entry
+			}
+			switch prop {
+			case "path":
+				entry.Path = val
+			case "url":
+				entry.URL = val
+			}
+		}
+	}
+	var res []submoduleEntry
+	for _, entry := range subMap {
+		if entry.Path != "" && entry.URL != "" {
+			res = append(res, *entry)
+		}
+	}
+	return res, nil
+}
+
+func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.RepositoryInfo) (*resolver.RepositoryInfo, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, errors.New("empty submodule URL")
+	}
+
+	storageRoot := ""
+	if m.cfg != nil && m.cfg.StorageRoot != "" {
+		storageRoot = m.cfg.StorageRoot
+	} else if parentInfo.MirrorPath != "" {
+		storageRoot = filepath.Dir(filepath.Dir(filepath.Dir(parentInfo.MirrorPath)))
+	}
+
+	// Handle local/fixture repos used in testing
+	if parentInfo.Domain == "local" || strings.HasPrefix(rawURL, "/") || strings.HasPrefix(rawURL, "file://") {
+		localPath := strings.TrimPrefix(rawURL, "file://")
+		if !filepath.IsAbs(localPath) && parentInfo.RemoteURL != "" {
+			parentDir := filepath.Dir(parentInfo.RemoteURL)
+			localPath = filepath.Clean(filepath.Join(parentDir, localPath))
+		}
+		repoName := strings.TrimSuffix(filepath.Base(localPath), ".git")
+		if storageRoot == "" {
+			storageRoot = "./storage"
+		}
+		return &resolver.RepositoryInfo{
+			Domain:      "local",
+			Owner:       "submodule",
+			RepoName:    repoName,
+			RemoteURL:   localPath,
+			MirrorPath:  filepath.Join(storageRoot, "mirrors", "local", "submodule", repoName+".git"),
+			ServingPath: filepath.Join(storageRoot, "repos", "local", "submodule", repoName+".git"),
+			BuildsPath:  filepath.Join(storageRoot, "builds", "local", "submodule", repoName+".git"),
+		}, nil
+	}
+
+	cfg := m.cfg
+	if cfg == nil {
+		cfg = &config.Config{
+			StorageRoot:  storageRoot,
+			AllowedHosts: config.DefaultAllowedHosts,
+			Shorthands:   map[string]string{"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"},
+		}
+	}
+
+	var targetPath string
+	if strings.HasPrefix(rawURL, "./") || strings.HasPrefix(rawURL, "../") {
+		// Relative URL: relative to parent repository's remote path
+		parentBase := path.Join(parentInfo.Domain, parentInfo.Owner)
+		targetPath = path.Clean(path.Join(parentBase, rawURL))
+	} else if strings.HasPrefix(rawURL, "git@") {
+		// git@domain:owner/repo.git
+		trimmed := strings.TrimPrefix(rawURL, "git@")
+		domain, repoPart, found := strings.Cut(trimmed, ":")
+		if !found {
+			return nil, fmt.Errorf("invalid git@ submodule URL %q", rawURL)
+		}
+		targetPath = domain + "/" + repoPart
+	} else if strings.Contains(rawURL, "://") {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse submodule URL %q: %w", rawURL, err)
+		}
+		host := u.Hostname()
+		repoPart := strings.TrimPrefix(u.Path, "/")
+		targetPath = host + "/" + repoPart
+	} else {
+		targetPath = rawURL
+	}
+
+	targetPath = strings.TrimSuffix(targetPath, ".git")
+	return resolver.ParsePath(targetPath, cfg)
+}
+
+func loadSubmoduleMarks(servingPath string) (map[string]string, error) {
+	sha1Path := filepath.Join(servingPath, "evergit-sha1-marks.txt")
+	sha256Path := filepath.Join(servingPath, "evergit-sha256-marks.txt")
+
+	f1, err := os.Open(sha1Path)
+	if err != nil {
+		return nil, err
+	}
+	defer f1.Close()
+
+	markToSHA1 := make(map[string]string)
+	s1 := bufio.NewScanner(f1)
+	for s1.Scan() {
+		line := s1.Text()
+		mark, sha, ok := parseMarkLine(line, sha1HexLen)
+		if ok {
+			markToSHA1[mark] = sha
+		}
+	}
+	if err := s1.Err(); err != nil {
+		return nil, err
+	}
+
+	f2, err := os.Open(sha256Path)
+	if err != nil {
+		return nil, err
+	}
+	defer f2.Close()
+
+	sha1ToSHA256 := make(map[string]string, len(markToSHA1))
+	s2 := bufio.NewScanner(f2)
+	for s2.Scan() {
+		line := s2.Text()
+		mark, sha256, ok := parseMarkLine(line, sha256HexLen)
+		if ok {
+			if sha1, found := markToSHA1[mark]; found {
+				sha1ToSHA256[sha1] = sha256
+			}
+		}
+	}
+	if err := s2.Err(); err != nil {
+		return nil, err
+	}
+
+	return sha1ToSHA256, nil
+}
+
+func (m *Manager) prepareSubmodules(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) map[string]map[string]string {
+	submodules, err := listActiveSubmodules(ctx, info.MirrorPath)
+	if err != nil || len(submodules) == 0 {
+		return nil
+	}
+
+	submoduleCommitMap := make(map[string]map[string]string)
+	for _, entry := range submodules {
+		subInfo, err := m.resolveSubmoduleInfo(entry.URL, info)
+		if err != nil {
+			if m.debug {
+				log.Printf("[%s] Submodule %q (%s) cannot be resolved: %v", info.RepoName, entry.Path, entry.URL, err)
+			}
+			continue
+		}
+
+		if depth > 0 {
+			if err := m.EnsureRepoWithDepth(ctx, subInfo, progressWriter, depth-1); err != nil {
+				log.Printf("[%s] Warning: failed to pre-convert submodule %q: %v", info.RepoName, entry.Path, err)
+			}
+		}
+
+		if marks, err := loadSubmoduleMarks(subInfo.ServingPath); err == nil && len(marks) > 0 {
+			submoduleCommitMap[entry.Path] = marks
+			if m.debug {
+				log.Printf("[%s] Loaded %d commit translations for submodule %q", info.RepoName, len(marks), entry.Path)
+			}
+		}
+	}
+	return submoduleCommitMap
+}
+
+func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, submoduleCommitMap map[string]map[string]string) error {
 	// Guard against unbounded concurrent conversions across all repositories
 	if m.conversionSem != nil {
 		wait := m.conversionWait
@@ -584,7 +841,7 @@ func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo
 		}()
 	}
 
-	if err := runConversionPipeline(ctx, info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, plan.totalObjects, plan.isIncremental, m.debug, progressWriter); err != nil {
+	if err := runConversionPipeline(ctx, info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, plan.totalObjects, plan.isIncremental, m.debug, progressWriter, submoduleCommitMap); err != nil {
 		plan.failed = true
 		return err
 	}
@@ -635,13 +892,13 @@ func (m *Manager) prepareConversion(ctx context.Context, info *resolver.Reposito
 		targetPath = info.ServingPath
 		log.Printf("Starting high-performance incremental conversion for repository %s...", info.RepoName)
 		if progressWriter != nil {
-			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Incremental update found. Performing incremental JIT conversion...\n")
+			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Incremental update found. Performing incremental JIT conversion...\n", info.RepoName)
 		}
 	} else {
 		targetPath = filepath.Join(info.BuildsPath, strconv.FormatInt(time.Now().UnixNano(), 10))
 		log.Printf("Starting full conversion for repository %s...", info.RepoName)
 		if progressWriter != nil {
-			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Performing full JIT SHA-1 -> SHA-256 history conversion, please wait...\n")
+			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Performing full JIT SHA-1 -> SHA-256 history conversion, please wait...\n", info.RepoName)
 		}
 		if _, err := runCmdContext(ctx, 0, "", "git", "init", "--bare", "--object-format=sha256", targetPath); err != nil {
 			return nil, fmt.Errorf("failed to initialize bare sha256 repository: %w", err)
@@ -700,11 +957,12 @@ const (
 )
 
 // transformFastExportStream filters the fast-export stream, zero-padding 40-character SHA-1
-// gitlinks (mode 160000) to 64-character synthetic SHA-256 hashes so that fast-import accepts
-// them into a SHA-256 repository without rejecting submodules. It also translates 40-character
-// null SHA-1 references (emitted e.g. when dereferencing nested tags with --mark-tags) to 64-character
-// null SHA-256 references. Binary data payloads are copied verbatim.
-func transformFastExportStream(r io.Reader, w io.Writer) error {
+// gitlinks (mode 160000) to 64-character synthetic SHA-256 hashes (or replacing them with the real
+// SHA-256 commit hash if available in submoduleCommitMap) so that fast-import accepts them into a
+// SHA-256 repository without rejecting submodules. It also translates 40-character null SHA-1 references
+// (emitted e.g. when dereferencing nested tags with --mark-tags) to 64-character null SHA-256 references.
+// Binary data payloads are copied verbatim.
+func transformFastExportStream(r io.Reader, w io.Writer, submoduleCommitMap map[string]map[string]string) error {
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
 		line, err := br.ReadString('\n')
@@ -725,8 +983,25 @@ func transformFastExportStream(r io.Reader, w io.Writer) error {
 				// M 160000 <dataref> <path>
 				parts := strings.SplitN(line, " ", 4)
 				if len(parts) == 4 && len(parts[2]) == 40 {
-					synthetic := parts[2] + syntheticSHA256Padding
-					line = fmt.Sprintf("M 160000 %s %s", synthetic, parts[3])
+					sha1 := parts[2]
+					subPath := strings.TrimRight(parts[3], "\r\n")
+					if strings.HasPrefix(subPath, "\"") {
+						if unquoted, err := strconv.Unquote(subPath); err == nil {
+							subPath = unquoted
+						}
+					}
+					var targetSHA string
+					if submoduleCommitMap != nil {
+						if m, ok := submoduleCommitMap[subPath]; ok {
+							if realSHA, ok := m[sha1]; ok && len(realSHA) == 64 {
+								targetSHA = realSHA
+							}
+						}
+					}
+					if targetSHA == "" {
+						targetSHA = sha1 + syntheticSHA256Padding
+					}
+					line = fmt.Sprintf("M 160000 %s %s", targetSHA, parts[3])
 				}
 			} else if strings.HasPrefix(line, "from ") || strings.HasPrefix(line, "merge ") {
 				parts := strings.SplitN(line, " ", 2)
@@ -747,7 +1022,7 @@ func transformFastExportStream(r io.Reader, w io.Writer) error {
 	}
 }
 
-func runConversionPipeline(ctx context.Context, mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, totalObjects int, isIncremental, debug bool, progressWriter io.Writer) error {
+func runConversionPipeline(ctx context.Context, mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, totalObjects int, isIncremental, debug bool, progressWriter io.Writer, submoduleCommitMap map[string]map[string]string) error {
 	exportCmd := exec.CommandContext(ctx, "git", append([]string{"fast-export"}, exportFlags...)...)
 	exportCmd.Env = GitEnv()
 	exportCmd.Dir = mirrorPath
@@ -803,7 +1078,7 @@ func runConversionPipeline(ctx context.Context, mirrorPath, targetPath string, e
 
 	transformErrChan := make(chan error, 1)
 	go func() {
-		err := transformFastExportStream(exportReader, importWriter)
+		err := transformFastExportStream(exportReader, importWriter, submoduleCommitMap)
 		_ = exportReader.CloseWithError(err)
 		_ = importWriter.CloseWithError(err)
 		transformErrChan <- err
@@ -830,11 +1105,11 @@ func runConversionPipeline(ctx context.Context, mirrorPath, targetPath string, e
 							if pct > 99 {
 								pct = 99
 							}
-							_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting repository: %2d%%...", pct)
+							_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: %2d%%...", repoName, pct)
 						}
 					}
 				} else if isIncremental {
-					_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting incremental updates...\r")
+					_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: incremental updates...\r", repoName)
 				}
 			}
 		}
@@ -872,9 +1147,9 @@ func runConversionPipeline(ctx context.Context, mirrorPath, targetPath string, e
 
 	if progressWriter != nil {
 		if totalObjects > 0 {
-			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting repository: 100%%, done.\n")
+			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: 100%%, done.\n", repoName)
 		} else if isIncremental {
-			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting incremental updates, done.\n")
+			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: incremental updates, done.\n", repoName)
 		}
 	}
 

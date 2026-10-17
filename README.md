@@ -18,7 +18,7 @@ It is designed to solve a critical interoperability gap: **Git does not allow re
 ### Limitations
 
 - **Only branches and tags are mirrored.** Forge-specific refs such as GitHub's `refs/pull/*` or GitLab's `refs/merge-requests/*` are not served.
-- **Submodules are supported seamlessly via zero-padding.** Submodule gitlink tree entries are deterministically translated to 64-character SHA-256 hashes (`<sha1>` padded with 24 zeros). When clients run standard `git submodule update --init`, Git matches the 40-character SHA-1 prefix and checks out the exact legacy commit directly into the submodule without requiring extra flags, aliases, or configuration.
+- **Defunct historical submodules use synthetic zero-padding.** For active submodules listed in `HEAD:.gitmodules`, Evergit automatically pre-converts them to SHA-256 and records their **real cryptographic SHA-256 commit hashes** in the superproject tree. For obsolete submodules found only in ancient history (e.g. removed dependencies from years ago), Evergit falls back to deterministic zero-padding (`<sha1>` + 24 zeros) so the conversion never fails on unreachable historical remotes.
 
 ---
 
@@ -39,6 +39,8 @@ go build -o evergit ./cmd/evergit
 ### Command-Line Flags
 - `-http`: HTTP listen address (default: `:8080`)
 - `-ssh`: SSH listen address (default: `:2222`)
+- `-public-url`: Public base URL of this Evergit HTTP service (e.g. `http://evergit.local:8080`); also settable via `EVERGIT_PUBLIC_URL`
+- `-public-ssh-url`: Public base URL of this Evergit SSH service (e.g. `ssh://git@evergit.local:2222`); also settable via `EVERGIT_PUBLIC_SSH_URL`
 - `-storage`: Directory path for storing host keys, cache mirrors, and converted repositories (default: `./storage`)
 - `-ttl`: Cache duration before checking upstream for updates; also settable via `EVERGIT_CACHE_TTL` (default: `30s`, pass `0` to check upstream on every fetch)
 - `-max-conversions`: Maximum concurrent JIT conversions; also settable via `EVERGIT_MAX_CONVERSIONS` (default: CPU count)
@@ -50,6 +52,46 @@ go build -o evergit ./cmd/evergit
 ---
 
 ##  Usage (Cloning and Submodules)
+
+### Client Auto-Configuration (Recommended)
+
+Evergit provides a client setup script that configures Git to route through Evergit **without polluting or breaking your global git configuration**.
+
+By default, the script writes its proxy rules to an isolated file (`~/.config/evergit/gitconfig`) and uses Git's native `includeIf` feature to activate it **only for repositories inside a specific directory** (e.g. `~/tmp/`, `~/obs/`, or your current workspace):
+
+```bash
+# Scope Evergit to your current directory (recommended)
+curl -fsSL http://localhost:8080/setup.sh | bash
+
+# Or scope to a specific build workspace (e.g. ~/tmp or ~/obs)
+curl -fsSL http://localhost:8080/setup.sh | bash -s -- --dir ~/tmp
+```
+
+#### Why Directory Scoping?
+* **Inside the target directory** (e.g. `~/tmp/libvirt` and its submodules): All clones and submodule checkouts automatically route through Evergit and convert to SHA-256.
+* **Outside the target directory** (e.g. your daily development in other folders): Git connects directly to `github.com` and `gitlab.com` normally. Pushes, private repositories, and direct fetches remain 100% unaffected.
+
+**Options:**
+```bash
+# Scope to a specific directory
+curl -fsSL http://localhost:8080/setup.sh | bash -s -- --dir ~/build
+
+# Configure for SSH clones instead of HTTP
+curl -fsSL http://localhost:8080/setup.sh | bash -s -- --dir ~/tmp --ssh
+
+# Preview commands without applying them
+curl -fsSL http://localhost:8080/setup.sh | bash -s -- --dry-run
+
+# Revert and remove Evergit rules from ~/.gitconfig
+curl -fsSL http://localhost:8080/setup.sh | bash -s -- --uninstall
+
+# Apply globally across the entire machine (intrusive)
+curl -fsSL http://localhost:8080/setup.sh | bash -s -- --global
+```
+
+---
+
+### Manual Usage
 
 Evergit automatically resolves requests by parsing the URL path segments.
 
@@ -105,11 +147,20 @@ git config evergit.url http://localhost:8080/github.com/owner/repo.git
 
 ### Working with Submodules
 
-Submodules work out-of-the-box with standard Git commands:
+When using Evergit's client setup script (`curl .../setup.sh | bash`), submodules work natively with standard Git commands:
 ```bash
 git submodule update --init
 ```
-Because Evergit preserves the original 40-character legacy SHA-1 in the prefix of the 64-character hash, Git's prefix-matching resolver automatically checks out the exact corresponding commit in the submodule, with `git status` remaining clean.
+
+#### How it works under the hood:
+1. **Pre-Conversion of Active Submodules:**
+   Before converting a superproject (e.g. `libvirt`), Evergit reads `HEAD:.gitmodules` from the mirror. It automatically resolves and pre-converts any active submodules (e.g. `keycodemapdb`) to SHA-256 into Evergit's storage cache, bounded by a recursion depth (default: `1`, with cycle protection).
+2. **Real Cryptographic SHA-256 Translation:**
+   Evergit loads the translation map from the submodule's marks file (`evergit-sha1-marks.txt` / `evergit-sha256-marks.txt`). When converting the superproject, Evergit translates gitlink commits to their **real cryptographic SHA-256 hashes**.
+3. **Seamless Client Clones:**
+   When your client runs `git submodule update --init`, the request routes to Evergit via the scoped `insteadOf` rule. The client requests the real SHA-256 commit from Evergit, which Evergit serves directly from its cache, resulting in a clean working tree.
+4. **Resilience to Ancient History:**
+   If a repository's history references dead or defunct submodules that no longer exist in `HEAD:.gitmodules`, Evergit gracefully falls back to synthetic zero-padding (`<sha1>` + 24 zeros) so ancient commits still convert without failing on unreachable third-party servers.
 
 > **Do not enable `extensions.compatObjectFormat` in your clones or in the superproject.** Git's SHA-1 compatibility mode
 > must compute a SHA-1 id for every object it writes, and it cannot do so for objects received by `git fetch` or for

@@ -19,6 +19,8 @@ const DefaultShorthands = "github=github.com,gitlab=gitlab.com,bitbucket=bitbuck
 type Config struct {
 	HTTPAddr       string
 	SSHAddr        string
+	PublicURL      string
+	PublicSSHURL   string
 	StorageRoot    string
 	CacheTTL       time.Duration
 	MaxConversions int
@@ -70,6 +72,8 @@ func Load() *Config {
 	return &Config{
 		HTTPAddr:       getEnv("EVERGIT_HTTP_ADDR", ":8080"),
 		SSHAddr:        getEnv("EVERGIT_SSH_ADDR", ":2222"),
+		PublicURL:      os.Getenv("EVERGIT_PUBLIC_URL"),
+		PublicSSHURL:   os.Getenv("EVERGIT_PUBLIC_SSH_URL"),
 		StorageRoot:    storageRoot,
 		CacheTTL:       cacheTTL,
 		MaxConversions: maxConversions,
