@@ -94,12 +94,13 @@ HAProxy sits at the network boundary to absorb volumetric traffic and manage net
 
 ## 4. Submodule Pre-Conversion & Real SHA-256 Translation
 
-- [x] **Opportunistic Submodule Pre-Conversion at HEAD**
-  - [x] Inspect `HEAD:.gitmodules` in the mirror before running a repository's conversion pipeline to identify active submodules.
+- [x] **Opportunistic Submodule Pre-Conversion & Historical Path Resolution**
+  - [x] Inspect `HEAD:.gitmodules` and historical commits modifying `.gitmodules` in the mirror before running a repository's conversion pipeline to identify active and historical submodules.
   - [x] Enforce a configurable maximum recursion depth constant (default: `1`, e.g., `DefaultMaxSubmoduleDepth = 1`) to prevent runaway cascading or circular submodule conversions.
   - [x] For submodules hosted on allowed forges (`cfg.AllowedHosts`), pre-convert each submodule repository Just-In-Time via `EnsureRepo`.
   - [x] Load the submodule's translation marks (`evergit-sha1-marks.txt` / `evergit-sha256-marks.txt`) into an in-memory lookup map (`submoduleCommitMap[path][sha1] = sha256`).
   - [x] In `transformFastExportStream`:
     - [x] If `<sha1>` exists in `submoduleCommitMap[path]`, write the **real SHA-256 hash**.
-    - [x] If `<sha1>` is not found in the map (e.g. defunct historical submodules like `.gnulib`), fall back to the synthetic zero-padded hash (`<sha1>` + 24 zeros) so ancient history converts without error.
+    - [x] If `<sha1>` is not found under `subPath` (e.g. submodule moved or path varied in history), search across all other pre-converted submodules for `<sha1>`.
+    - [x] If `<sha1>` is not found in any map (e.g. defunct historical submodules like `.gnulib`), fall back to the synthetic zero-padded hash (`<sha1>` + 24 zeros) so ancient history converts without error.
   - [x] Verify that client `git submodule update --init` successfully fetches and checks out the real SHA-256 commit from Evergit, leaving working tree clean.

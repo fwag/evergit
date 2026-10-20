@@ -618,11 +618,7 @@ type submoduleEntry struct {
 	URL  string
 }
 
-func listActiveSubmodules(ctx context.Context, mirrorPath string) ([]submoduleEntry, error) {
-	out, err := runCmdContext(ctx, 10*time.Second, mirrorPath, "git", "config", "--blob", "HEAD:.gitmodules", "--list")
-	if err != nil {
-		return nil, nil // No .gitmodules found at HEAD or invalid
-	}
+func parseGitmodulesConfig(out string) []submoduleEntry {
 	subMap := make(map[string]*submoduleEntry)
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
@@ -656,6 +652,42 @@ func listActiveSubmodules(ctx context.Context, mirrorPath string) ([]submoduleEn
 		if entry.Path != "" && entry.URL != "" {
 			res = append(res, *entry)
 		}
+	}
+	return res
+}
+
+func listActiveSubmodules(ctx context.Context, mirrorPath string) ([]submoduleEntry, error) {
+	uniqueEntries := make(map[string]submoduleEntry)
+
+	// 1. Check HEAD:.gitmodules
+	if out, err := runCmdContext(ctx, 10*time.Second, mirrorPath, "git", "config", "--blob", "HEAD:.gitmodules", "--list"); err == nil {
+		for _, entry := range parseGitmodulesConfig(out) {
+			key := entry.Path + "\x00" + entry.URL
+			uniqueEntries[key] = entry
+		}
+	}
+
+	// 2. Discover historical submodules and previous paths across git history
+	if commitsOut, err := runCmdContext(ctx, 10*time.Second, mirrorPath, "git", "log", "--all", "--format=%H", "-n", "50", "--", ".gitmodules"); err == nil {
+		for _, commit := range strings.Fields(commitsOut) {
+			if blobOut, err := runCmdContext(ctx, 5*time.Second, mirrorPath, "git", "config", "--blob", commit+":.gitmodules", "--list"); err == nil {
+				for _, entry := range parseGitmodulesConfig(blobOut) {
+					key := entry.Path + "\x00" + entry.URL
+					if _, exists := uniqueEntries[key]; !exists {
+						uniqueEntries[key] = entry
+					}
+				}
+			}
+		}
+	}
+
+	if len(uniqueEntries) == 0 {
+		return nil, nil
+	}
+
+	res := make([]submoduleEntry, 0, len(uniqueEntries))
+	for _, entry := range uniqueEntries {
+		res = append(res, entry)
 	}
 	return res, nil
 }
@@ -787,6 +819,8 @@ func (m *Manager) prepareSubmodules(ctx context.Context, info *resolver.Reposito
 	}
 
 	submoduleCommitMap := make(map[string]map[string]string)
+	marksCache := make(map[string]map[string]string)
+
 	for _, entry := range submodules {
 		subInfo, err := m.resolveSubmoduleInfo(entry.URL, info)
 		if err != nil {
@@ -802,10 +836,23 @@ func (m *Manager) prepareSubmodules(ctx context.Context, info *resolver.Reposito
 			}
 		}
 
-		if marks, err := loadSubmoduleMarks(subInfo.ServingPath); err == nil && len(marks) > 0 {
+		marks, cached := marksCache[subInfo.ServingPath]
+		if !cached {
+			if loaded, err := loadSubmoduleMarks(subInfo.ServingPath); err == nil && len(loaded) > 0 {
+				marks = loaded
+				marksCache[subInfo.ServingPath] = marks
+				if m.debug {
+					log.Printf("[%s] Loaded %d commit translations for submodule repo %s", info.RepoName, len(marks), subInfo.ServingPath)
+				}
+			} else {
+				marksCache[subInfo.ServingPath] = nil
+			}
+		}
+
+		if len(marks) > 0 {
 			submoduleCommitMap[entry.Path] = marks
 			if m.debug {
-				log.Printf("[%s] Loaded %d commit translations for submodule %q", info.RepoName, len(marks), entry.Path)
+				log.Printf("[%s] Mapped %d commit translations to submodule path %q", info.RepoName, len(marks), entry.Path)
 			}
 		}
 	}
@@ -995,6 +1042,16 @@ func transformFastExportStream(r io.Reader, w io.Writer, submoduleCommitMap map[
 						if m, ok := submoduleCommitMap[subPath]; ok {
 							if realSHA, ok := m[sha1]; ok && len(realSHA) == 64 {
 								targetSHA = realSHA
+							}
+						}
+						if targetSHA == "" {
+							// If not found under the exact subPath (e.g. submodule moved or path varied in history),
+							// search across all other pre-converted submodules. Commit SHA-1s are unique.
+							for _, m := range submoduleCommitMap {
+								if realSHA, ok := m[sha1]; ok && len(realSHA) == 64 {
+									targetSHA = realSHA
+									break
+								}
 							}
 						}
 					}
