@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1003,76 +1004,347 @@ const (
 	nullSHA256             = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
+// commitFileCmd represents a file modification command within a commit block.
+type commitFileCmd struct {
+	line       string
+	data       []byte
+	isDelete   bool
+	targetPath string
+}
+
+func extractPath(raw string) string {
+	raw = strings.TrimRight(raw, "\r\n")
+	if strings.HasPrefix(raw, "\"") {
+		if unquoted, err := strconv.Unquote(raw); err == nil {
+			return unquoted
+		}
+	}
+	return raw
+}
+
+func extractTargetFromCopyRename(line string) string {
+	trimmed := strings.TrimRight(line, "\r\n")
+	if len(trimmed) < 2 {
+		return ""
+	}
+	rest := strings.TrimSpace(trimmed[2:])
+	if strings.HasPrefix(rest, "\"") {
+		endQuote := -1
+		escaped := false
+		for i := 1; i < len(rest); i++ {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if rest[i] == '\\' {
+				escaped = true
+				continue
+			}
+			if rest[i] == '"' {
+				endQuote = i
+				break
+			}
+		}
+		if endQuote != -1 && endQuote+1 < len(rest) {
+			dst := strings.TrimSpace(rest[endQuote+1:])
+			return extractPath(dst)
+		}
+	}
+	parts := strings.SplitN(rest, " ", 2)
+	if len(parts) == 2 {
+		return extractPath(parts[1])
+	}
+	return ""
+}
+
+func dirPrefixes(path string) []string {
+	var prefixes []string
+	last := 0
+	for {
+		idx := strings.IndexByte(path[last:], '/')
+		if idx == -1 {
+			break
+		}
+		prefix := path[:last+idx]
+		if len(prefix) > 0 {
+			prefixes = append(prefixes, prefix)
+		}
+		last += idx + 1
+	}
+	return prefixes
+}
+
+// reorderCommitFileCommands fixes a Git fast-export bug where git fast-export orders file additions
+// under a new directory BEFORE the D command that deletes an old file or symlink at that directory path.
+// When git fast-import executes D <path>, it treats it as a recursive tree deletion and wipes out the
+// directory and its files that were just created.
+// To prevent this, any D command whose path is an ancestor directory of any file modified or added in
+// the commit is moved before the first command affecting that directory subtree.
+func reorderCommitFileCommands(cmds []commitFileCmd) []commitFileCmd {
+	if len(cmds) <= 1 {
+		return cmds
+	}
+
+	delIndices := make(map[string]int)
+	hasDeletes := false
+	for i, cmd := range cmds {
+		if cmd.isDelete && cmd.targetPath != "" {
+			delIndices[cmd.targetPath] = i
+			hasDeletes = true
+		}
+	}
+	if !hasDeletes {
+		return cmds
+	}
+
+	// minTarget maps delIdx -> earliest child idx that appeared before delIdx
+	minTarget := make(map[int]int)
+	for i, cmd := range cmds {
+		if cmd.targetPath == "" {
+			continue
+		}
+		for _, prefix := range dirPrefixes(cmd.targetPath) {
+			if delIdx, ok := delIndices[prefix]; ok && delIdx > i {
+				if earliest, seen := minTarget[delIdx]; !seen || i < earliest {
+					minTarget[delIdx] = i
+				}
+			}
+		}
+	}
+
+	if len(minTarget) == 0 {
+		return cmds
+	}
+
+	type moveItem struct {
+		delIdx   int
+		insertAt int
+		path     string
+	}
+	var toMove []moveItem
+	movedIndices := make(map[int]bool)
+	for delIdx, insertAt := range minTarget {
+		toMove = append(toMove, moveItem{
+			delIdx:   delIdx,
+			insertAt: insertAt,
+			path:     cmds[delIdx].targetPath,
+		})
+		movedIndices[delIdx] = true
+	}
+
+	// Sort toMove: primary by insertAt ascending, secondary by path length ascending (shorter parent paths first)
+	sort.Slice(toMove, func(i, j int) bool {
+		if toMove[i].insertAt != toMove[j].insertAt {
+			return toMove[i].insertAt < toMove[j].insertAt
+		}
+		return len(toMove[i].path) < len(toMove[j].path)
+	})
+
+	insertions := make(map[int][]commitFileCmd)
+	for _, item := range toMove {
+		insertions[item.insertAt] = append(insertions[item.insertAt], cmds[item.delIdx])
+	}
+
+	result := make([]commitFileCmd, 0, len(cmds))
+	for i := 0; i < len(cmds); i++ {
+		if toInsert, ok := insertions[i]; ok {
+			result = append(result, toInsert...)
+		}
+		if !movedIndices[i] {
+			result = append(result, cmds[i])
+		}
+	}
+
+	return result
+}
+
+func flushCommitFileCommands(w io.Writer, cmds []commitFileCmd) error {
+	if len(cmds) == 0 {
+		return nil
+	}
+	reordered := reorderCommitFileCommands(cmds)
+	for _, cmd := range reordered {
+		if _, err := io.WriteString(w, cmd.line); err != nil {
+			return err
+		}
+		if len(cmd.data) > 0 {
+			if _, err := w.Write(cmd.data); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // transformFastExportStream filters the fast-export stream, zero-padding 40-character SHA-1
 // gitlinks (mode 160000) to 64-character synthetic SHA-256 hashes (or replacing them with the real
 // SHA-256 commit hash if available in submoduleCommitMap) so that fast-import accepts them into a
 // SHA-256 repository without rejecting submodules. It also translates 40-character null SHA-1 references
 // (emitted e.g. when dereferencing nested tags with --mark-tags) to 64-character null SHA-256 references.
+// It also reorders file commands within commits so deletions of files/symlinks replaced by directories
+// precede additions in those directories, preventing fast-import from deleting the newly created directories.
 // Binary data payloads are copied verbatim.
 func transformFastExportStream(r io.Reader, w io.Writer, submoduleCommitMap map[string]map[string]string) error {
 	br := bufio.NewReaderSize(r, 64*1024)
+	var commitCmds []commitFileCmd
+	inCommit := false
+
+	flushCommit := func() error {
+		if inCommit {
+			if err := flushCommitFileCommands(w, commitCmds); err != nil {
+				return err
+			}
+			commitCmds = nil
+			inCommit = false
+		}
+		return nil
+	}
+
 	for {
 		line, err := br.ReadString('\n')
 		if len(line) > 0 {
-			if strings.HasPrefix(line, "data ") {
+			// Check if this line marks the start of a new top-level command or boundary
+			if strings.HasPrefix(line, "commit ") {
+				if err := flushCommit(); err != nil {
+					return err
+				}
+				inCommit = true
 				if _, werr := io.WriteString(w, line); werr != nil {
 					return werr
 				}
+				continue
+			} else if inCommit && (line == "\n" || line == "\r\n" ||
+				strings.HasPrefix(line, "tag ") ||
+				strings.HasPrefix(line, "reset ") ||
+				strings.HasPrefix(line, "blob") ||
+				strings.HasPrefix(line, "checkpoint") ||
+				strings.HasPrefix(line, "progress ") ||
+				strings.HasPrefix(line, "feature ")) {
+				if err := flushCommit(); err != nil {
+					return err
+				}
+			}
+
+			// Handle data payloads
+			if strings.HasPrefix(line, "data ") {
 				sizeStr := strings.TrimSpace(line[5:])
 				size, parseErr := strconv.ParseInt(sizeStr, 10, 64)
-				if parseErr == nil && size > 0 {
-					if _, cerr := io.CopyN(w, br, size); cerr != nil {
-						return cerr
+				if parseErr == nil && size >= 0 {
+					if inCommit && len(commitCmds) > 0 {
+						// This data payload belongs to the preceding inline file command (e.g. M ... inline)
+						dataBuf := make([]byte, size)
+						if _, rerr := io.ReadFull(br, dataBuf); rerr != nil {
+							return rerr
+						}
+						lastIdx := len(commitCmds) - 1
+						commitCmds[lastIdx].line += line
+						commitCmds[lastIdx].data = dataBuf
+						continue
 					}
+					// Otherwise, it is a commit message, blob, or tag payload: stream directly
+					if _, werr := io.WriteString(w, line); werr != nil {
+						return werr
+					}
+					if size > 0 {
+						if _, cerr := io.CopyN(w, br, size); cerr != nil {
+							return cerr
+						}
+					}
+					continue
 				}
-				continue
-			} else if strings.HasPrefix(line, "M 160000 ") {
-				// M 160000 <dataref> <path>
-				parts := strings.SplitN(line, " ", 4)
-				if len(parts) == 4 && len(parts[2]) == 40 {
-					sha1 := parts[2]
-					subPath := strings.TrimRight(parts[3], "\r\n")
-					if strings.HasPrefix(subPath, "\"") {
-						if unquoted, err := strconv.Unquote(subPath); err == nil {
-							subPath = unquoted
-						}
-					}
-					var targetSHA string
-					if submoduleCommitMap != nil {
-						if m, ok := submoduleCommitMap[subPath]; ok {
-							if realSHA, ok := m[sha1]; ok && len(realSHA) == 64 {
-								targetSHA = realSHA
-							}
-						}
-						if targetSHA == "" {
-							// If not found under the exact subPath (e.g. submodule moved or path varied in history),
-							// search across all other pre-converted submodules. Commit SHA-1s are unique.
-							for _, m := range submoduleCommitMap {
+			}
+
+			if inCommit {
+				if strings.HasPrefix(line, "M 160000 ") {
+					// M 160000 <dataref> <path>
+					parts := strings.SplitN(line, " ", 4)
+					if len(parts) == 4 && len(parts[2]) == 40 {
+						sha1 := parts[2]
+						subPath := extractPath(parts[3])
+						var targetSHA string
+						if submoduleCommitMap != nil {
+							if m, ok := submoduleCommitMap[subPath]; ok {
 								if realSHA, ok := m[sha1]; ok && len(realSHA) == 64 {
 									targetSHA = realSHA
-									break
+								}
+							}
+							if targetSHA == "" {
+								// If not found under the exact subPath (e.g. submodule moved or path varied in history),
+								// search across all other pre-converted submodules. Commit SHA-1s are unique.
+								for _, m := range submoduleCommitMap {
+									if realSHA, ok := m[sha1]; ok && len(realSHA) == 64 {
+										targetSHA = realSHA
+										break
+									}
 								}
 							}
 						}
+						if targetSHA == "" {
+							targetSHA = sha1 + syntheticSHA256Padding
+						}
+						line = fmt.Sprintf("M 160000 %s %s", targetSHA, parts[3])
 					}
-					if targetSHA == "" {
-						targetSHA = sha1 + syntheticSHA256Padding
+					commitCmds = append(commitCmds, commitFileCmd{
+						line:       line,
+						isDelete:   false,
+						targetPath: extractPath(strings.SplitN(line, " ", 4)[3]),
+					})
+					continue
+				} else if strings.HasPrefix(line, "M ") {
+					parts := strings.SplitN(line, " ", 4)
+					var p string
+					if len(parts) >= 4 {
+						p = extractPath(parts[3])
 					}
-					line = fmt.Sprintf("M 160000 %s %s", targetSHA, parts[3])
+					commitCmds = append(commitCmds, commitFileCmd{
+						line:       line,
+						isDelete:   false,
+						targetPath: p,
+					})
+					continue
+				} else if strings.HasPrefix(line, "D ") {
+					p := extractPath(strings.TrimPrefix(line, "D "))
+					commitCmds = append(commitCmds, commitFileCmd{
+						line:       line,
+						isDelete:   true,
+						targetPath: p,
+					})
+					continue
+				} else if strings.HasPrefix(line, "C ") || strings.HasPrefix(line, "R ") {
+					p := extractTargetFromCopyRename(line)
+					commitCmds = append(commitCmds, commitFileCmd{
+						line:       line,
+						isDelete:   false,
+						targetPath: p,
+					})
+					continue
+				} else if strings.HasPrefix(line, "deleteall") || strings.HasPrefix(line, "N ") {
+					commitCmds = append(commitCmds, commitFileCmd{
+						line: line,
+					})
+					continue
+				} else if strings.HasPrefix(line, "from ") || strings.HasPrefix(line, "merge ") {
+					parts := strings.SplitN(line, " ", 2)
+					if len(parts) == 2 && strings.TrimRight(parts[1], "\r\n ") == nullSHA1 {
+						line = parts[0] + " " + nullSHA256 + "\n"
+					}
 				}
-			} else if strings.HasPrefix(line, "from ") || strings.HasPrefix(line, "merge ") {
-				parts := strings.SplitN(line, " ", 2)
-				if len(parts) == 2 && strings.TrimRight(parts[1], "\r\n ") == nullSHA1 {
-					line = parts[0] + " " + nullSHA256 + "\n"
+			} else {
+				if strings.HasPrefix(line, "from ") || strings.HasPrefix(line, "merge ") {
+					parts := strings.SplitN(line, " ", 2)
+					if len(parts) == 2 && strings.TrimRight(parts[1], "\r\n ") == nullSHA1 {
+						line = parts[0] + " " + nullSHA256 + "\n"
+					}
 				}
 			}
+
 			if _, werr := io.WriteString(w, line); werr != nil {
 				return werr
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
-				return nil
+				return flushCommit()
 			}
 			return err
 		}

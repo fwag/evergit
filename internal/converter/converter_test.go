@@ -1322,3 +1322,197 @@ func TestEnsureRepoContinuesForRemainingWaiters(t *testing.T) {
 
 	manager.WaitIdle()
 }
+
+func TestReorderCommitFileCommands(t *testing.T) {
+	// Case 1: Empty and single command slices
+	if len(reorderCommitFileCommands(nil)) != 0 {
+		t.Error("expected nil/empty slice to remain empty")
+	}
+	single := []commitFileCmd{{line: "M 100644 :1 foo\n", targetPath: "foo"}}
+	if reordered := reorderCommitFileCommands(single); len(reordered) != 1 || reordered[0].targetPath != "foo" {
+		t.Error("expected single command to remain unchanged")
+	}
+
+	// Case 2: Commit with no deletions
+	noDeletes := []commitFileCmd{
+		{line: "M 100644 :1 a/b\n", targetPath: "a/b"},
+		{line: "M 100644 :2 c/d\n", targetPath: "c/d"},
+	}
+	res2 := reorderCommitFileCommands(noDeletes)
+	if len(res2) != 2 || res2[0].targetPath != "a/b" || res2[1].targetPath != "c/d" {
+		t.Error("expected no-delete slice to remain unchanged")
+	}
+
+	// Case 3: Deletions that do not prefix any additions
+	unrelatedDeletes := []commitFileCmd{
+		{line: "M 100644 :1 a/b\n", targetPath: "a/b"},
+		{line: "D c\n", isDelete: true, targetPath: "c"},
+	}
+	res3 := reorderCommitFileCommands(unrelatedDeletes)
+	if len(res3) != 2 || res3[0].targetPath != "a/b" || res3[1].targetPath != "c" {
+		t.Error("expected unrelated deletion not to move")
+	}
+
+	// Case 4: File/symlink replaced by directory (the libvirt bug scenario)
+	// fast-export outputs M for children first, followed by D for parent file/symlink.
+	// D must be moved before the first child command.
+	fileReplacedByDir := []commitFileCmd{
+		{line: "M 100644 :1 other.txt\n", targetPath: "other.txt"},
+		{line: "M 100644 :2 tests/system/cpu/0\n", targetPath: "tests/system/cpu/0"},
+		{line: "M 100644 :3 tests/system/node/1\n", targetPath: "tests/system/node/1"},
+		{line: "D tests/system\n", isDelete: true, targetPath: "tests/system"},
+		{line: "M 100644 :4 final.txt\n", targetPath: "final.txt"},
+	}
+	res4 := reorderCommitFileCommands(fileReplacedByDir)
+	expected4 := []string{
+		"other.txt",
+		"tests/system",
+		"tests/system/cpu/0",
+		"tests/system/node/1",
+		"final.txt",
+	}
+	if len(res4) != len(expected4) {
+		t.Fatalf("expected %d commands, got %d", len(expected4), len(res4))
+	}
+	for i, exp := range expected4 {
+		if res4[i].targetPath != exp {
+			t.Errorf("at index %d: expected targetPath %q, got %q", i, exp, res4[i].targetPath)
+		}
+	}
+	if !res4[1].isDelete {
+		t.Errorf("expected D tests/system at index 1")
+	}
+
+	// Case 5: Nested directory replacement (D a and D a/b before M a/b/c)
+	nested := []commitFileCmd{
+		{line: "M 100644 :1 a/b/c\n", targetPath: "a/b/c"},
+		{line: "D a/b\n", isDelete: true, targetPath: "a/b"},
+		{line: "D a\n", isDelete: true, targetPath: "a"},
+	}
+	res5 := reorderCommitFileCommands(nested)
+	expected5 := []string{"a", "a/b", "a/b/c"}
+	if len(res5) != len(expected5) {
+		t.Fatalf("expected %d commands, got %d", len(expected5), len(res5))
+	}
+	for i, exp := range expected5 {
+		if res5[i].targetPath != exp {
+			t.Errorf("at index %d: expected targetPath %q, got %q", i, exp, res5[i].targetPath)
+		}
+	}
+
+	// Case 6: Quoted paths with spaces
+	quoted := []commitFileCmd{
+		{line: "M 100644 :1 \"my dir/sub/file.txt\"\n", targetPath: "my dir/sub/file.txt"},
+		{line: "D \"my dir\"\n", isDelete: true, targetPath: "my dir"},
+	}
+	res6 := reorderCommitFileCommands(quoted)
+	if len(res6) != 2 || res6[0].targetPath != "my dir" || res6[1].targetPath != "my dir/sub/file.txt" {
+		t.Errorf("failed to reorder quoted paths with spaces: got %+v", res6)
+	}
+}
+
+func TestConverterFileReplacedByDirectory(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "evergit-test-file-to-dir-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	upstreamPath := filepath.Join(tempDir, "upstream.git")
+	if err := os.MkdirAll(upstreamPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd(upstreamPath, "git", "init", "--initial-branch=main", "--object-format=sha1"); err != nil {
+		if _, err := runCmd(upstreamPath, "git", "init", "--object-format=sha1"); err != nil {
+			t.Fatalf("failed to init upstream SHA1 repo: %v", err)
+		}
+	}
+	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
+	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
+
+	// Commit 1: create a symlink "system -> ." inside a subdirectory
+	testDir := filepath.Join(upstreamPath, "tests")
+	if err := os.MkdirAll(testDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkPath := filepath.Join(testDir, "system")
+	if err := os.Symlink(".", symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = runCmd(upstreamPath, "git", "add", "tests/system")
+	if _, err := runCmd(upstreamPath, "git", "commit", "-m", "commit 1: system is symlink"); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Commit 2: delete symlink "system", replace with directory "system" containing "cpu" and "node"
+	if err := os.Remove(symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	nodeDir := filepath.Join(testDir, "system", "node")
+	if err := os.MkdirAll(nodeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	onlineFile := filepath.Join(nodeDir, "online")
+	if err := os.WriteFile(onlineFile, []byte("0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cpuDir := filepath.Join(testDir, "system", "cpu", "cpu0")
+	if err := os.MkdirAll(cpuDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cpuNodeLink := filepath.Join(cpuDir, "node0")
+	if err := os.Symlink("../../node/node0", cpuNodeLink); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = runCmd(upstreamPath, "git", "add", "-A")
+	if _, err := runCmd(upstreamPath, "git", "commit", "-m", "commit 2: replace symlink with directories"); err != nil {
+		t.Fatalf("commit 2 failed: %v", err)
+	}
+
+	// Convert repository with Evergit
+	storageRoot := filepath.Join(tempDir, "storage")
+	manager := NewManager(0)
+	info := &resolver.RepositoryInfo{
+		Domain:      "local",
+		Owner:       "test",
+		RepoName:    "repo-file-to-dir",
+		RemoteURL:   upstreamPath,
+		MirrorPath:  filepath.Join(storageRoot, "mirrors", "local", "test", "repo-file-to-dir.git"),
+		ServingPath: filepath.Join(storageRoot, "repos", "local", "test", "repo-file-to-dir.git"),
+		BuildsPath:  filepath.Join(storageRoot, "builds", "local", "test", "repo-file-to-dir.git"),
+	}
+
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatalf("EnsureRepo failed: %v", err)
+	}
+
+	// Verify that in the converted SHA-256 repository:
+	// 1. tests/system/node/online exists and can be read
+	outOnline, err := runCmd(info.ServingPath, "git", "show", "HEAD:tests/system/node/online")
+	if err != nil {
+		t.Fatalf("tests/system/node/online was wiped out during conversion: %v (git show output: %q)", err, outOnline)
+	}
+	if strings.TrimSpace(outOnline) != "0" {
+		t.Errorf("expected '0', got %q", outOnline)
+	}
+
+	// 2. tests/system/cpu/cpu0/node0 exists
+	outLink, err := runCmd(info.ServingPath, "git", "show", "HEAD:tests/system/cpu/cpu0/node0")
+	if err != nil {
+		t.Fatalf("tests/system/cpu/cpu0/node0 was wiped out during conversion: %v (git show output: %q)", err, outLink)
+	}
+	if strings.TrimSpace(outLink) != "../../node/node0" {
+		t.Errorf("expected symlink target '../../node/node0', got %q", outLink)
+	}
+
+	// 3. ls-tree HEAD:tests/system shows both cpu and node trees
+	lsOut, err := runCmd(info.ServingPath, "git", "ls-tree", "HEAD:tests/system")
+	if err != nil {
+		t.Fatalf("failed to ls-tree tests/system: %v", err)
+	}
+	if !strings.Contains(lsOut, "cpu") || !strings.Contains(lsOut, "node") {
+		t.Errorf("expected tests/system to contain both cpu and node trees, got:\n%s", lsOut)
+	}
+}
