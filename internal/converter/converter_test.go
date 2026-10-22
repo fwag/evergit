@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -473,29 +472,6 @@ func TestDeletedBranchIsNoLongerServed(t *testing.T) {
 	}
 }
 
-func TestFastImportFailureIncludesStderr(t *testing.T) {
-	upstreamPath := newTestUpstream(t)
-	info := newTestRepoInfo(t, upstreamPath)
-	manager := NewManager(0)
-
-	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
-		t.Fatalf("initial EnsureRepo failed: %v", err)
-	}
-
-	// Corrupt the marks so the incremental fast-import fails
-	if err := os.WriteFile(filepath.Join(info.ServingPath, "evergit-sha256-marks.txt"), []byte("garbage\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	commitToUpstream(t, upstreamPath, "commit 1")
-	err := manager.EnsureRepo(context.Background(), info, nil)
-	if err == nil {
-		t.Fatal("expected incremental EnsureRepo to fail with corrupted marks")
-	}
-	if strings.Contains(err.Error(), `stderr: ""`) {
-		t.Errorf("fast-import failure should include its stderr, got: %v", err)
-	}
-}
-
 func TestFullConversionNeverHidesServingRepo(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
@@ -528,8 +504,8 @@ func TestFullConversionNeverHidesServingRepo(t *testing.T) {
 
 	for i := 1; i <= 10; i++ {
 		commitToUpstream(t, upstreamPath, fmt.Sprintf("commit %d", i))
-		// Dropping the marks forces the full conversion path
-		_ = os.Remove(filepath.Join(info.ServingPath, "evergit-sha1-marks.txt"))
+		// Dropping the marker forces the full conversion path
+		_ = os.Remove(filepath.Join(info.ServingPath, rewriteMarkerFile))
 		if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 			t.Fatalf("EnsureRepo %d failed: %v", i, err)
 		}
@@ -679,53 +655,6 @@ func TestRepoLocksAreReleased(t *testing.T) {
 	defer manager.locksMu.Unlock()
 	if n := len(manager.repoLocks); n != 0 {
 		t.Errorf("%d repository locks retained after all requests finished", n)
-	}
-}
-
-func TestGenerateLooseObjectIdxSkipsMalformedMarks(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(repo, "objects"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	sha1A, sha256A := strings.Repeat("a", 40), strings.Repeat("1", 64)
-	sha1B, sha256B := strings.Repeat("b", 40), strings.Repeat("2", 64)
-	sha1Marks := ":1 " + sha1A + "\n:2 " + sha1B + "\n:3 " + strings.Repeat("c", 17) + "\n:4 not-a-hash-at-all-not-a-hash-at-all-xx\n"
-	sha256Marks := ":1 " + sha256A + "\n:2 " + sha256B + "\n:3 " + strings.Repeat("3", 64) + "\n:4 " + strings.Repeat("4", 64) + "\n:5 " + strings.Repeat("5", 30)
-	_ = os.WriteFile(filepath.Join(repo, "evergit-sha1-marks.txt"), []byte(sha1Marks), 0644)
-	_ = os.WriteFile(filepath.Join(repo, "evergit-sha256-marks.txt"), []byte(sha256Marks), 0644)
-
-	if err := generateLooseObjectIdx(repo); err != nil {
-		t.Fatal(err)
-	}
-	idx, _ := os.ReadFile(filepath.Join(repo, "objects", "loose-object-idx"))
-	want := "# loose-object-idx\n" + sha256A + " " + sha1A + "\n" + sha256B + " " + sha1B + "\n"
-	if string(idx) != want {
-		t.Errorf("loose-object-idx =\n%s\nwant\n%s", idx, want)
-	}
-}
-
-func TestGenerateLooseObjectIdxOutOfOrderMarks(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(repo, "objects"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	sha1A, sha256A := strings.Repeat("a", 40), strings.Repeat("1", 64)
-	sha1B, sha256B := strings.Repeat("b", 40), strings.Repeat("2", 64)
-	sha1C, sha256C := strings.Repeat("c", 40), strings.Repeat("3", 64)
-
-	// SHA-1 marks are unordered
-	sha1Marks := ":3 " + sha1C + "\n:1 " + sha1A + "\n:2 " + sha1B + "\n"
-	sha256Marks := ":1 " + sha256A + "\n:2 " + sha256B + "\n:3 " + sha256C + "\n"
-	_ = os.WriteFile(filepath.Join(repo, "evergit-sha1-marks.txt"), []byte(sha1Marks), 0644)
-	_ = os.WriteFile(filepath.Join(repo, "evergit-sha256-marks.txt"), []byte(sha256Marks), 0644)
-
-	if err := generateLooseObjectIdx(repo); err != nil {
-		t.Fatal(err)
-	}
-	idx, _ := os.ReadFile(filepath.Join(repo, "objects", "loose-object-idx"))
-	want := "# loose-object-idx\n" + sha256A + " " + sha1A + "\n" + sha256B + " " + sha1B + "\n" + sha256C + " " + sha1C + "\n"
-	if string(idx) != want {
-		t.Errorf("loose-object-idx =\n%s\nwant\n%s", idx, want)
 	}
 }
 
@@ -1043,7 +972,7 @@ func TestSubmoduleCircularReferencePrevention(t *testing.T) {
 	}
 }
 
-func TestNestedTagsWithMarkTagsConvertSuccessfully(t *testing.T) {
+func TestNestedTagsConvertSuccessfully(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	// Create an annotated tag and a nested tag pointing to it
 	if _, err := runCmd(upstreamPath, "git", "tag", "-a", "v1.0", "-m", "tag v1.0"); err != nil {
@@ -1081,7 +1010,7 @@ func newTestUpstreamSHA256(t *testing.T) string {
 	return upstreamPath
 }
 
-func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
+func TestNativeSHA256UpstreamIsServedUnconverted(t *testing.T) {
 	upstreamPath := newTestUpstreamSHA256(t)
 	upstreamHead, err := runCmd(upstreamPath, "git", "rev-parse", "HEAD")
 	if err != nil {
@@ -1109,16 +1038,6 @@ func TestNativeSHA256UpstreamBypassesFastExport(t *testing.T) {
 	}
 	if servingHead != upstreamHead {
 		t.Fatalf("serving HEAD %q != upstream HEAD %q", servingHead, upstreamHead)
-	}
-
-	// Verify marks files were NOT created (fast-export / fast-import bypassed)
-	sha1MarksPath := filepath.Join(info.ServingPath, "evergit-sha1-marks.txt")
-	if _, err := os.Stat(sha1MarksPath); !os.IsNotExist(err) {
-		t.Errorf("evergit-sha1-marks.txt exists at %s; fast-export/fast-import was not bypassed", sha1MarksPath)
-	}
-	sha256MarksPath := filepath.Join(info.ServingPath, "evergit-sha256-marks.txt")
-	if _, err := os.Stat(sha256MarksPath); !os.IsNotExist(err) {
-		t.Errorf("evergit-sha256-marks.txt exists at %s; fast-export/fast-import was not bypassed", sha256MarksPath)
 	}
 
 	// Test incremental sync
@@ -1191,7 +1110,7 @@ func TestConversionEmitsProgress(t *testing.T) {
 	}
 
 	progressOutput := progressBuf.String()
-	if !strings.Contains(progressOutput, "history conversion, please wait...") {
+	if !strings.Contains(progressOutput, "Converting SHA-1 objects to SHA-256...") {
 		t.Errorf("expected initial conversion notice in progress output, got:\n%s", progressOutput)
 	}
 }
@@ -1243,38 +1162,6 @@ func TestDiskSpaceSafeguard(t *testing.T) {
 	}
 }
 
-func TestFastImportStatisticsGatedByDebug(t *testing.T) {
-	upstreamPath := newTestUpstream(t)
-	info := newTestRepoInfo(t, upstreamPath)
-
-	// With debug disabled (default)
-	manager := NewManager(0)
-	var logBuf strings.Builder
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(os.Stderr)
-
-	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
-		t.Fatalf("EnsureRepo failed: %v", err)
-	}
-
-	if strings.Contains(logBuf.String(), "fast-import statistics") {
-		t.Errorf("fast-import statistics logged when debug is disabled:\n%s", logBuf.String())
-	}
-
-	// With debug enabled
-	commitToUpstream(t, upstreamPath, "commit for debug")
-	manager.SetDebug(true)
-	logBuf.Reset()
-
-	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
-		t.Fatalf("EnsureRepo with debug failed: %v", err)
-	}
-
-	if !strings.Contains(logBuf.String(), "fast-import statistics") {
-		t.Errorf("expected fast-import statistics when debug is enabled, got:\n%s", logBuf.String())
-	}
-}
-
 func TestEnsureRepoCancelsWhenWaitersDisconnect(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
@@ -1321,94 +1208,6 @@ func TestEnsureRepoContinuesForRemainingWaiters(t *testing.T) {
 	}
 
 	manager.WaitIdle()
-}
-
-func TestReorderCommitFileCommands(t *testing.T) {
-	// Case 1: Empty and single command slices
-	if len(reorderCommitFileCommands(nil)) != 0 {
-		t.Error("expected nil/empty slice to remain empty")
-	}
-	single := []commitFileCmd{{line: "M 100644 :1 foo\n", targetPath: "foo"}}
-	if reordered := reorderCommitFileCommands(single); len(reordered) != 1 || reordered[0].targetPath != "foo" {
-		t.Error("expected single command to remain unchanged")
-	}
-
-	// Case 2: Commit with no deletions
-	noDeletes := []commitFileCmd{
-		{line: "M 100644 :1 a/b\n", targetPath: "a/b"},
-		{line: "M 100644 :2 c/d\n", targetPath: "c/d"},
-	}
-	res2 := reorderCommitFileCommands(noDeletes)
-	if len(res2) != 2 || res2[0].targetPath != "a/b" || res2[1].targetPath != "c/d" {
-		t.Error("expected no-delete slice to remain unchanged")
-	}
-
-	// Case 3: Deletions that do not prefix any additions
-	unrelatedDeletes := []commitFileCmd{
-		{line: "M 100644 :1 a/b\n", targetPath: "a/b"},
-		{line: "D c\n", isDelete: true, targetPath: "c"},
-	}
-	res3 := reorderCommitFileCommands(unrelatedDeletes)
-	if len(res3) != 2 || res3[0].targetPath != "a/b" || res3[1].targetPath != "c" {
-		t.Error("expected unrelated deletion not to move")
-	}
-
-	// Case 4: File/symlink replaced by directory (the libvirt bug scenario)
-	// fast-export outputs M for children first, followed by D for parent file/symlink.
-	// D must be moved before the first child command.
-	fileReplacedByDir := []commitFileCmd{
-		{line: "M 100644 :1 other.txt\n", targetPath: "other.txt"},
-		{line: "M 100644 :2 tests/system/cpu/0\n", targetPath: "tests/system/cpu/0"},
-		{line: "M 100644 :3 tests/system/node/1\n", targetPath: "tests/system/node/1"},
-		{line: "D tests/system\n", isDelete: true, targetPath: "tests/system"},
-		{line: "M 100644 :4 final.txt\n", targetPath: "final.txt"},
-	}
-	res4 := reorderCommitFileCommands(fileReplacedByDir)
-	expected4 := []string{
-		"other.txt",
-		"tests/system",
-		"tests/system/cpu/0",
-		"tests/system/node/1",
-		"final.txt",
-	}
-	if len(res4) != len(expected4) {
-		t.Fatalf("expected %d commands, got %d", len(expected4), len(res4))
-	}
-	for i, exp := range expected4 {
-		if res4[i].targetPath != exp {
-			t.Errorf("at index %d: expected targetPath %q, got %q", i, exp, res4[i].targetPath)
-		}
-	}
-	if !res4[1].isDelete {
-		t.Errorf("expected D tests/system at index 1")
-	}
-
-	// Case 5: Nested directory replacement (D a and D a/b before M a/b/c)
-	nested := []commitFileCmd{
-		{line: "M 100644 :1 a/b/c\n", targetPath: "a/b/c"},
-		{line: "D a/b\n", isDelete: true, targetPath: "a/b"},
-		{line: "D a\n", isDelete: true, targetPath: "a"},
-	}
-	res5 := reorderCommitFileCommands(nested)
-	expected5 := []string{"a", "a/b", "a/b/c"}
-	if len(res5) != len(expected5) {
-		t.Fatalf("expected %d commands, got %d", len(expected5), len(res5))
-	}
-	for i, exp := range expected5 {
-		if res5[i].targetPath != exp {
-			t.Errorf("at index %d: expected targetPath %q, got %q", i, exp, res5[i].targetPath)
-		}
-	}
-
-	// Case 6: Quoted paths with spaces
-	quoted := []commitFileCmd{
-		{line: "M 100644 :1 \"my dir/sub/file.txt\"\n", targetPath: "my dir/sub/file.txt"},
-		{line: "D \"my dir\"\n", isDelete: true, targetPath: "my dir"},
-	}
-	res6 := reorderCommitFileCommands(quoted)
-	if len(res6) != 2 || res6[0].targetPath != "my dir" || res6[1].targetPath != "my dir/sub/file.txt" {
-		t.Errorf("failed to reorder quoted paths with spaces: got %+v", res6)
-	}
 }
 
 func TestConverterFileReplacedByDirectory(t *testing.T) {

@@ -8,7 +8,7 @@ It is designed to solve a critical interoperability gap: **Git does not allow re
 
 ##  Features
 
-- **Just-In-Time (JIT) Conversion:** Translates SHA1 repositories to SHA256 on the first `git clone` or `git fetch` attempt using high-speed streaming `git-fast-export` and `git-fast-import` pipes.
+- **Just-In-Time (JIT) Conversion:** Translates SHA1 repositories to SHA256 on the first `git clone` or `git fetch` attempt, object by object as defined by Git's [hash function transition design](https://git-scm.com/docs/hash-function-transition): every object keeps its exact content, including signatures, and only the ids of the objects it references change. The result is identical to what Git's own `compatObjectFormat` translation computes and does not depend on the installed Git version.
 - **Robust Local Caching (Upstream Resilience):** Caches bare repositories locally. If the upstream forge (e.g., GitHub, GitLab) is down or has deleted a repository, Evergit continuously serves the last successfully retrieved version from its local cache, insulating your build environment.
 - **Force-Push and Deletion Protection (History Archival):** Captures references automatically before fetching updates. If a branch/tag is force-pushed (overwritten) or deleted upstream, Evergit automatically archives the old commits under a dedicated, permanent namespace (`refs/evergit-backups/`). This guarantees that old commits are never lost or garbage collected, and remain fully checkoutable by clients!
 - **Fully Compliant Smart HTTP/HTTPS Serving:** Leverages Go's native CGI wrapper over `git-http-backend`, delivering complete out-of-the-box support for the Git Smart HTTP protocol (v1 and v2).
@@ -45,7 +45,7 @@ go build -o evergit ./cmd/evergit
 - `-ttl`: Cache duration before checking upstream for updates; also settable via `EVERGIT_CACHE_TTL` (default: `30s`, pass `0` to check upstream on every fetch)
 - `-max-conversions`: Maximum concurrent JIT conversions; also settable via `EVERGIT_MAX_CONVERSIONS` (default: CPU count)
 - `-min-free-disk`: Minimum free disk in GB required before cloning new mirrors; also settable via `EVERGIT_MIN_FREE_DISK_GB` (default: `1`)
-- `-debug`: Enable debug logging and verbose fast-import statistics; also settable via `EVERGIT_DEBUG` (default: `false`)
+- `-debug`: Enable debug logging; also settable via `EVERGIT_DEBUG` (default: `false`)
 - `-allowed-hosts`: Comma-separated upstream hosts clients may request; also settable via `EVERGIT_ALLOWED_HOSTS` (default: `github.com,gitlab.com,bitbucket.org`). Self-hosted forges must be added explicitly.
 - `-shorthands`: Comma-separated domain shorthand mappings in `alias=domain` format; also settable via `EVERGIT_SHORTHANDS` (default: `github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org`). Pass `none` to disable shorthands.
 
@@ -156,7 +156,7 @@ git submodule update --init
 1. **Pre-Conversion of Active Submodules:**
    Before converting a superproject (e.g. `libvirt`), Evergit reads `HEAD:.gitmodules` from the mirror. It automatically resolves and pre-converts any active submodules (e.g. `keycodemapdb`) to SHA-256 into Evergit's storage cache, bounded by a recursion depth (default: `1`, with cycle protection).
 2. **Real Cryptographic SHA-256 Translation:**
-   Evergit loads the translation map from the submodule's marks file (`evergit-sha1-marks.txt` / `evergit-sha256-marks.txt`). When converting the superproject, Evergit translates gitlink commits to their **real cryptographic SHA-256 hashes**.
+   Evergit loads the translation map from the submodule's `objects/loose-object-idx`. When converting the superproject, Evergit translates gitlink commits to their **real cryptographic SHA-256 hashes**.
 3. **Seamless Client Clones:**
    When your client runs `git submodule update --init`, the request routes to Evergit via the scoped `insteadOf` rule. The client requests the real SHA-256 commit from Evergit, which Evergit serves directly from its cache, resulting in a clean working tree.
 4. **Resilience to Ancient History:**

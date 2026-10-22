@@ -25,7 +25,7 @@ func main() {
 	cacheTTLStr := flag.String("ttl", "", "Cache TTL (e.g. 30s, 5m, 1h, 0 to disable cache; default: 30s)")
 	maxConversionsFlag := flag.Int("max-conversions", 0, "Maximum concurrent JIT conversions (0 = CPU count)")
 	minFreeDiskFlag := flag.Int("min-free-disk", -1, "Minimum free disk space in GB required before cloning new mirrors (default: 1)")
-	debugFlag := flag.Bool("debug", false, "Enable debug mode and fast-import statistics")
+	debugFlag := flag.Bool("debug", false, "Enable debug logging")
 	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
 	shorthands := flag.String("shorthands", "", "Comma-separated domain shorthand mappings in alias=domain format (default: github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org)")
 	flag.Parse()

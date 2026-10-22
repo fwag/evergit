@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,7 +96,7 @@ func (m *Manager) SetConfig(cfg *config.Config) {
 	m.cfg = cfg
 }
 
-// SetDebug enables or disables debug mode (including fast-import statistics logging).
+// SetDebug enables or disables debug logging.
 func (m *Manager) SetDebug(enabled bool) {
 	m.debug = enabled
 }
@@ -347,24 +346,18 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 		return err
 	}
 
-	// If the upstream mirror is natively SHA-256, bypass the fast-export | fast-import pipeline
+	// If the upstream mirror is natively SHA-256, there is nothing to convert
 	if isRepoSHA256(info.MirrorPath) {
 		return m.syncNativeSHA256(ctx, info, changed, progressWriter)
 	}
 
-	// Skip conversion when the serving repo exists and the mirror did not change (or the fetch
-	// failed and we fall back to the cache). Touching HEAD restarts the TTL.
-	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
-	if _, err := os.Stat(servingHeadPath); err == nil {
-		if !changed {
-			// loose object idx healing if daemon is killed
-			if err := ensureLooseObjectIdx(info.ServingPath); err != nil {
-				return err
-			}
-			now := time.Now()
-			_ = os.Chtimes(servingHeadPath, now, now)
-			return nil
-		}
+	// Skip conversion when the serving repo is a complete conversion and the mirror did not change
+	// (or the fetch failed and we fall back to the cache). Touching HEAD restarts the TTL. Anything
+	// else, such as a lost translation table, is repaired by converting again.
+	if !changed && isIncrementalRewrite(info.ServingPath) {
+		now := time.Now()
+		_ = os.Chtimes(filepath.Join(info.ServingPath, "HEAD"), now, now)
+		return nil
 	}
 
 	// 3. Opportunistically pre-convert active submodules and load their commit translation maps
@@ -385,7 +378,7 @@ func isRepoSHA256(repoPath string) bool {
 }
 
 // syncNativeSHA256 creates or updates the serving repository for an upstream repository that is
-// already in SHA-256 format, bypassing the CPU- and memory-intensive fast-export | fast-import pipeline.
+// already in SHA-256 format, bypassing object conversion.
 func (m *Manager) syncNativeSHA256(ctx context.Context, info *resolver.RepositoryInfo, changed bool, progressWriter io.Writer) error {
 	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
 	if _, err := os.Stat(servingHeadPath); err == nil {
@@ -604,15 +597,6 @@ func looksLikeBareRepo(path string) bool {
 // scoped to heads and tags, "git fetch --prune" can never delete refs/evergit-backups/*.
 var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
-type conversionPlan struct {
-	targetPath    string
-	isIncremental bool
-	exportFlags   []string
-	importFlags   []string
-	totalObjects  int
-	failed        bool
-}
-
 type submoduleEntry struct {
 	Name string
 	Path string
@@ -766,50 +750,25 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 	return resolver.ParsePath(targetPath, cfg)
 }
 
-func loadSubmoduleMarks(servingPath string) (map[string]string, error) {
-	sha1Path := filepath.Join(servingPath, "evergit-sha1-marks.txt")
-	sha256Path := filepath.Join(servingPath, "evergit-sha256-marks.txt")
-
-	f1, err := os.Open(sha1Path)
+// loadSubmoduleTranslations reads a submodule's SHA-1 -> SHA-256 translations from its loose-object-idx.
+func loadSubmoduleTranslations(servingPath string) (map[string]string, error) {
+	f, err := os.Open(filepath.Join(servingPath, "objects", "loose-object-idx"))
 	if err != nil {
 		return nil, err
 	}
-	defer f1.Close()
+	defer f.Close()
 
-	markToSHA1 := make(map[string]string)
-	s1 := bufio.NewScanner(f1)
-	for s1.Scan() {
-		line := s1.Text()
-		mark, sha, ok := parseMarkLine(line, sha1HexLen)
-		if ok {
-			markToSHA1[mark] = sha
+	sha1ToSHA256 := make(map[string]string)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		sha256, sha1, found := strings.Cut(scanner.Text(), " ")
+		if found && len(sha256) == sha256HexLen && len(sha1) == sha1HexLen {
+			sha1ToSHA256[sha1] = sha256
 		}
 	}
-	if err := s1.Err(); err != nil {
+	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-
-	f2, err := os.Open(sha256Path)
-	if err != nil {
-		return nil, err
-	}
-	defer f2.Close()
-
-	sha1ToSHA256 := make(map[string]string, len(markToSHA1))
-	s2 := bufio.NewScanner(f2)
-	for s2.Scan() {
-		line := s2.Text()
-		mark, sha256, ok := parseMarkLine(line, sha256HexLen)
-		if ok {
-			if sha1, found := markToSHA1[mark]; found {
-				sha1ToSHA256[sha1] = sha256
-			}
-		}
-	}
-	if err := s2.Err(); err != nil {
-		return nil, err
-	}
-
 	return sha1ToSHA256, nil
 }
 
@@ -820,7 +779,7 @@ func (m *Manager) prepareSubmodules(ctx context.Context, info *resolver.Reposito
 	}
 
 	submoduleCommitMap := make(map[string]map[string]string)
-	marksCache := make(map[string]map[string]string)
+	translationsCache := make(map[string]map[string]string)
 
 	for _, entry := range submodules {
 		subInfo, err := m.resolveSubmoduleInfo(entry.URL, info)
@@ -837,23 +796,23 @@ func (m *Manager) prepareSubmodules(ctx context.Context, info *resolver.Reposito
 			}
 		}
 
-		marks, cached := marksCache[subInfo.ServingPath]
+		translations, cached := translationsCache[subInfo.ServingPath]
 		if !cached {
-			if loaded, err := loadSubmoduleMarks(subInfo.ServingPath); err == nil && len(loaded) > 0 {
-				marks = loaded
-				marksCache[subInfo.ServingPath] = marks
+			if loaded, err := loadSubmoduleTranslations(subInfo.ServingPath); err == nil && len(loaded) > 0 {
+				translations = loaded
+				translationsCache[subInfo.ServingPath] = translations
 				if m.debug {
-					log.Printf("[%s] Loaded %d commit translations for submodule repo %s", info.RepoName, len(marks), subInfo.ServingPath)
+					log.Printf("[%s] Loaded %d commit translations for submodule repo %s", info.RepoName, len(translations), subInfo.ServingPath)
 				}
 			} else {
-				marksCache[subInfo.ServingPath] = nil
+				translationsCache[subInfo.ServingPath] = nil
 			}
 		}
 
-		if len(marks) > 0 {
-			submoduleCommitMap[entry.Path] = marks
+		if len(translations) > 0 {
+			submoduleCommitMap[entry.Path] = translations
 			if m.debug {
-				log.Printf("[%s] Mapped %d commit translations to submodule path %q", info.RepoName, len(marks), entry.Path)
+				log.Printf("[%s] Mapped %d commit translations to submodule path %q", info.RepoName, len(translations), entry.Path)
 			}
 		}
 	}
@@ -877,655 +836,19 @@ func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo
 		}
 	}
 
-	plan, err := m.prepareConversion(ctx, info, progressWriter)
-	if err != nil {
-		return err
-	}
-	if !plan.isIncremental {
-		defer func() {
-			if plan.failed {
-				os.RemoveAll(plan.targetPath)
-			}
-		}()
-	}
-
-	if err := runConversionPipeline(ctx, info.MirrorPath, plan.targetPath, plan.exportFlags, plan.importFlags, info.RepoName, plan.totalObjects, plan.isIncremental, m.debug, progressWriter, submoduleCommitMap); err != nil {
-		plan.failed = true
-		return err
-	}
-
-	if err := m.finalizeConversion(info, plan.targetPath, plan.isIncremental); err != nil {
-		plan.failed = true
-		return err
-	}
-
-	return nil
+	return m.convertObjects(ctx, info, progressWriter, submoduleCommitMap)
 }
 
-func isIncrementalConversion(servingPath string) bool {
-	for _, file := range []string{"HEAD", "evergit-sha1-marks.txt", "evergit-sha256-marks.txt"} {
-		if _, err := os.Stat(filepath.Join(servingPath, file)); err != nil {
-			return false
-		}
-	}
-	return true
-}
+// syntheticSHA256Padding turns the SHA-1 of a submodule commit without a known translation into a
+// deterministic placeholder SHA-256.
+const syntheticSHA256Padding = "000000000000000000000000" // 24 zeros
 
-func countExportableObjects(ctx context.Context, mirrorPath string) int {
-	commitsOut, err := runCmdContext(ctx, 0, mirrorPath, "git", "rev-list", "--all", "--count")
-	if err != nil {
-		return 0
-	}
-	commits, _ := strconv.Atoi(strings.TrimSpace(commitsOut))
-
-	blobsOut, err := runCmdContext(ctx, 0, mirrorPath, "git", "rev-list", "--objects", "--filter=object:type=blob", "--all", "--count")
-	if err != nil {
-		return commits
-	}
-	blobs, _ := strconv.Atoi(strings.TrimSpace(blobsOut))
-
-	return commits + blobs
-}
-
-func (m *Manager) prepareConversion(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) (*conversionPlan, error) {
-	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create repos directory: %w", err)
-	}
-
-	isIncremental := isIncrementalConversion(info.ServingPath)
-	var targetPath string
-	totalObjects := 0
-
-	if isIncremental {
-		targetPath = info.ServingPath
-		log.Printf("Starting high-performance incremental conversion for repository %s...", info.RepoName)
-		if progressWriter != nil {
-			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Incremental update found. Performing incremental JIT conversion...\n", info.RepoName)
-		}
-	} else {
-		targetPath = filepath.Join(info.BuildsPath, strconv.FormatInt(time.Now().UnixNano(), 10))
-		log.Printf("Starting full conversion for repository %s...", info.RepoName)
-		if progressWriter != nil {
-			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Performing full JIT SHA-1 -> SHA-256 history conversion, please wait...\n", info.RepoName)
-		}
-		if _, err := runCmdContext(ctx, 0, "", "git", "init", "--bare", "--object-format=sha256", targetPath); err != nil {
-			return nil, fmt.Errorf("failed to initialize bare sha256 repository: %w", err)
-		}
-		totalObjects = countExportableObjects(ctx, info.MirrorPath)
-	}
-
-	sha1Marks := filepath.Join(targetPath, "evergit-sha1-marks.txt")
-	sha256Marks := filepath.Join(targetPath, "evergit-sha256-marks.txt")
-
-	interval := progressObjectInterval
-	if totalObjects > 0 {
-		// Target ~50 progress updates across the conversion, but no more frequently than every 5,000 objects
-		calculated := totalObjects / 50
-		if calculated > interval {
-			interval = calculated
-		}
-	}
-
-	exportFlags := []string{
-		"--all",
-		"--signed-commits=strip",
-		"--signed-tags=strip",
-		"--tag-of-filtered-object=rewrite",
-		"--mark-tags",
-		fmt.Sprintf("--progress=%d", interval),
-		"--export-marks=" + sha1Marks,
-	}
-	importFlags := []string{
-		"--export-marks=" + sha256Marks,
-	}
-	if m.debug {
-		importFlags = append(importFlags, "--stats")
-	} else {
-		importFlags = append(importFlags, "--quiet")
-	}
-
-	if isIncremental {
-		exportFlags = append(exportFlags, "--import-marks="+sha1Marks)
-		importFlags = append([]string{"--force", "--import-marks=" + sha256Marks}, importFlags...)
-	}
-
-	return &conversionPlan{
-		targetPath:    targetPath,
-		isIncremental: isIncremental,
-		exportFlags:   exportFlags,
-		importFlags:   importFlags,
-		totalObjects:  totalObjects,
-	}, nil
-}
-
-const (
-	syntheticSHA256Padding = "000000000000000000000000" // 24 zeros
-	nullSHA1               = "0000000000000000000000000000000000000000"
-	nullSHA256             = "0000000000000000000000000000000000000000000000000000000000000000"
-)
-
-// commitFileCmd represents a file modification command within a commit block.
-type commitFileCmd struct {
-	line       string
-	data       []byte
-	isDelete   bool
-	targetPath string
-}
-
-func extractPath(raw string) string {
-	raw = strings.TrimRight(raw, "\r\n")
-	if strings.HasPrefix(raw, "\"") {
-		if unquoted, err := strconv.Unquote(raw); err == nil {
-			return unquoted
-		}
-	}
-	return raw
-}
-
-func extractTargetFromCopyRename(line string) string {
-	trimmed := strings.TrimRight(line, "\r\n")
-	if len(trimmed) < 2 {
-		return ""
-	}
-	rest := strings.TrimSpace(trimmed[2:])
-	if strings.HasPrefix(rest, "\"") {
-		endQuote := -1
-		escaped := false
-		for i := 1; i < len(rest); i++ {
-			if escaped {
-				escaped = false
-				continue
-			}
-			if rest[i] == '\\' {
-				escaped = true
-				continue
-			}
-			if rest[i] == '"' {
-				endQuote = i
-				break
-			}
-		}
-		if endQuote != -1 && endQuote+1 < len(rest) {
-			dst := strings.TrimSpace(rest[endQuote+1:])
-			return extractPath(dst)
-		}
-	}
-	parts := strings.SplitN(rest, " ", 2)
-	if len(parts) == 2 {
-		return extractPath(parts[1])
-	}
-	return ""
-}
-
-func dirPrefixes(path string) []string {
-	var prefixes []string
-	last := 0
-	for {
-		idx := strings.IndexByte(path[last:], '/')
-		if idx == -1 {
-			break
-		}
-		prefix := path[:last+idx]
-		if len(prefix) > 0 {
-			prefixes = append(prefixes, prefix)
-		}
-		last += idx + 1
-	}
-	return prefixes
-}
-
-// reorderCommitFileCommands fixes a Git fast-export bug where git fast-export orders file additions
-// under a new directory BEFORE the D command that deletes an old file or symlink at that directory path.
-// When git fast-import executes D <path>, it treats it as a recursive tree deletion and wipes out the
-// directory and its files that were just created.
-// To prevent this, any D command whose path is an ancestor directory of any file modified or added in
-// the commit is moved before the first command affecting that directory subtree.
-func reorderCommitFileCommands(cmds []commitFileCmd) []commitFileCmd {
-	if len(cmds) <= 1 {
-		return cmds
-	}
-
-	delIndices := make(map[string]int)
-	hasDeletes := false
-	for i, cmd := range cmds {
-		if cmd.isDelete && cmd.targetPath != "" {
-			delIndices[cmd.targetPath] = i
-			hasDeletes = true
-		}
-	}
-	if !hasDeletes {
-		return cmds
-	}
-
-	// minTarget maps delIdx -> earliest child idx that appeared before delIdx
-	minTarget := make(map[int]int)
-	for i, cmd := range cmds {
-		if cmd.targetPath == "" {
-			continue
-		}
-		for _, prefix := range dirPrefixes(cmd.targetPath) {
-			if delIdx, ok := delIndices[prefix]; ok && delIdx > i {
-				if earliest, seen := minTarget[delIdx]; !seen || i < earliest {
-					minTarget[delIdx] = i
-				}
-			}
-		}
-	}
-
-	if len(minTarget) == 0 {
-		return cmds
-	}
-
-	type moveItem struct {
-		delIdx   int
-		insertAt int
-		path     string
-	}
-	var toMove []moveItem
-	movedIndices := make(map[int]bool)
-	for delIdx, insertAt := range minTarget {
-		toMove = append(toMove, moveItem{
-			delIdx:   delIdx,
-			insertAt: insertAt,
-			path:     cmds[delIdx].targetPath,
-		})
-		movedIndices[delIdx] = true
-	}
-
-	// Sort toMove: primary by insertAt ascending, secondary by path length ascending (shorter parent paths first)
-	sort.Slice(toMove, func(i, j int) bool {
-		if toMove[i].insertAt != toMove[j].insertAt {
-			return toMove[i].insertAt < toMove[j].insertAt
-		}
-		return len(toMove[i].path) < len(toMove[j].path)
-	})
-
-	insertions := make(map[int][]commitFileCmd)
-	for _, item := range toMove {
-		insertions[item.insertAt] = append(insertions[item.insertAt], cmds[item.delIdx])
-	}
-
-	result := make([]commitFileCmd, 0, len(cmds))
-	for i := 0; i < len(cmds); i++ {
-		if toInsert, ok := insertions[i]; ok {
-			result = append(result, toInsert...)
-		}
-		if !movedIndices[i] {
-			result = append(result, cmds[i])
-		}
-	}
-
-	return result
-}
-
-func flushCommitFileCommands(w io.Writer, cmds []commitFileCmd) error {
-	if len(cmds) == 0 {
-		return nil
-	}
-	reordered := reorderCommitFileCommands(cmds)
-	for _, cmd := range reordered {
-		if _, err := io.WriteString(w, cmd.line); err != nil {
-			return err
-		}
-		if len(cmd.data) > 0 {
-			if _, err := w.Write(cmd.data); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// transformFastExportStream filters the fast-export stream, zero-padding 40-character SHA-1
-// gitlinks (mode 160000) to 64-character synthetic SHA-256 hashes (or replacing them with the real
-// SHA-256 commit hash if available in submoduleCommitMap) so that fast-import accepts them into a
-// SHA-256 repository without rejecting submodules. It also translates 40-character null SHA-1 references
-// (emitted e.g. when dereferencing nested tags with --mark-tags) to 64-character null SHA-256 references.
-// It also reorders file commands within commits so deletions of files/symlinks replaced by directories
-// precede additions in those directories, preventing fast-import from deleting the newly created directories.
-// Binary data payloads are copied verbatim.
-func transformFastExportStream(r io.Reader, w io.Writer, submoduleCommitMap map[string]map[string]string) error {
-	br := bufio.NewReaderSize(r, 64*1024)
-	var commitCmds []commitFileCmd
-	inCommit := false
-
-	flushCommit := func() error {
-		if inCommit {
-			if err := flushCommitFileCommands(w, commitCmds); err != nil {
-				return err
-			}
-			commitCmds = nil
-			inCommit = false
-		}
-		return nil
-	}
-
-	for {
-		line, err := br.ReadString('\n')
-		if len(line) > 0 {
-			// Check if this line marks the start of a new top-level command or boundary
-			if strings.HasPrefix(line, "commit ") {
-				if err := flushCommit(); err != nil {
-					return err
-				}
-				inCommit = true
-				if _, werr := io.WriteString(w, line); werr != nil {
-					return werr
-				}
-				continue
-			} else if inCommit && (line == "\n" || line == "\r\n" ||
-				strings.HasPrefix(line, "tag ") ||
-				strings.HasPrefix(line, "reset ") ||
-				strings.HasPrefix(line, "blob") ||
-				strings.HasPrefix(line, "checkpoint") ||
-				strings.HasPrefix(line, "progress ") ||
-				strings.HasPrefix(line, "feature ")) {
-				if err := flushCommit(); err != nil {
-					return err
-				}
-			}
-
-			// Handle data payloads
-			if strings.HasPrefix(line, "data ") {
-				sizeStr := strings.TrimSpace(line[5:])
-				size, parseErr := strconv.ParseInt(sizeStr, 10, 64)
-				if parseErr == nil && size >= 0 {
-					if inCommit && len(commitCmds) > 0 {
-						// This data payload belongs to the preceding inline file command (e.g. M ... inline)
-						dataBuf := make([]byte, size)
-						if _, rerr := io.ReadFull(br, dataBuf); rerr != nil {
-							return rerr
-						}
-						lastIdx := len(commitCmds) - 1
-						commitCmds[lastIdx].line += line
-						commitCmds[lastIdx].data = dataBuf
-						continue
-					}
-					// Otherwise, it is a commit message, blob, or tag payload: stream directly
-					if _, werr := io.WriteString(w, line); werr != nil {
-						return werr
-					}
-					if size > 0 {
-						if _, cerr := io.CopyN(w, br, size); cerr != nil {
-							return cerr
-						}
-					}
-					continue
-				}
-			}
-
-			if inCommit {
-				if strings.HasPrefix(line, "M 160000 ") {
-					// M 160000 <dataref> <path>
-					parts := strings.SplitN(line, " ", 4)
-					if len(parts) == 4 && len(parts[2]) == 40 {
-						sha1 := parts[2]
-						subPath := extractPath(parts[3])
-						var targetSHA string
-						if submoduleCommitMap != nil {
-							if m, ok := submoduleCommitMap[subPath]; ok {
-								if realSHA, ok := m[sha1]; ok && len(realSHA) == 64 {
-									targetSHA = realSHA
-								}
-							}
-							if targetSHA == "" {
-								// If not found under the exact subPath (e.g. submodule moved or path varied in history),
-								// search across all other pre-converted submodules. Commit SHA-1s are unique.
-								for _, m := range submoduleCommitMap {
-									if realSHA, ok := m[sha1]; ok && len(realSHA) == 64 {
-										targetSHA = realSHA
-										break
-									}
-								}
-							}
-						}
-						if targetSHA == "" {
-							targetSHA = sha1 + syntheticSHA256Padding
-						}
-						line = fmt.Sprintf("M 160000 %s %s", targetSHA, parts[3])
-					}
-					commitCmds = append(commitCmds, commitFileCmd{
-						line:       line,
-						isDelete:   false,
-						targetPath: extractPath(strings.SplitN(line, " ", 4)[3]),
-					})
-					continue
-				} else if strings.HasPrefix(line, "M ") {
-					parts := strings.SplitN(line, " ", 4)
-					var p string
-					if len(parts) >= 4 {
-						p = extractPath(parts[3])
-					}
-					commitCmds = append(commitCmds, commitFileCmd{
-						line:       line,
-						isDelete:   false,
-						targetPath: p,
-					})
-					continue
-				} else if strings.HasPrefix(line, "D ") {
-					p := extractPath(strings.TrimPrefix(line, "D "))
-					commitCmds = append(commitCmds, commitFileCmd{
-						line:       line,
-						isDelete:   true,
-						targetPath: p,
-					})
-					continue
-				} else if strings.HasPrefix(line, "C ") || strings.HasPrefix(line, "R ") {
-					p := extractTargetFromCopyRename(line)
-					commitCmds = append(commitCmds, commitFileCmd{
-						line:       line,
-						isDelete:   false,
-						targetPath: p,
-					})
-					continue
-				} else if strings.HasPrefix(line, "deleteall") || strings.HasPrefix(line, "N ") {
-					commitCmds = append(commitCmds, commitFileCmd{
-						line: line,
-					})
-					continue
-				} else if strings.HasPrefix(line, "from ") || strings.HasPrefix(line, "merge ") {
-					parts := strings.SplitN(line, " ", 2)
-					if len(parts) == 2 && strings.TrimRight(parts[1], "\r\n ") == nullSHA1 {
-						line = parts[0] + " " + nullSHA256 + "\n"
-					}
-				}
-			} else {
-				if strings.HasPrefix(line, "from ") || strings.HasPrefix(line, "merge ") {
-					parts := strings.SplitN(line, " ", 2)
-					if len(parts) == 2 && strings.TrimRight(parts[1], "\r\n ") == nullSHA1 {
-						line = parts[0] + " " + nullSHA256 + "\n"
-					}
-				}
-			}
-
-			if _, werr := io.WriteString(w, line); werr != nil {
-				return werr
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				return flushCommit()
-			}
-			return err
-		}
-	}
-}
-
-func runConversionPipeline(ctx context.Context, mirrorPath, targetPath string, exportFlags, importFlags []string, repoName string, totalObjects int, isIncremental, debug bool, progressWriter io.Writer, submoduleCommitMap map[string]map[string]string) error {
-	exportCmd := exec.CommandContext(ctx, "git", append([]string{"fast-export"}, exportFlags...)...)
-	exportCmd.Env = GitEnv()
-	exportCmd.Dir = mirrorPath
-
-	importCmd := exec.CommandContext(ctx, "git", append([]string{"fast-import"}, importFlags...)...)
-	importCmd.Env = GitEnv()
-	importCmd.Dir = targetPath
-
-	exportReader, exportWriter := io.Pipe()
-	importReader, importWriter := io.Pipe()
-
-	exportCmd.Stdout = exportWriter
-	importCmd.Stdin = importReader
-
-	var exportErrBuf, importErrBuf strings.Builder
-	exportCmd.Stderr = &exportErrBuf
-
-	importStdoutPipe, err := importCmd.StdoutPipe()
-	if err != nil {
-		_ = exportReader.Close()
-		_ = exportWriter.Close()
-		_ = importReader.Close()
-		_ = importWriter.Close()
-		return fmt.Errorf("failed to create stdout pipe for git fast-import: %w", err)
-	}
-
-	importStderrPipe, err := importCmd.StderrPipe()
-	if err != nil {
-		_ = exportReader.Close()
-		_ = exportWriter.Close()
-		_ = importReader.Close()
-		_ = importWriter.Close()
-		_ = importStdoutPipe.Close()
-		return fmt.Errorf("failed to create stderr pipe for git fast-import: %w", err)
-	}
-
-	if err := exportCmd.Start(); err != nil {
-		_ = exportReader.Close()
-		_ = exportWriter.Close()
-		_ = importReader.Close()
-		_ = importWriter.Close()
-		return fmt.Errorf("failed to start git fast-export: %w", err)
-	}
-	if err := importCmd.Start(); err != nil {
-		_ = exportReader.Close()
-		_ = exportWriter.Close()
-		_ = importReader.Close()
-		_ = importWriter.Close()
-		_ = exportCmd.Process.Kill()
-		_ = exportCmd.Wait()
-		return fmt.Errorf("failed to start git fast-import: %w", err)
-	}
-
-	transformErrChan := make(chan error, 1)
-	go func() {
-		err := transformFastExportStream(exportReader, importWriter, submoduleCommitMap)
-		_ = exportReader.CloseWithError(err)
-		_ = importWriter.CloseWithError(err)
-		transformErrChan <- err
-	}()
-
-	var pipesWg sync.WaitGroup
-	pipesWg.Add(2)
-
-	// Stream stdout of fast-import in real-time (contains "--progress" statements from fast-export)
-	go func() {
-		defer pipesWg.Done()
-		scanner := bufio.NewScanner(importStdoutPipe)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if debug {
-				log.Printf("[%s fast-import] %s", repoName, line)
-			}
-			if progressWriter != nil {
-				if totalObjects > 0 {
-					fields := strings.Fields(line)
-					if len(fields) >= 2 {
-						if current, err := strconv.Atoi(fields[1]); err == nil {
-							pct := int((float64(current) / float64(totalObjects)) * 100)
-							if pct > 99 {
-								pct = 99
-							}
-							_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: %2d%%...", repoName, pct)
-						}
-					}
-				} else if isIncremental {
-					_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: incremental updates...\r", repoName)
-				}
-			}
-		}
-	}()
-
-	// Stream stderr of fast-import in real-time, keeping it for error reporting and stats logging
-	go func() {
-		defer pipesWg.Done()
-		reader := bufio.NewReader(importStderrPipe)
-		for {
-			line, err := reader.ReadString('\n')
-			if len(line) > 0 {
-				importErrBuf.WriteString(line)
-				if debug {
-					log.Printf("[%s fast-import] %s", repoName, strings.TrimRight(line, "\r\n"))
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-	}()
-
-	exportErrChan := make(chan error, 1)
-	go func() {
-		err := exportCmd.Wait()
-		_ = exportWriter.CloseWithError(err)
-		exportErrChan <- err
-	}()
-
-	// All stdout and stderr reads must complete before Wait closes the pipes
-	pipesWg.Wait()
-	importErr := importCmd.Wait()
-	_ = importReader.Close()
-
-	if progressWriter != nil {
-		if totalObjects > 0 {
-			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: 100%%, done.\n", repoName)
-		} else if isIncremental {
-			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: incremental updates, done.\n", repoName)
-		}
-	}
-
-	exportErr := <-exportErrChan
-	transformErr := <-transformErrChan
-
-	// If fast-export or stream transformation failed with a non-pipe error, report that first
-	if exportErr != nil && !isBrokenPipe(exportErr) {
-		return fmt.Errorf("git fast-export failed: %v (stderr: %q)", exportErr, strings.TrimSpace(exportErrBuf.String()))
-	}
-	if transformErr != nil && !errors.Is(transformErr, io.EOF) && !isBrokenPipe(transformErr) {
-		return fmt.Errorf("git fast-export stream transform failed: %w", transformErr)
-	}
-	if importErr != nil {
-		return fmt.Errorf("git fast-import failed: %v (stderr: %q)", importErr, strings.TrimSpace(importErrBuf.String()))
-	}
-	if exportErr != nil {
-		return fmt.Errorf("git fast-export failed: %v (stderr: %q)", exportErr, strings.TrimSpace(exportErrBuf.String()))
-	}
-	if transformErr != nil && !errors.Is(transformErr, io.EOF) {
-		return fmt.Errorf("git fast-export stream transform failed: %w", transformErr)
-	}
-	return nil
-}
-
-func isBrokenPipe(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "broken pipe") || strings.Contains(msg, "closed pipe")
-}
-
-func (m *Manager) finalizeConversion(info *resolver.RepositoryInfo, targetPath string, isIncremental bool) error {
-	if isIncremental {
-		if err := pruneServingRefs(info); err != nil {
-			return err
-		}
-	}
-
+// publishConversion sets HEAD like the mirror's, restarts the TTL and, for a full conversion,
+// atomically publishes the new build.
+func (m *Manager) publishConversion(info *resolver.RepositoryInfo, targetPath string, isIncremental bool) error {
 	headRef, err := runCmd(info.MirrorPath, "git", "symbolic-ref", "HEAD")
 	if err != nil {
 		headRef = "refs/heads/main"
-	}
-
-	if err := generateLooseObjectIdx(targetPath); err != nil {
-		return fmt.Errorf("failed to generate loose-object-idx compatibility map: %w", err)
 	}
 
 	if _, err := runCmd(targetPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef); err != nil {
@@ -1694,192 +1017,10 @@ func runCmdContext(ctx context.Context, timeout time.Duration, dir, name string,
 const (
 	sha1HexLen   = 40
 	sha256HexLen = 64
-	// maxMarkID caps mark numbers to prevent corrupt marks files from creating runaway sparse scratch files.
-	maxMarkID = 100_000_000
-	// progressObjectInterval specifies how often fast-export emits progress statements (in objects).
+	// progressObjectInterval specifies how often conversion progress is reported (in objects).
 	progressObjectInterval = 5000
 )
 
-// generateLooseObjectIdx rebuilds objects/loose-object-idx by pairing the SHA1 and SHA256 marks files.
-// It uses a fixed-offset scratch file on disk so the pairing runs in O(1) RAM without loading maps into memory.
-// Pass 1 streams SHA1 marks into the scratch file at offset (markID-1)*sha1HexLen.
-// Pass 2 streams the sequential SHA256 marks, matching each against the scratch file and emitting loose-object-idx.
-func generateLooseObjectIdx(repoPath string) error {
-	scratchPath := filepath.Join(repoPath, "objects", "loose-object-idx-scratch.tmp")
-	scratchFile, err := os.Create(scratchPath)
-	if err != nil {
-		return fmt.Errorf("failed to create marks scratch file: %w", err)
-	}
-	defer func() {
-		_ = scratchFile.Close()
-		_ = os.Remove(scratchPath)
-	}()
-
-	sha1Path := filepath.Join(repoPath, "evergit-sha1-marks.txt")
-	scratchSize, err := indexSHA1Marks(sha1Path, scratchFile)
-	if err != nil {
-		return err
-	}
-
-	sha256Path := filepath.Join(repoPath, "evergit-sha256-marks.txt")
-	idxPath := filepath.Join(repoPath, "objects", "loose-object-idx")
-	return writeLooseObjectIdx(sha256Path, scratchFile, scratchSize, idxPath)
-}
-
-// indexSHA1Marks streams unordered SHA1 marks into the scratch file at mark-indexed offsets (O(1) RAM).
-func indexSHA1Marks(path string, scratch *os.File) (int64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, fmt.Errorf("failed to open SHA1 marks: %w", err)
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		mark, hash, ok := parseMarkLine(scanner.Text(), sha1HexLen)
-		if !ok {
-			continue
-		}
-		id, ok := parseMarkID(mark)
-		if !ok {
-			continue
-		}
-		offset := (id - 1) * sha1HexLen
-		if _, err := scratch.WriteAt([]byte(hash), offset); err != nil {
-			return 0, fmt.Errorf("failed to write mark %s to scratch file: %w", mark, err)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("failed to read SHA1 marks: %w", err)
-	}
-
-	info, err := scratch.Stat()
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat scratch file: %w", err)
-	}
-	return info.Size(), nil
-}
-
-// writeLooseObjectIdx streams sequential SHA256 marks, looks up SHA1 hashes by offset, and atomically writes the index.
-func writeLooseObjectIdx(sha256Path string, scratch *os.File, scratchSize int64, outPath string) error {
-	sha256File, err := os.Open(sha256Path)
-	if err != nil {
-		return fmt.Errorf("failed to open SHA256 marks: %w", err)
-	}
-	defer sha256File.Close()
-
-	tmpPath := outPath + ".tmp"
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return fmt.Errorf("failed to create loose-object-idx file: %w", err)
-	}
-	defer os.Remove(tmpPath)
-
-	w := bufio.NewWriter(out)
-	if _, err := w.WriteString("# loose-object-idx\n"); err != nil {
-		_ = out.Close()
-		return fmt.Errorf("failed to write header to loose-object-idx: %w", err)
-	}
-
-	sha1Reader := bufio.NewReaderSize(scratch, 256*1024)
-	var currentOffset int64
-	var sha1Buf [sha1HexLen]byte
-
-	scanner := bufio.NewScanner(sha256File)
-	for scanner.Scan() {
-		mark, sha256Hash, ok := parseMarkLine(scanner.Text(), sha256HexLen)
-		if !ok {
-			continue
-		}
-		id, ok := parseMarkID(mark)
-		if !ok {
-			continue
-		}
-		targetOffset := (id - 1) * sha1HexLen
-		if targetOffset+sha1HexLen > scratchSize {
-			continue
-		}
-
-		// Handling Gaps or Out-of-Order Marks
-		if targetOffset != currentOffset {
-			if _, err := scratch.Seek(targetOffset, io.SeekStart); err != nil {
-				_ = out.Close()
-				return fmt.Errorf("failed to seek in scratch file: %w", err)
-			}
-			sha1Reader.Reset(scratch)
-			currentOffset = targetOffset
-		}
-
-		if _, err := io.ReadFull(sha1Reader, sha1Buf[:]); err != nil {
-			_ = out.Close()
-			return fmt.Errorf("failed to read from scratch file: %w", err)
-		}
-		currentOffset += sha1HexLen
-
-		if sha1Buf[0] == 0 {
-			continue
-		}
-
-		_, _ = w.WriteString(sha256Hash)
-		_ = w.WriteByte(' ')
-		_, _ = w.Write(sha1Buf[:])
-		_ = w.WriteByte('\n')
-	}
-	if err := scanner.Err(); err != nil {
-		_ = out.Close()
-		return fmt.Errorf("failed to read SHA256 marks: %w", err)
-	}
-	if err := w.Flush(); err != nil {
-		_ = out.Close()
-		return fmt.Errorf("failed to write loose-object-idx file: %w", err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("failed to close loose-object-idx file: %w", err)
-	}
-	if err := os.Rename(tmpPath, outPath); err != nil {
-		return fmt.Errorf("failed to install loose-object-idx file: %w", err)
-	}
-
-	return nil
-}
-
-// ensureLooseObjectIdx regenerates the translation map if it is missing or older than the marks,
-// e.g. after a failed or interrupted conversion.
-func ensureLooseObjectIdx(repoPath string) error {
-	marks, err := os.Stat(filepath.Join(repoPath, "evergit-sha256-marks.txt"))
-	if err != nil {
-		return nil // No marks to build from
-	}
-	idx, err := os.Stat(filepath.Join(repoPath, "objects", "loose-object-idx"))
-	if err == nil && !idx.ModTime().Before(marks.ModTime()) {
-		return nil
-	}
-	if err := generateLooseObjectIdx(repoPath); err != nil {
-		return fmt.Errorf("failed to regenerate loose-object-idx compatibility map: %w", err)
-	}
-	return nil
-}
-
-// parseMarkID parses the integer ID from ":<id>".
-func parseMarkID(mark string) (int64, bool) {
-	if len(mark) < 2 || mark[0] != ':' {
-		return 0, false
-	}
-	id, err := strconv.ParseInt(mark[1:], 10, 64)
-	if err != nil || id <= 0 || id > maxMarkID {
-		return 0, false
-	}
-	return id, true
-}
-
-// parseMarkLine parses ":<mark> <hash>", requiring hash to be hashLen lowercase hex digits.
-func parseMarkLine(line string, hashLen int) (mark, hash string, ok bool) {
-	mark, hash, found := strings.Cut(strings.TrimSpace(line), " ")
-	if !found || len(mark) < 2 || mark[0] != ':' || len(hash) != hashLen || strings.Trim(hash, "0123456789abcdef") != "" {
-		return "", "", false
-	}
-	return mark, hash, true
-}
 func (m *Manager) backupForcePushedRefs(info *resolver.RepositoryInfo, oldRefs map[string]string) {
 	newRefs, err := listRefs(info.MirrorPath)
 	if err != nil {
