@@ -656,12 +656,8 @@ func writeTranslationTable(repoPath string, extend bool, ids map[sha1ID]sha256ID
 	return os.Rename(tmpPath, path)
 }
 
-// updateRefsFromMirror points every ref of the target at the translation of the mirror's ref.
-func updateRefsFromMirror(ctx context.Context, mirrorPath, targetPath string, ids map[sha1ID]sha256ID) error {
-	refs, err := listRefs(mirrorPath)
-	if err != nil {
-		return err
-	}
+// updateRefs points every ref of the target at the translation of the mirror's ref.
+func updateRefs(ctx context.Context, refs map[string]string, targetPath string, ids map[sha1ID]sha256ID) error {
 	names := make([]string, 0, len(refs))
 	for name := range refs {
 		names = append(names, name)
@@ -776,6 +772,10 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 		}
 	}
 
+	refs, err := listRefs(info.MirrorPath) // the mirror cannot change while the repository is locked
+	if err != nil {
+		return err
+	}
 	added, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, progress)
 	if err != nil {
 		return err
@@ -792,7 +792,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err := state.save(targetPath); err != nil {
 		return fmt.Errorf("failed to record conversion state: %w", err)
 	}
-	if err := updateRefsFromMirror(ctx, info.MirrorPath, targetPath, ids); err != nil {
+	if err := updateRefs(ctx, refs, targetPath, ids); err != nil {
 		return err
 	}
 	if incremental {
@@ -803,6 +803,11 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	// Repacking after the refs are set orders the pack and its bitmap by reachability
 	if err := repackConverted(ctx, targetPath, incremental, progressWriter, info.RepoName); err != nil {
 		return err
+	}
+	// The conversion is complete: until this is recorded, the next request converts again
+	state.ConvertedRefs = refs
+	if err := state.save(targetPath); err != nil {
+		return fmt.Errorf("failed to record conversion state: %w", err)
 	}
 	return m.publishConversion(info, targetPath, incremental)
 }

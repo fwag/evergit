@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // gitRaw runs git and returns its untrimmed stdout, optionally feeding stdin.
@@ -494,5 +496,58 @@ func TestConversionGoldenHashes(t *testing.T) {
 		"37ce2e35532bd67eb910bce6f66972f521f2a4463e7315fd7b715773f106a11b refs/tags/v1"
 	if got := servingRefs(t, info.ServingPath); got != want {
 		t.Errorf("converted ids changed (bump conversionVersion if intended):\n%s", got)
+	}
+}
+
+func TestConversionFailedAfterFetchIsRetried(t *testing.T) {
+	up := newTestUpstream(t)
+	info := newTestRepoInfo(t, up)
+	m := NewManager(0, 1)
+	m.SetConversionTimeout(100 * time.Millisecond)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fetch succeeds, then the conversion fails because the only slot is taken
+	commitToUpstream(t, up, "commit 1")
+	if !m.TryAcquireConversionSlot() {
+		t.Fatal("no conversion slot")
+	}
+	err := m.EnsureRepo(context.Background(), info, nil)
+	m.ReleaseConversionSlot()
+	if !errors.Is(err, ErrServerBusy) {
+		t.Fatalf("EnsureRepo with every slot taken = %v, want ErrServerBusy", err)
+	}
+
+	// The mirror is already up to date, but the next request must still convert
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	served, err := LookupID(info.ServingPath, "sha256", gitLine(t, info.ServingPath, nil, "--git-dir=.", "rev-parse", "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := gitLine(t, up, nil, "rev-parse", "HEAD"); served != want {
+		t.Errorf("serving the translation of %s after a failed conversion, want upstream %s", served, want)
+	}
+}
+
+func TestNativeSHA256SyncFailedAfterFetchIsRetried(t *testing.T) {
+	up := newTestUpstreamSHA256(t)
+	info := newTestRepoInfo(t, up)
+	m := NewManager(0)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// As left by an update whose fetch succeeded but whose sync into the serving repository failed
+	commitToUpstream(t, up, "commit 1")
+	gitRaw(t, info.MirrorPath, nil, "fetch", "-q", "origin", "+refs/heads/*:refs/heads/*")
+
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := gitLine(t, info.ServingPath, nil, "--git-dir=.", "rev-parse", "main"), gitLine(t, up, nil, "rev-parse", "HEAD"); got != want {
+		t.Errorf("serving %s, want upstream %s", got, want)
 	}
 }

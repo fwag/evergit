@@ -510,29 +510,27 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 }
 
 // pinCommits makes wanted commits part of the mirror's history under refs/evergit-pinned/, fetching
-// them by id when the mirror lacks them, and reports whether any was pinned. Commits the upstream
-// does not have are skipped; other failures are returned.
-func pinCommits(ctx context.Context, info *resolver.RepositoryInfo, want []string) (bool, error) {
-	pinned := false
+// them by id when the mirror lacks them. Commits the upstream does not have are skipped; other
+// failures are returned.
+func pinCommits(ctx context.Context, info *resolver.RepositoryInfo, want []string) error {
 	for _, c := range want {
 		if _, err := parseSHA1Hex(c); err != nil {
-			return pinned, err
+			return err
 		}
 		ref := "refs/evergit-pinned/" + c
 		if _, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "cat-file", "-e", c+"^{commit}"); err == nil {
 			if _, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "update-ref", ref, c); err != nil {
-				return pinned, err
+				return err
 			}
 		} else if _, err := runCmdContext(ctx, upstreamTimeout, info.MirrorPath, "git", "-c", "http.followRedirects=false", "fetch", "--no-tags", "origin", "+"+c+":"+ref); err != nil {
 			if err := markGone(err); errors.Is(err, errUpstreamGone) {
 				log.Printf("[%s] Submodule commit %s does not exist upstream: %v", info.RepoName, c, err)
 				continue
 			}
-			return pinned, fmt.Errorf("failed to fetch submodule commit %s: %w", c, err)
+			return fmt.Errorf("failed to fetch submodule commit %s: %w", c, err)
 		}
-		pinned = true
 	}
-	return pinned, nil
+	return nil
 }
 
 // missingCommits returns the commits the repository does not contain.

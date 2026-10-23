@@ -24,6 +24,9 @@ type repoState struct {
 	ConversionVersion int `json:"conversion_version"`
 	// EvergitRevision is the build that last converted the repository, for diagnostics only
 	EvergitRevision string `json:"evergit_revision,omitempty"`
+	// ConvertedRefs are the mirror's refs (SHA-1) at the last successful conversion, recorded as its
+	// last step: a conversion is complete only if they match the mirror
+	ConvertedRefs map[string]string `json:"converted_refs,omitempty"`
 	// Submodules records the SHA-256 decided for every submodule commit, by submodule as in
 	// config.SyntheticGitlink (URL, or "path:<path>" for a gitlink without URL). A submodule commit
 	// recorded under several submodules has the same SHA-256 under each.

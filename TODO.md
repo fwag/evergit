@@ -131,8 +131,8 @@ Goal: the same SHA-1 history always converts to the same SHA-256 history, across
   - [x] Convert a repository's submodules the same way however it is reached (the depth limit, now 10, fails instead of padding), so a repository's SHA-256 no longer depends on request order.
   - [x] Submodule cycles fail clearly instead of deadlocking; the visited set is propagated into the conversion job. A submodule pointing into its own repository is translated from its own objects.
   - [ ] Cycles between repositories that are resolvable commit by commit (A@v2 -> B@v1 -> A@v1) still fail; converting them would need cross-repository translation.
-- [ ] **Stale serving after a failed conversion**
-  - [ ] When a conversion fails after a successful fetch (e.g. `ErrServerBusy`), the next request sees an unchanged mirror, reports success and serves the old version until upstream changes again. Decide "changed" against a record of the last successful conversion instead of the mirror before the fetch.
+- [x] **Stale serving after a failed conversion**
+  - [x] When a conversion failed after a successful fetch (e.g. `ErrServerBusy`), the next request saw an unchanged mirror, reported success and served the old version until upstream changed again. "Up to date" is now decided against `converted_refs` in `evergit-state.json`, the mirror's refs recorded as the last step of a successful conversion; natively SHA-256 repositories compare the mirror's refs with the served ones.
 - [x] **Conversion versioning**
   - [x] `conversionVersion` recorded in each serving repository's `evergit-state.json` (with the evergit revision, for diagnostics); a repository recorded with another version is rebuilt, keeping synthetic gitlink decisions.
   - [x] Golden test pinning the SHA-256 of a fixed SHA-1 history; a change requires bumping `conversionVersion`.

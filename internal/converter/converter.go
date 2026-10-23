@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -354,10 +355,10 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 	}
 
 	// 2. Clone/Fetch the upstream mirror
-	changed, err := m.syncMirror(ctx, info)
+	err := m.syncMirror(ctx, info)
 	var cached *cacheFallbackError
 	if errors.As(err, &cached) && len(want) == 0 {
-		changed, err = false, nil // serve the cached repository
+		err = nil // serve the cached repository
 	}
 	if err != nil {
 		return err
@@ -365,21 +366,20 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 
 	// If the upstream mirror is natively SHA-256, there is nothing to convert
 	if isRepoSHA256(info.MirrorPath) {
-		return m.syncNativeSHA256(ctx, info, changed, progressWriter)
+		return m.syncNativeSHA256(ctx, info, progressWriter)
 	}
 
 	if len(want) > 0 {
-		pinned, err := pinCommits(ctx, info, want)
-		if err != nil {
+		if err := pinCommits(ctx, info, want); err != nil {
 			return err
 		}
-		changed = changed || pinned
 	}
 
-	// Skip conversion when the serving repo is a complete conversion and the mirror did not change
-	// (or the fetch failed and we fall back to the cache). Touching HEAD restarts the TTL. Anything
-	// else, such as a lost translation table, is repaired by converting again.
-	if !changed && isIncrementalRewrite(info.ServingPath) {
+	// Skip conversion when the serving repo is a complete conversion of the mirror's current refs.
+	// Comparing with the last successful conversion, rather than with the mirror before the fetch,
+	// retries a conversion that failed after its fetch instead of serving the old version. Touching
+	// HEAD restarts the TTL. Anything else, such as a lost translation table, is converted again.
+	if convertedUpToDate(info) {
 		now := time.Now()
 		_ = os.Chtimes(filepath.Join(info.ServingPath, "HEAD"), now, now)
 		return nil
@@ -403,10 +403,10 @@ func isRepoSHA256(repoPath string) bool {
 
 // syncNativeSHA256 creates or updates the serving repository for an upstream repository that is
 // already in SHA-256 format, bypassing object conversion.
-func (m *Manager) syncNativeSHA256(ctx context.Context, info *resolver.RepositoryInfo, changed bool, progressWriter io.Writer) error {
+func (m *Manager) syncNativeSHA256(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
 	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
 	if _, err := os.Stat(servingHeadPath); err == nil {
-		if !changed {
+		if nativeUpToDate(info) {
 			now := time.Now()
 			_ = os.Chtimes(servingHeadPath, now, now)
 			return nil
@@ -524,9 +524,10 @@ func (m *Manager) needsSync(info *resolver.RepositoryInfo) bool {
 	return time.Since(fi.ModTime()) > m.cacheTTL
 }
 
-func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo) (bool, error) {
+// syncMirror clones or fetches the upstream into the mirror, archiving overwritten and deleted refs.
+func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo) error {
 	if err := os.MkdirAll(filepath.Dir(info.MirrorPath), 0755); err != nil {
-		return false, fmt.Errorf("failed to create mirrors directory: %w", err)
+		return fmt.Errorf("failed to create mirrors directory: %w", err)
 	}
 
 	_, statErr := os.Stat(info.MirrorPath)
@@ -534,17 +535,17 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 		// git would otherwise walk up from this directory and operate on an enclosing repository
 		log.Printf("WARNING: mirror %s is not a git repository (interrupted clone?), re-cloning", info.MirrorPath)
 		if err := os.RemoveAll(info.MirrorPath); err != nil {
-			return false, fmt.Errorf("failed to remove broken mirror %s: %w", info.MirrorPath, err)
+			return fmt.Errorf("failed to remove broken mirror %s: %w", info.MirrorPath, err)
 		}
 		statErr = os.ErrNotExist
 	}
 	if statErr != nil && !os.IsNotExist(statErr) {
-		return false, fmt.Errorf("failed to access mirror %s: %w", info.MirrorPath, statErr)
+		return fmt.Errorf("failed to access mirror %s: %w", info.MirrorPath, statErr)
 	}
 
 	if os.IsNotExist(statErr) {
 		if err := m.checkDiskSpace(info.MirrorPath); err != nil {
-			return false, err
+			return err
 		}
 		// Clone as a bare mirror
 		// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
@@ -552,18 +553,18 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 		_, err := runCmdContext(ctx, upstreamTimeout, "", "git", "-c", "http.followRedirects=false", "clone", "--bare", "--", info.RemoteURL, info.MirrorPath)
 		if err != nil {
 			_ = os.RemoveAll(info.MirrorPath)
-			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, markGone(err))
+			return fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, markGone(err))
 		}
-		return true, nil // Newly cloned, definitely changed
+		return nil
 	} else {
 		// Read current refs before fetching: without this baseline, force-pushes cannot be archived
 		oldRefs, err := listRefs(info.MirrorPath)
 		if err != nil {
 			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
 				log.Printf("WARNING: cannot read refs of mirror %s (%v), skipping upstream fetch and serving cached repository", info.MirrorPath, err)
-				return false, &cacheFallbackError{err}
+				return &cacheFallbackError{err}
 			}
-			return false, fmt.Errorf("failed to read refs of mirror %s: %w", info.MirrorPath, err)
+			return fmt.Errorf("failed to read refs of mirror %s: %w", info.MirrorPath, err)
 		}
 
 		// Fetch updates
@@ -580,30 +581,47 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 			// Check if we have an existing serving repository to fall back to
 			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
 				log.Printf("WARNING: Upstream fetch failed for %s (%v). Falling back to cached repository.", info.RemoteURL, err)
-				return false, &cacheFallbackError{markGone(err)}
+				return &cacheFallbackError{markGone(err)}
 			}
-			return false, fmt.Errorf("upstream fetch failed and no local cache available for %s: %w", info.RemoteURL, markGone(err))
+			return fmt.Errorf("upstream fetch failed and no local cache available for %s: %w", info.RemoteURL, markGone(err))
 		}
-
-		// Read new refs after fetching & backup creation
-		newRefs, err := listRefs(info.MirrorPath)
-		if err != nil {
-			return false, fmt.Errorf("failed to read refs of mirror %s: %w", info.MirrorPath, err)
-		}
-
-		// Compare references to determine if anything changed
-		if len(oldRefs) != len(newRefs) {
-			return true, nil
-		}
-		for ref, oldOID := range oldRefs {
-			newOID, exists := newRefs[ref]
-			if !exists || oldOID != newOID {
-				return true, nil
-			}
-		}
-
-		return false, nil // No changes detected!
+		return nil
 	}
+}
+
+// convertedUpToDate reports whether the serving repository is a complete conversion of the
+// mirror's current refs.
+func convertedUpToDate(info *resolver.RepositoryInfo) bool {
+	state := currentState(info.ServingPath)
+	if state == nil || !isIncrementalRewrite(info.ServingPath) {
+		return false
+	}
+	refs, err := listRefs(info.MirrorPath)
+	return err == nil && maps.Equal(refs, state.ConvertedRefs)
+}
+
+// nativeUpToDate reports whether a natively SHA-256 serving repository has the mirror's current
+// branches, tags and backups. Backups the mirror no longer has are kept by the serving repository.
+func nativeUpToDate(info *resolver.RepositoryInfo) bool {
+	mirrorRefs, err := listRefs(info.MirrorPath)
+	if err != nil {
+		return false
+	}
+	servingRefs, err := listRefs(info.ServingPath)
+	if err != nil {
+		return false
+	}
+	for ref, id := range mirrorRefs {
+		if servingRefs[ref] != id {
+			return false
+		}
+	}
+	for ref := range servingRefs {
+		if _, ok := mirrorRefs[ref]; !ok && !strings.HasPrefix(ref, "refs/evergit-backups/") {
+			return false
+		}
+	}
+	return true
 }
 
 // cacheFallbackError reports that the upstream could not be fetched but a converted repository
