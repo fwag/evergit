@@ -378,7 +378,7 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 	}
 
 	if len(want) > 0 {
-		if err := pinCommits(ctx, info, want); err != nil {
+		if err := m.pinCommits(ctx, info, want); err != nil {
 			return err
 		}
 	}
@@ -571,7 +571,9 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 		// Clone as a bare mirror
 		// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
 		// thousands of refs/pull/* from forks
-		_, err := runCmdContext(ctx, upstreamTimeout, "", "git", "-c", "http.followRedirects=false", "clone", "--bare", "--", info.RemoteURL, info.MirrorPath)
+		err := m.gitUpstream(ctx, info, "", func(remote string) []string {
+			return []string{"-c", "http.followRedirects=false", "clone", "--bare", "--", remote, info.MirrorPath}
+		})
 		if err != nil {
 			_ = os.RemoveAll(info.MirrorPath)
 			return fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, markGone(err))
@@ -589,8 +591,9 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 		}
 
 		// Fetch updates
-		fetchArgs := append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", "origin"}, mirrorRefspecs...)
-		_, err = runCmdContext(ctx, upstreamTimeout, info.MirrorPath, "git", fetchArgs...)
+		err = m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
+			return append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", remote}, mirrorRefspecs...)
+		})
 
 		// Archive overwritten/deleted refs even if the fetch failed midway, since it may already
 		// have pruned or updated some of them

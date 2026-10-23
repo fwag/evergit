@@ -48,7 +48,7 @@ go build -o evergit ./cmd/evergit
 - `-max-conversion-time`: Maximum duration of a single sync or conversion; also settable via `EVERGIT_MAX_CONVERSION_TIME` (default: `12h`; a first conversion of the Linux kernel takes about 4 hours on 4 CPUs).
 - `-min-free-disk`: Minimum free disk in GB required before cloning new mirrors; also settable via `EVERGIT_MIN_FREE_DISK_GB` (default: `1`)
 - `-debug`: Enable debug logging; also settable via `EVERGIT_DEBUG` (default: `false`)
-- `-allowed-hosts`: Comma-separated upstream hosts clients may request; also settable via `EVERGIT_ALLOWED_HOSTS` (default: `github.com,gitlab.com,bitbucket.org`). Self-hosted forges must be added explicitly.
+- `-allowed-hosts`: Comma-separated upstream hosts clients may request; also settable via `EVERGIT_ALLOWED_HOSTS` (default: `github.com,gitlab.com,bitbucket.org`). Self-hosted forges must be added explicitly. Upstream redirects are only followed over HTTPS to allowed hosts (git itself never follows them), so a host that redirects elsewhere needs its target allowed too, e.g. `git.savannah.gnu.org,https.git.savannah.gnu.org`.
 - `-synthetic-gitlinks`: File approving synthetic SHA-256s for submodules that cannot be converted (see [Submodules that cannot be converted](#submodules-that-cannot-be-converted)); also settable via `EVERGIT_SYNTHETIC_GITLINKS`. It is read again at every conversion, so approvals apply without a restart.
 - `-shorthands`: Comma-separated domain shorthand mappings in `alias=domain` format; also settable via `EVERGIT_SHORTHANDS` (default: `github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org`). Pass `none` to disable shorthands.
 

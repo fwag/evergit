@@ -31,6 +31,7 @@ This checklist tracks security, rate-limiting, and hardening improvements across
 
 - [x] **[Low] Disable upstream HTTP redirects**
   - [x] git follows the initial redirect (`http.followRedirects=initial`), so a self-hosted allowed host could redirect Evergit to an internal address. Pass `-c http.followRedirects=false` on clone/fetch.
+  - [x] Hosts that legitimately redirect (e.g. git.savannah.gnu.org to https.git.savannah.gnu.org) could not be mirrored: Evergit follows redirects itself, over HTTPS and only to allowed hosts, and retries git with the final URL.
 
 - [x] **[Low] Log injection via SSH command**
   - [x] `executeGitCommand` logs `rawCmd` with `%s`; a client can forge log lines with embedded newlines. Use `%q`.

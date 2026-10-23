@@ -407,6 +407,11 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 		if table != nil {
 			res.tables = append(res.tables, table)
 		}
+		if errors.Is(err, ErrRedirectNotAllowed) {
+			// The administrator can allow the host redirected to, or approve synthetic SHA-256s
+			synthetic(pending, err.Error())
+			continue
+		}
 		if errors.Is(err, ErrSubmoduleCycle) || errors.Is(err, ErrSubmoduleDepth) || errors.Is(err, ErrSubmoduleUnavailable) || errors.Is(err, ErrSubmoduleNotApproved) {
 			return nil, fmt.Errorf("submodule %s of %s: %w", submodule, info.RepoName, err)
 		}
@@ -508,7 +513,7 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 // pinCommits makes wanted commits part of the mirror's history under refs/evergit-pinned/, fetching
 // them by id when the mirror lacks them. Commits the upstream does not have are skipped; other
 // failures are returned.
-func pinCommits(ctx context.Context, info *resolver.RepositoryInfo, want []string) error {
+func (m *Manager) pinCommits(ctx context.Context, info *resolver.RepositoryInfo, want []string) error {
 	for _, c := range want {
 		if _, err := parseSHA1Hex(c); err != nil {
 			return err
@@ -518,7 +523,9 @@ func pinCommits(ctx context.Context, info *resolver.RepositoryInfo, want []strin
 			if _, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "update-ref", ref, c); err != nil {
 				return err
 			}
-		} else if _, err := runCmdContext(ctx, upstreamTimeout, info.MirrorPath, "git", "-c", "http.followRedirects=false", "fetch", "--no-tags", "origin", "+"+c+":"+ref); err != nil {
+		} else if err := m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
+			return []string{"-c", "http.followRedirects=false", "fetch", "--no-tags", remote, "+" + c + ":" + ref}
+		}); err != nil {
 			if err := markGone(err); errors.Is(err, errUpstreamGone) {
 				log.Printf("[%s] Submodule commit %s does not exist upstream: %v", info.RepoName, c, err)
 				continue
