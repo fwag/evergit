@@ -39,7 +39,7 @@ go build -o evergit ./cmd/evergit
 ### Command-Line Flags
 - `-http`: HTTP listen address (default: `:8080`)
 - `-ssh`: SSH listen address (default: `:2222`)
-- `-public-url`: Public base URL of this Evergit HTTP service (e.g. `http://evergit.local:8080`); also settable via `EVERGIT_PUBLIC_URL`
+- `-public-url`: Public base URL of this Evergit HTTP service (e.g. `http://evergit.local:8080`); also settable via `EVERGIT_PUBLIC_URL`. Recommended, together with `-public-ssh-url`: without them the client setup script derives its URLs from the request's `Host` header, which must then be a plain host name or IP address
 - `-public-ssh-url`: Public base URL of this Evergit SSH service (e.g. `ssh://git@evergit.local:2222`); also settable via `EVERGIT_PUBLIC_SSH_URL`
 - `-storage`: Directory path for storing host keys, cache mirrors, and converted repositories (default: `./storage`)
 - `-ttl`: Cache duration before checking upstream for updates; also settable via `EVERGIT_CACHE_TTL` (default: `30s`, pass `0` to check upstream on every fetch)

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -222,7 +223,7 @@ func TestServeSetupScript(t *testing.T) {
 	if !strings.Contains(scriptContent, baseURL) {
 		t.Errorf("expected script to contain detected base URL %q, got:\n%s", baseURL, scriptContent)
 	}
-	if !strings.Contains(scriptContent, "ALLOWED_HOSTS=(github.com gitlab.com)") {
+	if !strings.Contains(scriptContent, "ALLOWED_HOSTS=('github.com' 'gitlab.com')") {
 		t.Errorf("expected script to contain allowed hosts, got:\n%s", scriptContent)
 	}
 
@@ -264,7 +265,7 @@ func TestServeSetupScript(t *testing.T) {
 		t.Fatalf("failed to read response body: %v", err)
 	}
 	scriptContent2 := string(scriptBytes2)
-	if !strings.Contains(scriptContent2, `HTTP_BASE="https://evergit.corp:8443"`) {
+	if !strings.Contains(scriptContent2, `HTTP_BASE='https://evergit.corp:8443'`) {
 		t.Errorf("expected script to contain PublicURL override, got:\n%s", scriptContent2)
 	}
 }
@@ -315,5 +316,46 @@ func generateSSHClientKey(t *testing.T, path string) {
 
 	if err := pem.Encode(f, privateKeyPEM); err != nil {
 		t.Fatalf("failed to encode key: %v", err)
+	}
+}
+
+func TestSetupScriptRejectsShellInjection(t *testing.T) {
+	cfg := &config.Config{SSHAddr: ":2222", StorageRoot: t.TempDir(), AllowedHosts: []string{"github.com"}}
+	httpServer, err := server.NewHTTPServer(cfg, converter.NewManager(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(host string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "/setup.sh", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		httpServer.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Go's HTTP server accepts this Host header; rendered into the script it would run in the
+	// victim's shell under "curl | bash"
+	injection := "$(id;touch$IFS'pwned')"
+	if rec := get(injection); rec.Code != http.StatusBadRequest || strings.Contains(rec.Body.String(), injection) {
+		t.Errorf("Host %q: status %d, body %q; want 400 without the value", injection, rec.Code, rec.Body.String())
+	}
+	if rec := get("[::1]:8080"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "HTTP_BASE='http://[::1]:8080'") {
+		t.Errorf("IPv6 Host: status %d, want 200 with the quoted base URL", rec.Code)
+	}
+
+	// A misconfigured public URL is refused too
+	cfg.PublicURL, cfg.PublicSSHURL = "https://evergit.example/$(id)", "ssh://git@evergit.example:2222"
+	if rec := get("evergit.example"); rec.Code != http.StatusInternalServerError {
+		t.Errorf("unsafe -public-url: status %d, want 500", rec.Code)
+	}
+
+	// With both public URLs set the Host header is not used
+	cfg.PublicURL = "https://evergit.example"
+	rec := get(injection)
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), injection) {
+		t.Fatalf("public URLs set: status %d, want 200 without the Host header", rec.Code)
+	}
+	if out, err := exec.Command("bash", "-n", "-c", rec.Body.String()).CombinedOutput(); err != nil {
+		t.Errorf("generated script is not valid bash: %v\n%s", err, out)
 	}
 }

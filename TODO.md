@@ -22,9 +22,9 @@ This checklist tracks security, rate-limiting, and hardening improvements across
   - [x] A relative `file://` URL is joined onto `https:/github.com/...`, which git parses as an scp-style ssh target with host `https`.
   - [x] Fix: dropped the branch; local paths and non-network URL schemes are rejected (and so need an approval like any submodule that cannot be converted). Tests mirror local upstreams from per-upstream hosts through `UpstreamOverrides`.
 
-- [ ] **[Low] Shell injection in `/setup.sh` through the `Host` header**
-  - [ ] Without `PublicURL`, `r.Host` is rendered unescaped into `HTTP_BASE="..."`; Go accepts `Host: $(id;...)`, which runs in the victim's shell under `curl | bash`. Needs an attacker-influenced Host header (reverse proxy, cache poisoning).
-  - [ ] Fix: require `PublicURL` or strictly validate the host, and render values with single-quote shell escaping.
+- [x] **[Low] Shell injection in `/setup.sh` through the `Host` header**
+  - [x] Without `PublicURL`, `r.Host` is rendered unescaped into `HTTP_BASE="..."`; Go accepts `Host: $(id;...)`, which runs in the victim's shell under `curl | bash`. Needs an attacker-influenced Host header (reverse proxy, cache poisoning).
+  - [x] Fix: without `-public-url`/`-public-ssh-url` the Host header must be a plain host name or IP address with optional port (400 otherwise); every rendered value must use URL-safe characters (the base URL is also embedded in the installed git aliases), and the assignments use single-quote shell escaping.
 
 - [x] **[Low] Reject `/git-receive-pack` before `EnsureRepo`**
   - [x] Push is currently refused only by `git-http-backend` (no `REMOTE_USER`), after a sync/conversion has already been triggered. Return `403` immediately.

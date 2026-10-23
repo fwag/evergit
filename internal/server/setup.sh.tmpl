@@ -3,9 +3,9 @@
 # Generated dynamically by Evergit ({{.HttpBase}})
 set -euo pipefail
 
-HTTP_BASE="{{.HttpBase}}"
-SSH_BASE="{{.SshBase}}"
-ALLOWED_HOSTS=({{.AllowedHosts}})
+HTTP_BASE={{shq .HttpBase}}
+SSH_BASE={{shq .SshBase}}
+ALLOWED_HOSTS=({{range $i, $h := .AllowedHosts}}{{if $i}} {{end}}{{shq $h}}{{end}})
 DEFAULT_CONFIG_FILE="$HOME/.config/evergit/gitconfig"
 
 MODE="install"
