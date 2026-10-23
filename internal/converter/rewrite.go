@@ -41,8 +41,13 @@ var signatureMarkers = []string{
 	"-----BEGIN SSH SIGNATURE-----",
 }
 
-// errObjectMissing is returned for an object the repository does not contain.
+// errObjectMissing is returned, as a *missingObjectError, for an object the repository does not contain.
 var errObjectMissing = errors.New("object missing")
+
+type missingObjectError struct{ id sha1ID }
+
+func (e *missingObjectError) Error() string        { return fmt.Sprintf("%v: %x", errObjectMissing, e.id) }
+func (e *missingObjectError) Is(target error) bool { return target == errObjectMissing }
 
 // cutLine splits off the first line of data, including its newline if present.
 func cutLine(data []byte) (line, rest []byte) {
@@ -75,11 +80,12 @@ func translateTree(data []byte, mapID func(mode, name []byte, id sha1ID) (sha256
 	return out, nil
 }
 
-// translateCommit rewrites the tree and parent headers and the tag embedded in mergetag headers.
-// Other headers (author, encoding, gpgsig, ...) and the message are copied verbatim. Unlike git,
-// which refuses to convert commits with unknown headers, those are copied verbatim too, as the
-// transition design defines the content to be unchanged apart from object references.
-func translateCommit(data []byte, mapHex func(string) (string, error)) ([]byte, error) {
+// translateCommit rewrites the tree and parent headers and the tag embedded in mergetag headers,
+// whose object reference is translated by mapMergetag. Other headers (author, encoding, gpgsig, ...)
+// and the message are copied verbatim. Unlike git, which refuses to convert commits with unknown
+// headers, those are copied verbatim too, as the transition design defines the content to be
+// unchanged apart from object references.
+func translateCommit(data []byte, mapHex, mapMergetag func(string) (string, error)) ([]byte, error) {
 	var out bytes.Buffer
 	out.Grow(len(data) + 64)
 	for len(data) > 0 && data[0] != '\n' {
@@ -99,7 +105,7 @@ func translateCommit(data []byte, mapHex func(string) (string, error)) ([]byte, 
 				line, data = cutLine(data)
 				tag = append(tag, line[1:]...)
 			}
-			newTag, err := translateTag(tag, mapHex)
+			newTag, err := translateTag(tag, mapMergetag)
 			if err != nil {
 				return nil, fmt.Errorf("mergetag: %w", err)
 			}
@@ -262,7 +268,7 @@ func (c *catFileBatch) read(id sha1ID) (string, []byte, error) {
 	}
 	fields := strings.Fields(header)
 	if len(fields) == 2 && fields[1] == "missing" {
-		return "", nil, fmt.Errorf("%w: %x", errObjectMissing, id)
+		return "", nil, &missingObjectError{id: id}
 	}
 	if len(fields) != 3 {
 		return "", nil, fmt.Errorf("object %x: %s", id, strings.TrimSpace(header))
@@ -408,6 +414,10 @@ type objectRewriter struct {
 	added    []sha1ID // objects converted in this run, in conversion order
 	gitlinks *gitlinkResolution
 	progress func(converted int)
+
+	// missingMergetags maps objects that mergetags refer to but the repository lacks (e.g. the inner
+	// tag of a tag of a tag, which stayed in the maintainer's repository) to a merge recording one
+	missingMergetags map[string]string
 }
 
 func (r *objectRewriter) convert(id sha1ID, name string) (sha256ID, error) {
@@ -423,7 +433,7 @@ func (r *objectRewriter) convert(id sha1ID, name string) (sha256ID, error) {
 	case "tree":
 		data, err = translateTree(data, r.convertTreeEntry)
 	case "commit":
-		data, err = translateCommit(data, r.convertHex)
+		data, err = translateCommit(data, r.convertHex, func(s string) (string, error) { return r.convertMergetagHex(s, id) })
 	case "tag":
 		data, err = translateTag(data, r.convertHex)
 	default:
@@ -471,6 +481,23 @@ func (r *objectRewriter) convertTreeEntry(mode, name []byte, id sha1ID) (sha256I
 	}
 	r.gitlinks.decided[id] = newID
 	return newID, nil
+}
+
+// convertMergetagHex translates the object of the tag embedded in a mergetag of merge. A mergetag is
+// a copy of a signed tag kept for verification, and git does not require its object: if the
+// repository lacks it, no copy of the repository has it, so it gets the synthetic SHA-256
+// (<sha1> + 24 zeros), as git itself cannot convert such a commit.
+func (r *objectRewriter) convertMergetagHex(s string, merge sha1ID) (string, error) {
+	newHex, err := r.convertHex(s)
+	var missing *missingObjectError
+	if !errors.As(err, &missing) || hex.EncodeToString(missing.id[:]) != s {
+		return newHex, err // translated, or another object is missing (a corrupt repository)
+	}
+	if r.missingMergetags == nil {
+		r.missingMergetags = make(map[string]string)
+	}
+	r.missingMergetags[s] = hex.EncodeToString(merge[:])
+	return s + syntheticSHA256Padding, nil
 }
 
 func (r *objectRewriter) convertHex(s string) (string, error) {
@@ -539,47 +566,48 @@ func (r *objectRewriter) flushChunk() error {
 }
 
 // rewriteObjects converts every object reachable from the mirror's refs that is not yet in ids
-// into packs in targetPath, and returns the converted ids in conversion order.
-func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids map[sha1ID]sha256ID, gitlinks *gitlinkResolution, progress func(int)) ([]sha1ID, error) {
+// into packs in targetPath. It returns the converted ids in conversion order, and the objects
+// mergetags refer to but the repository lacks, with a merge recording each.
+func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids map[sha1ID]sha256ID, gitlinks *gitlinkResolution, progress func(int)) ([]sha1ID, map[string]string, error) {
 	// Parents before children keeps the recursion in convert shallow: commits only recurse into trees
 	commits, err := runCmdContext(ctx, 0, mirrorPath, "git", "rev-list", "--reverse", "--topo-order", "--all")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Tags, and refs pointing directly at trees or blobs, are not listed by rev-list
 	refTargets, err := runCmdContext(ctx, 0, mirrorPath, "git", "for-each-ref", "--format=%(objectname)")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	cat, err := startCatFile(ctx, mirrorPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer cat.close()
 
 	packDir := filepath.Join(targetPath, "objects", "pack")
 	if err := os.MkdirAll(packDir, 0755); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	r := &objectRewriter{ctx: ctx, cat: cat, repoPath: targetPath, packDir: packDir, ids: ids, gitlinks: gitlinks, progress: progress}
 	if err := r.startChunk(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { r.pack.discard() }()
 
 	for _, hexID := range append(strings.Fields(commits), strings.Fields(refTargets)...) {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 		if _, err := r.convertHex(hexID); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	if err := r.flushChunk(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return r.added, nil
+	return r.added, r.missingMergetags, nil
 }
 
 // loadTranslationTable reads a repository's loose-object-idx into a map.
@@ -776,9 +804,12 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err != nil {
 		return err
 	}
-	added, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, progress)
+	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, progress)
 	if err != nil {
 		return err
+	}
+	if len(missingMergetags) > 0 {
+		log.Printf("[%s] %d mergetag object(s) missing from the repository recorded with the synthetic SHA-256", info.RepoName, len(missingMergetags))
 	}
 	if progressWriter != nil {
 		_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: %d objects, done.\n", info.RepoName, len(added))
@@ -789,6 +820,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 		return fmt.Errorf("failed to write loose-object-idx: %w", err)
 	}
 	state.recordGitlinks(gitlinks)
+	state.recordMissingMergetags(missingMergetags)
 	if err := state.save(targetPath); err != nil {
 		return fmt.Errorf("failed to record conversion state: %w", err)
 	}

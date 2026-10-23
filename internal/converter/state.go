@@ -31,6 +31,9 @@ type repoState struct {
 	// config.SyntheticGitlink (URL, or "path:<path>" for a gitlink without URL). A submodule commit
 	// recorded under several submodules has the same SHA-256 under each.
 	Submodules map[string]*submoduleState `json:"submodules,omitempty"`
+	// MissingMergetagObjects maps objects that mergetags refer to but the repository lacks to a
+	// merge recording one; they are translated to the synthetic SHA-256
+	MissingMergetagObjects map[string]string `json:"missing_mergetag_objects,omitempty"`
 }
 
 type submoduleState struct {
@@ -155,11 +158,24 @@ func (s *repoState) recordGitlinks(g *gitlinkResolution) {
 	}
 }
 
+// recordMissingMergetags adds the mergetag objects a conversion found missing.
+func (s *repoState) recordMissingMergetags(missing map[string]string) {
+	for object, merge := range missing {
+		if s.MissingMergetagObjects == nil {
+			s.MissingMergetagObjects = make(map[string]string)
+		}
+		s.MissingMergetagObjects[object] = merge
+	}
+}
+
 // newRepoState starts the state of a conversion, keeping the recorded decisions of the previous one.
 func newRepoState(previous *repoState) *repoState {
 	state := &repoState{ConversionVersion: conversionVersion, EvergitRevision: evergitRevision()}
 	if previous == nil {
 		return state
+	}
+	if previous.ConversionVersion == conversionVersion {
+		state.recordMissingMergetags(previous.MissingMergetagObjects)
 	}
 	state.Submodules = make(map[string]*submoduleState, len(previous.Submodules))
 	for submodule, sub := range previous.Submodules {

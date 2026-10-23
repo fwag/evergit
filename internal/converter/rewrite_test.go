@@ -113,7 +113,7 @@ func TestTranslationMatchesGitCompatObjectFormat(t *testing.T) {
 					return newID, nil
 				})
 			case "commit":
-				got, err = translateCommit([]byte(tc.content), mapHex)
+				got, err = translateCommit([]byte(tc.content), mapHex, mapHex)
 			case "tag":
 				got, err = translateTag([]byte(tc.content), mapHex)
 			}
@@ -140,7 +140,8 @@ func TestTranslateCommitKeepsUnknownHeaders(t *testing.T) {
 	sha1 := strings.Repeat("1", 40)
 	sha256 := strings.Repeat("2", 64)
 	in := "tree " + sha1 + "\nauthor A <a> 1 +0000\ncommitter A <a> 1 +0000\nx-custom value\n continued\n\nmsg\n"
-	got, err := translateCommit([]byte(in), func(string) (string, error) { return sha256, nil })
+	mapHex := func(string) (string, error) { return sha256, nil }
+	got, err := translateCommit([]byte(in), mapHex, mapHex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +332,7 @@ func TestChunksAreCompressed(t *testing.T) {
 	gitRaw(t, "", nil, "init", "-q", "--bare", "--object-format=sha256", target)
 
 	// Without the final repack of a conversion, which would hide uncompressed chunks
-	if _, err := rewriteObjects(context.Background(), up, target, make(map[sha1ID]sha256ID), newGitlinkResolution(nil), nil); err != nil {
+	if _, _, err := rewriteObjects(context.Background(), up, target, make(map[sha1ID]sha256ID), newGitlinkResolution(nil), nil); err != nil {
 		t.Fatal(err)
 	}
 	if !hasDeltas(t, target) {
@@ -550,4 +551,36 @@ func TestNativeSHA256SyncFailedAfterFetchIsRetried(t *testing.T) {
 	if got, want := gitLine(t, info.ServingPath, nil, "--git-dir=.", "rev-parse", "main"), gitLine(t, up, nil, "rev-parse", "HEAD"); got != want {
 		t.Errorf("serving %s, want upstream %s", got, want)
 	}
+}
+
+func TestMergetagObjectMissingFromRepositoryIsSynthetic(t *testing.T) {
+	up := newTestUpstream(t)
+	gitRaw(t, up, nil, "checkout", "-q", "-b", "side")
+	commitToUpstream(t, up, "side")
+	side := gitLine(t, up, nil, "rev-parse", "HEAD")
+	gitRaw(t, up, nil, "checkout", "-q", "main")
+	main := gitLine(t, up, nil, "rev-parse", "HEAD")
+	tree := gitLine(t, up, nil, "rev-parse", "HEAD^{tree}")
+	// Like the kernel's merges of a tag of a tag: the inner tag stayed in the maintainer's repository
+	missing := strings.Repeat("95", 20)
+	ident := "T <t@e> 1700000000 +0000"
+	merge := gitLine(t, up, []byte("tree "+tree+"\nparent "+main+"\nparent "+side+"\nauthor "+ident+"\ncommitter "+ident+"\n"+
+		"mergetag object "+missing+"\n type tag\n tag outer\n tagger "+ident+"\n \n release\n\nMerge tag 'outer'\n"), "hash-object", "-t", "commit", "-w", "--stdin")
+	gitRaw(t, up, nil, "update-ref", "refs/heads/main", merge)
+
+	info := newTestRepoInfo(t, up)
+	if err := NewManager(0).EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	if commit := string(gitRaw(t, info.ServingPath, nil, "--git-dir=.", "cat-file", "commit", "main")); !strings.Contains(commit, "mergetag object "+missing+syntheticSHA256Padding+"\n") {
+		t.Errorf("mergetag object missing from the repository should get the synthetic SHA-256:\n%s", commit)
+	}
+	state, err := loadState(info.ServingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.MissingMergetagObjects[missing]; got != merge {
+		t.Errorf("state records merge %q for the missing mergetag object, want %s", got, merge)
+	}
+	gitRaw(t, info.ServingPath, nil, "--git-dir=.", "fsck", "--no-dangling")
 }
