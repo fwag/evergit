@@ -33,7 +33,12 @@ var ErrDiskSpaceExhausted = errors.New("storage disk space exhausted")
 const DefaultConversionTimeout = 30 * time.Second
 
 // DefaultExecTimeout is the maximum time a repository conversion may run before being terminated.
-const DefaultExecTimeout = 1 * time.Hour
+// A first conversion of the Linux kernel takes about 4 hours on 4 CPUs.
+const DefaultExecTimeout = 12 * time.Hour
+
+// ErrConversionInProgress is returned by EnsureRepoWithin when a repository without a converted
+// copy is still being converted; the conversion continues and a later request may succeed.
+var ErrConversionInProgress = errors.New("repository is being converted")
 
 // DefaultMaxSubmoduleDepth is the maximum nesting of submodules converted for a repository. It only
 // stops runaway nesting: exceeding it fails the conversion rather than changing any SHA-256.
@@ -52,14 +57,13 @@ type Manager struct {
 	repoLocks         map[string]*repoLock
 }
 
-// repoJob tracks an active conversion job and its waiting clients.
+// repoJob tracks an active conversion job. It runs to completion (or until the exec timeout) even
+// when every client waiting for it has gone, so long conversions finish behind proxies with short
+// timeouts instead of being restarted by every request.
 type repoJob struct {
-	mu       sync.Mutex
-	waiters  int
-	cancel   context.CancelFunc
-	canceled bool
-	done     chan struct{}
-	err      error
+	mu   sync.Mutex
+	done chan struct{}
+	err  error
 }
 
 // repoLock is a per-repository mutex, reference-counted so idle entries can be dropped.
@@ -212,6 +216,27 @@ func (m *Manager) EnsureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	return m.EnsureRepoWithDepth(ctx, info, progressWriter, depth)
 }
 
+// EnsureRepoWithin is EnsureRepo for clients behind proxies with short timeouts: it waits at most
+// wait for a running sync or conversion. Then it returns nil if a converted copy can be served
+// (a repository being updated stays consistent for readers), or ErrConversionInProgress. Either
+// way the conversion continues.
+func (m *Manager) EnsureRepoWithin(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, wait time.Duration) error {
+	if wait <= 0 {
+		return m.EnsureRepo(ctx, info, progressWriter)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	err := m.EnsureRepo(waitCtx, info, progressWriter)
+	if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		return err
+	}
+	if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
+		log.Printf("Serving the current copy of %s while it is being updated", info.RepoName)
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrConversionInProgress, info.RepoName)
+}
+
 // EnsureRepoWithDepth checks or converts a repository, converting submodules nested at most depth levels.
 func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
 	return m.ensureRepo(ctx, info, progressWriter, depth, nil)
@@ -263,12 +288,11 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	lock.mu.Lock()
 	for lock.job != nil {
 		job := lock.job
-		if !job.canceled && len(want) == 0 {
+		if len(want) == 0 {
 			lock.mu.Unlock()
-			return m.waitJob(ctx, lock, job)
+			return m.waitJob(ctx, job)
 		}
-		// A canceled job is shutting down, and a running job may not fetch the wanted commits: wait
-		// for it to exit before starting anew
+		// A running job may not fetch the wanted commits: wait for it to exit before starting anew
 		lock.mu.Unlock()
 		select {
 		case <-job.done:
@@ -292,11 +316,11 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	jobCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	// The job outlives this request, but submodule conversions it starts must see the chain
 	jobCtx = context.WithValue(jobCtx, visitedReposKey{}, ctx.Value(visitedReposKey{}))
-	job.cancel = cancel
 	lock.job = job
 	lock.mu.Unlock()
 
 	go func() {
+		defer cancel()
 		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth, want)
 		job.mu.Lock()
 		job.err = err
@@ -315,28 +339,11 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 		m.locksMu.Unlock()
 	}()
 
-	return m.waitJob(ctx, lock, job)
+	return m.waitJob(ctx, job)
 }
 
-func (m *Manager) waitJob(ctx context.Context, lock *repoLock, job *repoJob) error {
-	job.mu.Lock()
-	job.waiters++
-	job.mu.Unlock()
-
-	defer func() {
-		job.mu.Lock()
-		job.waiters--
-		if job.waiters == 0 {
-			select {
-			case <-job.done:
-			default:
-				job.canceled = true
-				job.cancel()
-			}
-		}
-		job.mu.Unlock()
-	}()
-
+// waitJob waits for a job or for ctx; the job keeps running when ctx ends.
+func (m *Manager) waitJob(ctx context.Context, job *repoJob) error {
 	select {
 	case <-job.done:
 		job.mu.Lock()
@@ -483,8 +490,10 @@ func (m *Manager) syncNativeSHA256(ctx context.Context, info *resolver.Repositor
 // asyncWriter forwards writes from a goroutine and drops them when its buffer is full, so a
 // client that stops reading progress cannot stall a conversion holding the repository lock.
 type asyncWriter struct {
-	lines chan []byte
-	done  chan struct{}
+	mu     sync.Mutex
+	closed bool
+	lines  chan []byte
+	done   chan struct{}
 }
 
 func newAsyncWriter(w io.Writer) *asyncWriter {
@@ -498,7 +507,14 @@ func newAsyncWriter(w io.Writer) *asyncWriter {
 	return a
 }
 
+// Write never blocks, and drops lines once the client is gone: a conversion outlives the request
+// that started it.
 func (a *asyncWriter) Write(p []byte) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return len(p), nil
+	}
 	select {
 	case a.lines <- append([]byte(nil), p...):
 	default: // Reader is not keeping up; drop the progress line
@@ -509,7 +525,10 @@ func (a *asyncWriter) Write(p []byte) (int, error) {
 // Close stops accepting writes and gives queued lines a moment to flush, so progress is not
 // interleaved with output written after the conversion. A stalled reader is abandoned.
 func (a *asyncWriter) Close() {
+	a.mu.Lock()
+	a.closed = true
 	close(a.lines)
+	a.mu.Unlock()
 	select {
 	case <-a.done:
 	case <-time.After(time.Second):

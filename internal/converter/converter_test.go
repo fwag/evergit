@@ -1051,21 +1051,71 @@ func TestDiskSpaceSafeguard(t *testing.T) {
 	}
 }
 
-func TestEnsureRepoCancelsWhenWaitersDisconnect(t *testing.T) {
+func TestConversionContinuesAfterClientsDisconnect(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	info := newTestRepoInfo(t, upstreamPath)
 	manager := NewManager(0)
 
+	// The only client is gone at once, e.g. dropped by a proxy timeout
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-canceled context
-
-	err := manager.EnsureRepo(ctx, info, nil)
-	if !errors.Is(err, context.Canceled) {
+	cancel()
+	if err := manager.EnsureRepo(ctx, info, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
 
-	// Wait for background worker cancellation and cleanup to complete before temp dir removal
+	// The conversion still finishes, so a long one is not restarted by every request
 	manager.WaitIdle()
+	if !convertedUpToDate(info) {
+		t.Error("conversion did not finish after its client disconnected")
+	}
+}
+
+func TestEnsureRepoWithinBoundsTheWait(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager(0, 1)
+	manager.SetConversionTimeout(10 * time.Second)
+
+	// A slow first conversion (waiting for a conversion slot): reported as in progress
+	if !manager.TryAcquireConversionSlot() {
+		t.Fatal("no conversion slot")
+	}
+	err := manager.EnsureRepoWithin(context.Background(), info, nil, 100*time.Millisecond)
+	if !errors.Is(err, ErrConversionInProgress) {
+		t.Fatalf("EnsureRepoWithin during a first conversion = %v, want ErrConversionInProgress", err)
+	}
+	manager.ReleaseConversionSlot()
+	manager.WaitIdle()
+	if !convertedUpToDate(info) {
+		t.Fatal("conversion did not finish in the background")
+	}
+
+	// A slow update: the current copy is served meanwhile
+	commitToUpstream(t, upstreamPath, "commit 1")
+	if !manager.TryAcquireConversionSlot() {
+		t.Fatal("no conversion slot")
+	}
+	start := time.Now()
+	if err := manager.EnsureRepoWithin(context.Background(), info, nil, 100*time.Millisecond); err != nil {
+		t.Fatalf("EnsureRepoWithin during an update = %v, want the current copy served", err)
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Errorf("waited %v for the update", waited)
+	}
+	manager.ReleaseConversionSlot()
+	manager.WaitIdle()
+	if !convertedUpToDate(info) {
+		t.Error("update did not finish in the background")
+	}
+}
+
+func TestProgressWrittenAfterClientLeftIsDropped(t *testing.T) {
+	var out strings.Builder
+	w := newAsyncWriter(&out)
+	w.Close()
+	if _, err := w.Write([]byte("late progress\n")); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestEnsureRepoContinuesForRemainingWaiters(t *testing.T) {

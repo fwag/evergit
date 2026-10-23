@@ -61,7 +61,7 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 		// SHA-1 <-> SHA-256 id lookups: /<repo>/sha1/<id> and /<repo>/sha256/<id>
 		if m := idLookupPath.FindStringSubmatch(r.URL.Path); m != nil {
 			if info, err := resolver.ParsePath(m[1], cfg); err == nil {
-				serveIDLookup(w, r.Context(), conv, info, m[2], m[3])
+				serveIDLookup(w, r.Context(), conv, info, m[2], m[3], cfg.RequestWait)
 				return
 			}
 		}
@@ -88,7 +88,7 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 
 		// Run JIT clone and conversion if necessary
 		log.Printf("[HTTP] Ensuring repository %s is available & converted...", info.RepoName)
-		if err := conv.EnsureRepo(r.Context(), info, nil); err != nil {
+		if err := conv.EnsureRepoWithin(r.Context(), info, nil, cfg.RequestWait); err != nil {
 			writeConversionError(w, info, err)
 			return
 		}
@@ -109,6 +109,11 @@ func writeConversionError(w http.ResponseWriter, info *resolver.RepositoryInfo, 
 		http.Error(w, "Evergit: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	if errors.Is(err, converter.ErrConversionInProgress) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "Evergit: "+err.Error()+"; this can take a while for large repositories, please retry later", http.StatusServiceUnavailable)
+		return
+	}
 	if errors.Is(err, converter.ErrSubmoduleNotApproved) {
 		http.Error(w, "Evergit: "+err.Error(), http.StatusForbidden)
 		return
@@ -124,8 +129,8 @@ func writeConversionError(w http.ResponseWriter, info *resolver.RepositoryInfo, 
 var idLookupPath = regexp.MustCompile(`^/(.+)/(sha1|sha256)/([^/]+)$`)
 
 // serveIDLookup answers with the id of the same object in the other hash format, as plain text.
-func serveIDLookup(w http.ResponseWriter, ctx context.Context, conv *converter.Manager, info *resolver.RepositoryInfo, format, id string) {
-	if err := conv.EnsureRepo(ctx, info, nil); err != nil {
+func serveIDLookup(w http.ResponseWriter, ctx context.Context, conv *converter.Manager, info *resolver.RepositoryInfo, format, id string, wait time.Duration) {
+	if err := conv.EnsureRepoWithin(ctx, info, nil, wait); err != nil {
 		writeConversionError(w, info, err)
 		return
 	}

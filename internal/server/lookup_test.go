@@ -257,6 +257,54 @@ func TestUnavailableSubmoduleReturns503WithRetryHint(t *testing.T) {
 	}
 }
 
+func TestLongConversionReturns503AndFinishesInBackground(t *testing.T) {
+	tempDir := t.TempDir()
+	upstreamPath := filepath.Join(tempDir, "upstream")
+	if _, err := runCmd("", "git", "init", "-q", "--initial-branch=main", "--object-format=sha1", upstreamPath); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
+	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
+	if _, err := runCmd(upstreamPath, "git", "commit", "-q", "--allow-empty", "-m", "initial"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		StorageRoot:       filepath.Join(tempDir, "storage"),
+		AllowedHosts:      []string{"github.com"},
+		UpstreamOverrides: map[string]string{"github.com": upstreamPath},
+		RequestWait:       100 * time.Millisecond,
+	}
+	conv := converter.NewManager(0, 1)
+	conv.SetConversionTimeout(10 * time.Second)
+	httpServer, err := server.NewHTTPServer(cfg, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "/github.com/owner/repo.git/info/refs?service=git-upload-pack", nil)
+		rec := httptest.NewRecorder()
+		httpServer.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// The conversion outlasts the request wait (it waits for the only conversion slot)
+	if !conv.TryAcquireConversionSlot() {
+		t.Fatal("no conversion slot")
+	}
+	rec := get()
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), "retry later") {
+		t.Errorf("status %d, Retry-After %q, body %q; want 503 asking to retry", rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
+	}
+
+	// It finishes without any client waiting, and the next request is served
+	conv.ReleaseConversionSlot()
+	conv.WaitIdle()
+	if rec := get(); rec.Code != http.StatusOK {
+		t.Errorf("after the conversion: status %d, want 200", rec.Code)
+	}
+}
+
 func TestPushRequestsAreRejectedEarlyWith403(t *testing.T) {
 	tempDir := t.TempDir()
 	cfg := &config.Config{

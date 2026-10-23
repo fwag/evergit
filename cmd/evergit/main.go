@@ -26,6 +26,8 @@ func main() {
 	cacheTTLStr := flag.String("ttl", "", "Cache TTL (e.g. 30s, 5m, 1h, 0 to disable cache; default: 30s)")
 	maxConversionsFlag := flag.Int("max-conversions", 0, "Maximum concurrent JIT conversions (0 = CPU count)")
 	minFreeDiskFlag := flag.Int("min-free-disk", -1, "Minimum free disk space in GB required before cloning new mirrors (default: 1)")
+	requestWaitStr := flag.String("request-wait", "", "How long a request waits for a running conversion before serving the current copy or answering 503; keep below the proxy timeout (default: 20s, 0 to wait for the end)")
+	maxConversionTimeStr := flag.String("max-conversion-time", "", "Maximum duration of a single sync or conversion (default: 12h)")
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
 	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
 	syntheticGitlinks := flag.String("synthetic-gitlinks", "", "File of \"<superproject> <submodule>\" lines approving synthetic SHA-256s for submodules that cannot be converted")
@@ -71,6 +73,20 @@ func main() {
 	if *minFreeDiskFlag >= 0 {
 		cfg.MinFreeDiskGB = *minFreeDiskFlag
 	}
+	if *requestWaitStr != "" {
+		wait, err := time.ParseDuration(*requestWaitStr)
+		if err != nil || wait < 0 {
+			log.Fatalf("Invalid request wait %q", *requestWaitStr)
+		}
+		cfg.RequestWait = wait
+	}
+	if *maxConversionTimeStr != "" {
+		limit, err := time.ParseDuration(*maxConversionTimeStr)
+		if err != nil || limit <= 0 {
+			log.Fatalf("Invalid maximum conversion time %q", *maxConversionTimeStr)
+		}
+		cfg.MaxConversionTime = limit
+	}
 	if *debugFlag {
 		cfg.Debug = true
 	}
@@ -90,6 +106,8 @@ func main() {
 	log.Printf("Cache TTL:       %v", cfg.CacheTTL)
 	log.Printf("Max conversions: %d", cfg.MaxConversions)
 	log.Printf("Min free disk:   %d GB", cfg.MinFreeDiskGB)
+	log.Printf("Request wait:    %v", cfg.RequestWait)
+	log.Printf("Max conversion:  %v", cfg.MaxConversionTime)
 	log.Printf("Debug:           %v", cfg.Debug)
 	if cfg.PublicURL != "" {
 		log.Printf("Public URL:      %s", cfg.PublicURL)
@@ -127,6 +145,7 @@ func main() {
 	convManager := converter.NewManager(cfg.CacheTTL, cfg.MaxConversions)
 	convManager.SetConfig(cfg)
 	convManager.SetMinFreeDisk(uint64(cfg.MinFreeDiskGB) * 1024 * 1024 * 1024)
+	convManager.SetExecTimeout(cfg.MaxConversionTime)
 	convManager.SetDebug(cfg.Debug)
 
 	// Start SSH Server

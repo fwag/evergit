@@ -213,7 +213,13 @@ func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCm
 	log.Printf("[SSH] Ensuring repository %s is available & converted...", info.RepoName)
 	_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: Checking cache for %s...\n", info.RepoName)
 
-	if err := s.converter.EnsureRepo(ctx, info, ch.Stderr()); err != nil {
+	// An existing copy is served while it is updated; a first conversion keeps the client waiting,
+	// as the progress written to it keeps the connection alive
+	err = s.converter.EnsureRepoWithin(ctx, info, ch.Stderr(), s.cfg.RequestWait)
+	if errors.Is(err, converter.ErrConversionInProgress) {
+		err = s.converter.EnsureRepo(ctx, info, ch.Stderr())
+	}
+	if err != nil {
 		log.Printf("[SSH] JIT conversion failed for %s: %v", info.RepoName, err)
 		if errors.Is(err, converter.ErrServerBusy) {
 			_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: error: server busy with other conversions, please retry shortly\n")

@@ -25,7 +25,13 @@ type Config struct {
 	CacheTTL       time.Duration
 	MaxConversions int
 	MinFreeDiskGB  int
-	Debug          bool
+	// RequestWait is how long a request waits for a running sync or conversion before the current
+	// copy is served, or a first conversion is reported as in progress; keep it below the proxy's
+	// timeout. 0 waits until the conversion ends.
+	RequestWait time.Duration
+	// MaxConversionTime bounds a single sync or conversion
+	MaxConversionTime time.Duration
+	Debug             bool
 	// AllowedHosts lists the upstream hosts clients may request; anything else is rejected
 	AllowedHosts []string
 	// Shorthands maps short prefix aliases to their target domains (e.g. "github" -> "github.com")
@@ -70,6 +76,19 @@ func Load() *Config {
 		}
 	}
 
+	requestWait := 20 * time.Second
+	if env := os.Getenv("EVERGIT_REQUEST_WAIT"); env != "" {
+		if val, err := time.ParseDuration(env); err == nil && val >= 0 {
+			requestWait = val
+		}
+	}
+	maxConversionTime := 12 * time.Hour
+	if env := os.Getenv("EVERGIT_MAX_CONVERSION_TIME"); env != "" {
+		if val, err := time.ParseDuration(env); err == nil && val > 0 {
+			maxConversionTime = val
+		}
+	}
+
 	debug := os.Getenv("EVERGIT_DEBUG") == "1" || strings.EqualFold(os.Getenv("EVERGIT_DEBUG"), "true")
 
 	return &Config{
@@ -81,9 +100,12 @@ func Load() *Config {
 		CacheTTL:       cacheTTL,
 		MaxConversions: maxConversions,
 		MinFreeDiskGB:  minFreeDiskGB,
-		Debug:          debug,
-		AllowedHosts:   ParseHostList(getEnv("EVERGIT_ALLOWED_HOSTS", strings.Join(DefaultAllowedHosts, ","))),
-		Shorthands:     ParseShorthands(getEnv("EVERGIT_SHORTHANDS", DefaultShorthands)),
+
+		RequestWait:       requestWait,
+		MaxConversionTime: maxConversionTime,
+		Debug:             debug,
+		AllowedHosts:      ParseHostList(getEnv("EVERGIT_ALLOWED_HOSTS", strings.Join(DefaultAllowedHosts, ","))),
+		Shorthands:        ParseShorthands(getEnv("EVERGIT_SHORTHANDS", DefaultShorthands)),
 
 		SyntheticGitlinksFile: os.Getenv("EVERGIT_SYNTHETIC_GITLINKS"),
 	}

@@ -44,6 +44,8 @@ go build -o evergit ./cmd/evergit
 - `-storage`: Directory path for storing host keys, cache mirrors, and converted repositories (default: `./storage`)
 - `-ttl`: Cache duration before checking upstream for updates; also settable via `EVERGIT_CACHE_TTL` (default: `30s`, pass `0` to check upstream on every fetch)
 - `-max-conversions`: Maximum concurrent JIT conversions; also settable via `EVERGIT_MAX_CONVERSIONS` (default: CPU count)
+- `-request-wait`: How long a request waits for a running sync or conversion; also settable via `EVERGIT_REQUEST_WAIT` (default: `20s`, `0` waits until the end). After it, an existing copy is served (it stays consistent while being updated) and a first conversion is answered with HTTP 503 and `Retry-After`; over SSH a first conversion keeps the client waiting with progress. Conversions always continue when clients disconnect. Keep it below the reverse proxy's timeout.
+- `-max-conversion-time`: Maximum duration of a single sync or conversion; also settable via `EVERGIT_MAX_CONVERSION_TIME` (default: `12h`; a first conversion of the Linux kernel takes about 4 hours on 4 CPUs).
 - `-min-free-disk`: Minimum free disk in GB required before cloning new mirrors; also settable via `EVERGIT_MIN_FREE_DISK_GB` (default: `1`)
 - `-debug`: Enable debug logging; also settable via `EVERGIT_DEBUG` (default: `false`)
 - `-allowed-hosts`: Comma-separated upstream hosts clients may request; also settable via `EVERGIT_ALLOWED_HOSTS` (default: `github.com,gitlab.com,bitbucket.org`). Self-hosted forges must be added explicitly.
