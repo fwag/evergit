@@ -26,10 +26,10 @@ gitlab.com/libvirt/libvirt	path:.gnulib dir
 		t.Errorf("got %+v, want %+v", got, want)
 	}
 
-	if !ApprovesSynthetic(got, "github.com/any/repo", "https://git.savannah.gnu.org/git/gnulib.git/") {
-		t.Error("wildcard entry should approve any superproject")
+	if e, ok := FindSyntheticApproval(got, "github.com/any/repo", "https://git.savannah.gnu.org/git/gnulib.git/"); !ok || e.String() != "* https://git.savannah.gnu.org/git/gnulib.git/" {
+		t.Errorf("wildcard entry should approve any superproject, got %q, %v", e, ok)
 	}
-	if ApprovesSynthetic(got, "github.com/other/repo", "git://git.sv.gnu.org/gnulib.git") {
+	if _, ok := FindSyntheticApproval(got, "github.com/other/repo", "git://git.sv.gnu.org/gnulib.git"); ok {
 		t.Error("entry for libvirt should not approve another superproject")
 	}
 }

@@ -33,12 +33,6 @@ import (
 type sha1ID = [20]byte
 type sha256ID = [32]byte
 
-// rewriteMarkerFile records that a serving repository is a complete object-level conversion, so
-// repositories converted otherwise (e.g. by older versions with fast-export) are rebuilt rather
-// than extended.
-const rewriteMarkerFile = "evergit-conversion"
-const rewriteMarker = "object-rewrite\n"
-
 // signatureMarkers are the lines that start an in-body tag signature (git's gpg-interface.c).
 var signatureMarkers = []string{
 	"-----BEGIN PGP SIGNATURE-----",
@@ -699,20 +693,6 @@ func updateRefsFromMirror(ctx context.Context, mirrorPath, targetPath string, id
 	return nil
 }
 
-// writeGitlinkDecisions atomically records the SHA-256 decided for each submodule commit.
-func writeGitlinkDecisions(repoPath string, decided map[sha1ID]sha256ID) error {
-	lines := make([]string, 0, len(decided))
-	for oldID, newID := range decided {
-		lines = append(lines, fmt.Sprintf("%x %x\n", newID, oldID))
-	}
-	slices.Sort(lines)
-	path := filepath.Join(repoPath, gitlinksFile)
-	if err := os.WriteFile(path+".tmp", []byte(strings.Join(lines, "")), 0644); err != nil {
-		return err
-	}
-	return os.Rename(path+".tmp", path)
-}
-
 // maxPacksBeforeRepack is how many packs incremental conversions may accumulate before the serving
 // repository is repacked.
 const maxPacksBeforeRepack = 8
@@ -743,9 +723,11 @@ func repackConverted(ctx context.Context, repoPath string, incremental bool, pro
 	return nil
 }
 
+// isIncrementalRewrite reports whether a serving repository is a complete conversion with the
+// current rules, which can be extended. Anything else (another conversion version, a repository
+// converted by older versions with fast-export, a lost translation table) is rebuilt.
 func isIncrementalRewrite(servingPath string) bool {
-	marker, err := os.ReadFile(filepath.Join(servingPath, rewriteMarkerFile))
-	if err != nil || string(marker) != rewriteMarker {
+	if currentState(servingPath) == nil {
 		return false
 	}
 	for _, file := range []string{"HEAD", filepath.Join("objects", "loose-object-idx")} {
@@ -764,6 +746,8 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	}
 
 	incremental := isIncrementalRewrite(info.ServingPath)
+	previous, _ := loadState(info.ServingPath)
+	state := newRepoState(previous)
 	targetPath := info.ServingPath
 	ids := make(map[sha1ID]sha256ID)
 	if incremental {
@@ -804,8 +788,9 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err := writeTranslationTable(targetPath, incremental, ids, added); err != nil {
 		return fmt.Errorf("failed to write loose-object-idx: %w", err)
 	}
-	if err := writeGitlinkDecisions(targetPath, gitlinks.decided); err != nil {
-		return fmt.Errorf("failed to record gitlinks: %w", err)
+	state.recordGitlinks(gitlinks)
+	if err := state.save(targetPath); err != nil {
+		return fmt.Errorf("failed to record conversion state: %w", err)
 	}
 	if err := updateRefsFromMirror(ctx, info.MirrorPath, targetPath, ids); err != nil {
 		return err
@@ -817,9 +802,6 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	}
 	// Repacking after the refs are set orders the pack and its bitmap by reachability
 	if err := repackConverted(ctx, targetPath, incremental, progressWriter, info.RepoName); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(targetPath, rewriteMarkerFile), []byte(rewriteMarker), 0644); err != nil {
 		return err
 	}
 	return m.publishConversion(info, targetPath, incremental)

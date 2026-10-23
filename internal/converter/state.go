@@ -1,0 +1,200 @@
+package converter
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"slices"
+)
+
+// conversionVersion identifies the rules that translate SHA-1 objects to SHA-256 objects. Bump it
+// whenever a change could alter any object id: serving repositories recorded with another version
+// are rebuilt, never extended. Object ids do not depend on the installed git version (see
+// rewrite.go), so git upgrades do not require a bump.
+const conversionVersion = 1
+
+// stateFile records how a serving repository was converted, in its git directory (never served).
+const stateFile = "evergit-state.json"
+
+// repoState is the content of stateFile.
+type repoState struct {
+	ConversionVersion int `json:"conversion_version"`
+	// EvergitRevision is the build that last converted the repository, for diagnostics only
+	EvergitRevision string `json:"evergit_revision,omitempty"`
+	// Submodules records the SHA-256 decided for every submodule commit, by submodule as in
+	// config.SyntheticGitlink (URL, or "path:<path>" for a gitlink without URL). A submodule commit
+	// recorded under several submodules has the same SHA-256 under each.
+	Submodules map[string]*submoduleState `json:"submodules,omitempty"`
+}
+
+type submoduleState struct {
+	// Translated maps submodule commits to their real SHA-256
+	Translated map[string]string `json:"translated,omitempty"`
+	// Synthetic lists commits recorded with the synthetic SHA-256 (<sha1> + 24 zeros)
+	Synthetic []syntheticDecision `json:"synthetic,omitempty"`
+}
+
+type syntheticDecision struct {
+	Reason     string   `json:"reason"`
+	ApprovedBy string   `json:"approved_by"` // the approval line that allowed it
+	Commits    []string `json:"commits"`
+}
+
+// loadState reads a serving repository's state; os.ErrNotExist if it has none.
+func loadState(repoPath string) (*repoState, error) {
+	data, err := os.ReadFile(filepath.Join(repoPath, stateFile))
+	if err != nil {
+		return nil, err
+	}
+	var state repoState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("invalid %s in %s: %w", stateFile, repoPath, err)
+	}
+	return &state, nil
+}
+
+// save atomically writes the state into repoPath.
+func (s *repoState) save(repoPath string) error {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(repoPath, stateFile)
+	if err := os.WriteFile(path+".tmp", append(data, '\n'), 0644); err != nil {
+		return err
+	}
+	return os.Rename(path+".tmp", path)
+}
+
+// gitlinkDecisions returns the SHA-256 recorded for each submodule commit. Real translations are
+// only kept if the repository was converted with the current rules, since the submodules are
+// rebuilt with them otherwise; synthetic ones do not depend on the rules.
+func (s *repoState) gitlinkDecisions() (map[sha1ID]sha256ID, error) {
+	decided := make(map[sha1ID]sha256ID)
+	add := func(oldHex, newHex string) error {
+		oldID, err := parseSHA1Hex(oldHex)
+		if err != nil {
+			return err
+		}
+		var newID sha256ID
+		if len(newHex) != 2*len(newID) {
+			return fmt.Errorf("invalid SHA-256 %q for submodule commit %s", newHex, oldHex)
+		}
+		if _, err := hex.Decode(newID[:], []byte(newHex)); err != nil {
+			return fmt.Errorf("invalid SHA-256 %q for submodule commit %s", newHex, oldHex)
+		}
+		decided[oldID] = newID
+		return nil
+	}
+	for _, sub := range s.Submodules {
+		for _, d := range sub.Synthetic {
+			for _, c := range d.Commits {
+				if err := add(c, c+syntheticSHA256Padding); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if s.ConversionVersion != conversionVersion {
+			continue
+		}
+		for oldHex, newHex := range sub.Translated {
+			if err := add(oldHex, newHex); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return decided, nil
+}
+
+// recordGitlinks adds the decisions of a conversion, under the submodules that recorded them.
+func (s *repoState) recordGitlinks(g *gitlinkResolution) {
+	if s.Submodules == nil {
+		s.Submodules = make(map[string]*submoduleState)
+	}
+	submodules := make([]string, 0, len(g.recorded))
+	for submodule := range g.recorded {
+		submodules = append(submodules, submodule)
+	}
+	slices.Sort(submodules)
+	for _, submodule := range submodules {
+		sub := s.Submodules[submodule]
+		if sub == nil {
+			sub = &submoduleState{}
+			s.Submodules[submodule] = sub
+		}
+		var synthetic []string
+		for _, c := range g.recorded[submodule] {
+			id, err := parseSHA1Hex(c)
+			if err != nil {
+				continue
+			}
+			newID, ok := g.decided[id]
+			if !ok {
+				continue // not reached by the conversion
+			}
+			if newHex := hex.EncodeToString(newID[:]); newHex == c+syntheticSHA256Padding {
+				synthetic = append(synthetic, c)
+			} else {
+				if sub.Translated == nil {
+					sub.Translated = make(map[string]string)
+				}
+				sub.Translated[c] = newHex
+			}
+		}
+		if len(synthetic) > 0 {
+			slices.Sort(synthetic)
+			why := g.synthetic[submodule]
+			sub.Synthetic = append(sub.Synthetic, syntheticDecision{Reason: why.Reason, ApprovedBy: why.ApprovedBy, Commits: synthetic})
+		}
+	}
+}
+
+// newRepoState starts the state of a conversion, keeping the recorded decisions of the previous one.
+func newRepoState(previous *repoState) *repoState {
+	state := &repoState{ConversionVersion: conversionVersion, EvergitRevision: evergitRevision()}
+	if previous == nil {
+		return state
+	}
+	state.Submodules = make(map[string]*submoduleState, len(previous.Submodules))
+	for submodule, sub := range previous.Submodules {
+		kept := &submoduleState{Synthetic: sub.Synthetic}
+		if previous.ConversionVersion == conversionVersion {
+			kept.Translated = sub.Translated
+		}
+		state.Submodules[submodule] = kept
+	}
+	return state
+}
+
+// evergitRevision returns the VCS revision the binary was built from, if known.
+func evergitRevision() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	revision, modified := "", false
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			modified = s.Value == "true"
+		}
+	}
+	if revision != "" && modified {
+		revision += "-modified"
+	}
+	return revision
+}
+
+// currentState returns the state of a serving repository converted with the current rules, or nil.
+func currentState(servingPath string) *repoState {
+	state, err := loadState(servingPath)
+	if err != nil || state.ConversionVersion != conversionVersion {
+		return nil
+	}
+	return state
+}

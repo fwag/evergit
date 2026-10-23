@@ -127,16 +127,16 @@ Goal: the same SHA-1 history always converts to the same SHA-256 history, across
   - [x] Fail the conversion when a submodule has a temporary problem (busy, unreachable, cancelled), never pad; no automatic retry. HTTP 503 with `Retry-After`, SSH message asking to retry.
   - [x] No synthetic SHA-256 without administrator approval: a gitlink without URL, a host outside `-allowed-hosts`, an unusable URL or a repository/commit gone upstream fails the conversion (HTTP 403) with the suggested approval line, until the host is allowed or the submodule is approved in the `-synthetic-gitlinks` file (re-read at every conversion).
   - [x] Refresh a submodule within its TTL when it lacks a recorded commit, and fetch commits that no branch or tag reaches by id (pinned under `refs/evergit-pinned/`).
-  - [x] Record every gitlink decision (`evergit-gitlinks`) and reuse it in incremental conversions and rebuilds.
+  - [x] Record every gitlink decision in `evergit-state.json` (by submodule, with reason and approval for synthetic ones) and reuse it in incremental conversions and rebuilds.
   - [x] Convert a repository's submodules the same way however it is reached (the depth limit, now 10, fails instead of padding), so a repository's SHA-256 no longer depends on request order.
   - [x] Submodule cycles fail clearly instead of deadlocking; the visited set is propagated into the conversion job. A submodule pointing into its own repository is translated from its own objects.
   - [ ] Cycles between repositories that are resolvable commit by commit (A@v2 -> B@v1 -> A@v1) still fail; converting them would need cross-repository translation.
 - [ ] **Stale serving after a failed conversion**
   - [ ] When a conversion fails after a successful fetch (e.g. `ErrServerBusy`), the next request sees an unchanged mirror, reports success and serves the old version until upstream changes again. Decide "changed" against a record of the last successful conversion instead of the mirror before the fetch.
-- [ ] **Conversion spec versioning**
-  - [ ] Spec version constant and per-repository state file (replacing the `evergit-conversion` marker); rebuild on mismatch.
-  - [ ] Golden corpus of fixture repositories with expected SHA-256 refs; startup canary refusing conversions when the output changed.
-  - [ ] Optional `-git-path` to pin the git binary; CI against several git versions.
+- [x] **Conversion versioning**
+  - [x] `conversionVersion` recorded in each serving repository's `evergit-state.json` (with the evergit revision, for diagnostics); a repository recorded with another version is rebuilt, keeping synthetic gitlink decisions.
+  - [x] Golden test pinning the SHA-256 of a fixed SHA-1 history; a change requires bumping `conversionVersion`.
+  - Not needed since object-level conversion: object ids no longer depend on the git version (git only reads objects, indexes and repacks the bytes Evergit writes), so no startup canary, `-git-path` or git version matrix.
 - [ ] **Scaling limits**
   - [ ] The SHA-1 -> SHA-256 table is held in memory (~100 bytes per object, ~1 GB for the Linux kernel) and blobs are read whole.
   - [ ] Incremental pack merges run `repack -f` every 8 updates, which can take minutes on large repositories while clients wait.

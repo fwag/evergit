@@ -78,10 +78,6 @@ func markGone(err error) error {
 	return err
 }
 
-// gitlinksFile records the SHA-256 decided for every submodule commit of a serving repository, in
-// the format of loose-object-idx.
-const gitlinksFile = "evergit-gitlinks"
-
 type submoduleEntry struct {
 	Name string
 	Path string
@@ -287,13 +283,23 @@ type gitlinkResolution struct {
 	decided map[sha1ID]sha256ID // extended with every decision of this conversion
 	tables  []map[string]string // sha1 -> sha256 of converted submodules
 	padded  map[string]bool
+
+	// For the conversion state: the commits each submodule records that this conversion decides,
+	// and why the synthetic ones were approved
+	recorded  map[string][]string
+	synthetic map[string]syntheticDecision
 }
 
 func newGitlinkResolution(decided map[sha1ID]sha256ID) *gitlinkResolution {
 	if decided == nil {
 		decided = make(map[sha1ID]sha256ID)
 	}
-	return &gitlinkResolution{decided: decided, padded: make(map[string]bool)}
+	return &gitlinkResolution{
+		decided:   decided,
+		padded:    make(map[string]bool),
+		recorded:  make(map[string][]string),
+		synthetic: make(map[string]syntheticDecision),
+	}
 }
 
 // resolve returns the SHA-256 for a submodule commit, or ok=false if it must be one of the
@@ -327,14 +333,19 @@ func (g *gitlinkResolution) resolve(id sha1ID) (newID sha256ID, ok bool, err err
 // resolveGitlinks converts the submodules of the commits the conversion will add and decides the
 // SHA-256 of every submodule commit they record. Earlier decisions are kept, also across rebuilds.
 func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) (*gitlinkResolution, error) {
-	decided, err := loadTranslationFile(filepath.Join(info.ServingPath, gitlinksFile))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("failed to load recorded gitlinks: %w", err)
+	var decided map[sha1ID]sha256ID
+	if previous, err := loadState(info.ServingPath); err == nil {
+		if decided, err = previous.gitlinkDecisions(); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
 	res := newGitlinkResolution(decided)
 
 	var exclude []string
 	if isIncrementalRewrite(info.ServingPath) {
+		var err error
 		if exclude, err = convertedTips(info.ServingPath); err != nil {
 			return nil, err
 		}
@@ -376,6 +387,7 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 			continue
 		}
 		slices.Sort(pending)
+		res.recorded[submodule] = pending
 
 		synthetic := func(commits []string, reason string) {
 			problems = append(problems, problem{submodule: submodule, reason: reason, commits: commits})
@@ -431,15 +443,17 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 		if len(remaining) == 0 {
 			continue
 		}
-		if !config.ApprovesSynthetic(approvals, superproject, p.submodule) {
+		approval, ok := config.FindSyntheticApproval(approvals, superproject, p.submodule)
+		if !ok {
 			unapproved = append(unapproved, p.submodule)
 			unapprovedReasons = append(unapprovedReasons, fmt.Sprintf("  %s: %s (%d commit(s))\n", p.submodule, p.reason, len(remaining)))
 			continue
 		}
-		log.Printf("[%s] Recording %d commit(s) of submodule %q with the synthetic SHA-256 as approved: %s", info.RepoName, len(remaining), p.submodule, p.reason)
+		log.Printf("[%s] Recording %d commit(s) of submodule %q with the synthetic SHA-256 as approved by %q: %s", info.RepoName, len(remaining), p.submodule, approval, p.reason)
 		for _, c := range remaining {
 			res.padded[c] = true
 		}
+		res.synthetic[p.submodule] = syntheticDecision{Reason: p.reason, ApprovedBy: approval.String()}
 	}
 	if len(unapproved) > 0 {
 		var hint strings.Builder

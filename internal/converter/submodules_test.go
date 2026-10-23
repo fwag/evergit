@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -335,15 +336,30 @@ func TestGitlinkDecisionsAreKept(t *testing.T) {
 		t.Errorf("incremental conversion translated the gitlink to %s, earlier to %s", got, padded)
 	}
 
-	// Nor must a rebuild
-	if err := os.Remove(filepath.Join(info.ServingPath, rewriteMarkerFile)); err != nil {
-		t.Fatal(err)
-	}
+	// Nor must a rebuild, e.g. for new conversion rules: synthetic decisions do not depend on them
+	build := gitLine(t, "", nil, "-C", info.ServingPath, "rev-parse", "--absolute-git-dir")
+	setConversionVersion(t, info.ServingPath, conversionVersion-1)
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
+	if rebuilt := gitLine(t, "", nil, "-C", info.ServingPath, "rev-parse", "--absolute-git-dir"); rebuilt == build {
+		t.Fatal("repository converted with other rules was not rebuilt")
+	}
 	if got := gitlinkOf(t, info.ServingPath, "HEAD", "dir/sub"); got != padded {
 		t.Errorf("rebuild translated the gitlink to %s, earlier to %s", got, padded)
+	}
+}
+
+// setConversionVersion rewrites a serving repository's state as if converted with other rules.
+func setConversionVersion(t *testing.T, servingPath string, version int) {
+	t.Helper()
+	state, err := loadState(servingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.ConversionVersion = version
+	if err := state.save(servingPath); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -385,5 +401,47 @@ func TestMarkGoneClassifiesUpstreamErrors(t *testing.T) {
 		if gone := errors.Is(markGone(errors.New(tc.stderr)), errUpstreamGone); gone != tc.gone {
 			t.Errorf("markGone(%q) gone = %v, want %v", tc.stderr, gone, tc.gone)
 		}
+	}
+}
+
+func TestStateRecordsSubmoduleDecisions(t *testing.T) {
+	sub := newTestUpstream(t)
+	subCommit := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	gone := newTestUpstream(t)
+	commitToUpstream(t, gone, "only in the gone repository") // not the same commit as sub's
+	goneCommit := gitLine(t, gone, nil, "rev-parse", "HEAD")
+	super := newTestUpstream(t)
+	addGitlink(t, super, "sub", sub, subCommit)
+	addGitlink(t, super, "gone", gone, goneCommit)
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	info := repoInfoAt(root, super, "super")
+	m := newSubmoduleManager(root, 0)
+	approveSynthetic(t, m, "local/test/super "+gone)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := loadState(info.ServingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ConversionVersion != conversionVersion {
+		t.Errorf("conversion_version = %d, want %d", state.ConversionVersion, conversionVersion)
+	}
+	want, err := LookupID(submoduleServingPath(root, sub), "sha1", subCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Submodules[sub].Translated[subCommit]; got != want {
+		t.Errorf("state records %s for submodule %s commit %s, want %s", got, sub, subCommit, want)
+	}
+	synthetic := state.Submodules[gone].Synthetic
+	if len(synthetic) != 1 || !slices.Equal(synthetic[0].Commits, []string{goneCommit}) ||
+		synthetic[0].ApprovedBy != "local/test/super "+gone || !strings.Contains(synthetic[0].Reason, "gone upstream") {
+		t.Errorf("synthetic decisions of %s = %+v, want commit %s approved by its line, gone upstream", gone, synthetic, goneCommit)
 	}
 }

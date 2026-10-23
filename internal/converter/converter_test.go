@@ -509,7 +509,7 @@ func TestFullConversionNeverHidesServingRepo(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		commitToUpstream(t, upstreamPath, fmt.Sprintf("commit %d", i))
 		// Dropping the marker forces the full conversion path
-		_ = os.Remove(filepath.Join(info.ServingPath, rewriteMarkerFile))
+		_ = os.Remove(filepath.Join(info.ServingPath, stateFile))
 		if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
 			t.Fatalf("EnsureRepo %d failed: %v", i, err)
 		}

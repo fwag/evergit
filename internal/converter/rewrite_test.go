@@ -418,7 +418,7 @@ func TestChunkedPacksGiveSameRepository(t *testing.T) {
 	}
 }
 
-func TestConversionWithoutMarkerIsRebuilt(t *testing.T) {
+func TestConversionWithoutStateIsRebuilt(t *testing.T) {
 	up := newTestUpstream(t)
 	info := newTestRepoInfo(t, up)
 	m := NewManager(0)
@@ -427,14 +427,72 @@ func TestConversionWithoutMarkerIsRebuilt(t *testing.T) {
 	}
 	build := gitLine(t, "", nil, "-C", info.ServingPath, "rev-parse", "--absolute-git-dir")
 
-	// As left by older versions, which converted with fast-export
-	if err := os.Remove(filepath.Join(info.ServingPath, rewriteMarkerFile)); err != nil {
+	// As left by older versions, which converted with fast-export and recorded no state
+	if err := os.Remove(filepath.Join(info.ServingPath, stateFile)); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
 	if rebuilt := gitLine(t, "", nil, "-C", info.ServingPath, "rev-parse", "--absolute-git-dir"); rebuilt == build || !isIncrementalRewrite(info.ServingPath) {
-		t.Errorf("repository without marker was not rebuilt (build %s, now %s)", build, rebuilt)
+		t.Errorf("repository without state was not rebuilt (build %s, now %s)", build, rebuilt)
+	}
+}
+
+// newGoldenUpstream builds a fixed SHA-1 history from literal objects: signatures, an encoding
+// header, an unknown header, a non-canonical mode, a symlink, a merge with a signed mergetag, a
+// signed tag and a tag of a tree.
+func newGoldenUpstream(t *testing.T) string {
+	t.Helper()
+	up := filepath.Join(t.TempDir(), "golden.git")
+	gitRaw(t, "", nil, "init", "-q", "--bare", "--initial-branch=main", "--object-format=sha1", up)
+	write := func(typ, content string) string {
+		return gitLine(t, up, []byte(content), "hash-object", "-t", typ, "-w", "--literally", "--stdin")
+	}
+	raw := func(id string) string { return string(mustHex(t, id)) }
+
+	blob := write("blob", "hello\n")
+	link := write("blob", "hello.txt")
+	sub := write("tree", "100644 a\x00"+raw(blob))
+	tree := write("tree", "100644 hello.txt\x00"+raw(blob)+"120000 link\x00"+raw(link)+"100664 odd\x00"+raw(blob)+"40000 sub\x00"+raw(sub))
+	ident := "A U Thor <author@example.com> 1700000000 +0100"
+	pgp := "-----BEGIN PGP SIGNATURE-----\n\niQEzBAABCAAdFiEE\n=abcd\n-----END PGP SIGNATURE-----\n"
+	folded := func(header, value string) string {
+		return header + " " + strings.ReplaceAll(strings.TrimSuffix(value, "\n"), "\n", "\n ") + "\n"
+	}
+	root := write("commit", "tree "+tree+"\nauthor "+ident+"\ncommitter "+ident+"\nencoding ISO-8859-1\n\ncaf\xe9\n")
+	signed := write("commit", "tree "+sub+"\nparent "+root+"\nauthor "+ident+"\ncommitter "+ident+"\n"+folded("gpgsig", pgp)+"x-custom value\n\nsigned\n")
+	tag := "object " + signed + "\ntype commit\ntag v1\ntagger " + ident + "\n\nrelease\n" + pgp
+	v1 := write("tag", tag)
+	treeTag := write("tag", "object "+tree+"\ntype tree\ntag tree-tag\ntagger "+ident+"\n\ntree\n")
+	merge := write("commit", "tree "+tree+"\nparent "+signed+"\nparent "+root+"\nauthor "+ident+"\ncommitter "+ident+"\n"+folded("mergetag", tag)+"\nmerge\n")
+	gitRaw(t, up, nil, "update-ref", "refs/heads/main", merge)
+	gitRaw(t, up, nil, "update-ref", "refs/tags/v1", v1)
+	gitRaw(t, up, nil, "update-ref", "refs/tags/tree-tag", treeTag)
+	return up
+}
+
+// TestConversionGoldenHashes pins the SHA-256 of a fixed SHA-1 history. If it fails, the change
+// alters the ids of converted repositories: bump conversionVersion and update the expected ids.
+func TestConversionGoldenHashes(t *testing.T) {
+	up := newGoldenUpstream(t)
+	const wantSHA1 = "5f21647e2c8fd50c00c26768972cbd30a9f4f8af refs/heads/main\n" +
+		"a54f37b1408caa3e94b123d40c6e57ef4129531c refs/tags/tree-tag\n" +
+		"c51eff929febe974845f71d914f5c74428b52b2a refs/tags/v1"
+	if got := gitLine(t, up, nil, "for-each-ref", "--format=%(objectname) %(refname)"); got != wantSHA1 {
+		t.Fatalf("the fixture itself changed:\n%s", got)
+	}
+
+	info := newTestRepoInfo(t, up)
+	if err := NewManager(0).EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	// tree-tag matches git's own compatObjectFormat translation; main and v1 contain a commit with
+	// an unknown header, which git refuses to translate and Evergit copies unchanged
+	const want = "fa4e901e883e7857cc2cfbc9889c37e7439d2d47b26e4a4c021b61f1f8bfa4cb refs/heads/main\n" +
+		"7bc4ec20c947d9ee0783cce30d68baffe0f20e3756d19585ef79ba9112129ed5 refs/tags/tree-tag\n" +
+		"37ce2e35532bd67eb910bce6f66972f521f2a4463e7315fd7b715773f106a11b refs/tags/v1"
+	if got := servingRefs(t, info.ServingPath); got != want {
+		t.Errorf("converted ids changed (bump conversionVersion if intended):\n%s", got)
 	}
 }

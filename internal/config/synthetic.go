@@ -59,12 +59,17 @@ func LoadSyntheticGitlinks(path string) ([]SyntheticGitlink, error) {
 	return entries, nil
 }
 
-// ApprovesSynthetic reports whether entries approve synthetic SHA-256s for submodule of superproject.
-func ApprovesSynthetic(entries []SyntheticGitlink, superproject, submodule string) bool {
+// FindSyntheticApproval returns the entry approving synthetic SHA-256s for submodule of superproject.
+func FindSyntheticApproval(entries []SyntheticGitlink, superproject, submodule string) (SyntheticGitlink, bool) {
 	for _, e := range entries {
 		if (e.Superproject == "*" || e.Superproject == superproject) && e.Submodule == submodule {
-			return true
+			return e, true
 		}
 	}
-	return false
+	return SyntheticGitlink{}, false
+}
+
+// String formats the entry as a line of the synthetic gitlinks file.
+func (e SyntheticGitlink) String() string {
+	return e.Superproject + " " + e.Submodule
 }

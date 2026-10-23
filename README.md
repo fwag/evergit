@@ -159,7 +159,7 @@ git submodule update --init
 2. **Conversion of the submodules:**
    Each submodule (e.g. `keycodemapdb`) is converted the same way, recursively, so its SHA-256 is the same whether it is cloned directly or reached as a submodule. If it lacks a recorded commit, it is refreshed regardless of the cache TTL, and commits that no branch or tag reaches (e.g. only a pull request ref) are fetched by id and kept under `refs/evergit-pinned/`.
 3. **Real Cryptographic SHA-256 Translation:**
-   Gitlinks record the submodule's real SHA-256 commit, from its `objects/loose-object-idx`. A submodule pointing into its own repository (e.g. a `gh-pages` docs submodule) is translated from that repository's objects. Every decision is recorded in the serving repository (`evergit-gitlinks`), so later updates and rebuilds never translate a submodule commit differently.
+   Gitlinks record the submodule's real SHA-256 commit, from its `objects/loose-object-idx`. A submodule pointing into its own repository (e.g. a `gh-pages` docs submodule) is translated from that repository's objects. Every decision is recorded, by submodule and with the reason and approval for synthetic ones, in the serving repository's `evergit-state.json` (never served to clients), so later updates and rebuilds never translate a submodule commit differently.
 4. **Failures instead of guesses:**
    A temporary failure (busy server, unreachable upstream) fails the conversion with a message asking to retry (HTTP 503 with `Retry-After`). A submodule that cannot be converted for good fails it until the administrator decides (HTTP 403, see below). Submodule cycles between repositories and nesting deeper than 10 levels fail with an error.
 5. **Seamless Client Clones:**
