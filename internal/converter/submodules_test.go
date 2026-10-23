@@ -491,3 +491,24 @@ func TestSubmoduleWithLocalPathIsNotCloned(t *testing.T) {
 		t.Errorf("mirrors = %v, want only the superproject's %s", mirrors, info.MirrorPath)
 	}
 }
+
+func TestRelativeSubmoduleURLsResolveLikeGit(t *testing.T) {
+	m := newSubmoduleManager(t.TempDir(), 0)
+	parent := &resolver.RepositoryInfo{Domain: "github.com", Owner: "owner", RepoName: "repo"}
+	// As "git submodule init" resolves them against https://github.com/owner/repo.git
+	for url, want := range map[string]string{
+		"../other.git":       "github.com/owner/other",
+		"../../org2/lib.git": "github.com/org2/lib",
+		"./nested.git":       "", // https://github.com/owner/repo.git/nested.git is no repository path
+	} {
+		info, err := m.resolveSubmoduleInfo(url, parent)
+		switch {
+		case want == "" && err == nil:
+			t.Errorf("relative URL %q resolved to %s, want an error", url, canonicalRepoID(info))
+		case want != "" && err != nil:
+			t.Errorf("relative URL %q: %v, want %s", url, err, want)
+		case want != "" && canonicalRepoID(info) != want:
+			t.Errorf("relative URL %q resolved to %s, want %s", url, canonicalRepoID(info), want)
+		}
+	}
+}
