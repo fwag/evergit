@@ -139,5 +139,6 @@ Goal: the same SHA-1 history always converts to the same SHA-256 history, across
   - Not needed since object-level conversion: object ids no longer depend on the git version (git only reads objects, indexes and repacks the bytes Evergit writes), so no startup canary, `-git-path` or git version matrix.
 - [ ] **Scaling limits**
   - [ ] The SHA-1 -> SHA-256 table is held in memory (~100 bytes per object, ~1 GB for the Linux kernel) and blobs are read whole.
-  - [ ] Incremental pack merges run `repack -f` every 8 updates, which can take minutes on large repositories while clients wait.
+  - [x] Incremental pack merges ran `repack -f` every 8 updates (about 1.5 hours on the Linux kernel) while clients waited. Updates are now merged geometrically; a full `repack -f` runs only once update packs reach 25% of the main pack, while the current copy is served (`-request-wait`).
+  - [x] Conversions were cancelled when their clients disconnected and limited to 1 hour, so behind a proxy timeout large repositories never converted. They now run to `-max-conversion-time` (default 12h); requests wait at most `-request-wait`.
   - [ ] Reusing the source pack's blob deltas would avoid recompressing every file version (conversion time is dominated by raw blob volume: 15 min for libvirt's 33 GB).

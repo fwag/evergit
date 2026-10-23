@@ -717,26 +717,46 @@ func updateRefs(ctx context.Context, refs map[string]string, targetPath string, 
 	return nil
 }
 
-// maxPacksBeforeRepack is how many packs incremental conversions may accumulate before the serving
-// repository is repacked.
-const maxPacksBeforeRepack = 8
+// fullRepackRatio triggers a full repack of a serving repository once its other packs together
+// reach this fraction of its largest pack.
+const fullRepackRatio = 0.25
 
-// repackConverted merges the packs of a conversion into one pack with a reachability bitmap. A full
-// build is always repacked before it is published; its chunks are already compressed, so their
-// deltas are kept. A serving repository is repacked once incremental packs accumulate, with -f:
-// objects of an incremental pack can only be deltas against objects of the same update, so
-// without a new delta search they would stay whole. Object ids are unaffected.
+// repackConverted keeps the packs of a conversion compact. A full build is merged into one pack with
+// a reachability bitmap before it is published; its chunks are already compressed, so their deltas
+// are kept. After an incremental conversion, the new pack is merged geometrically with the other
+// small packs, leaving the large ones untouched, as git does on servers. Objects of an update are
+// only stored as deltas against objects of the same update, so once the small packs grow to
+// fullRepackRatio of the largest one, everything is repacked with a new delta search (-f), which
+// takes long on large repositories but runs while the current copy is served.
 //
 // -k keeps objects no ref reaches any more: loose-object-idx still lists them, and incremental
 // conversions skip listed objects, so a dropped object that became reachable again would be missing.
+// Object ids are unaffected.
 func repackConverted(ctx context.Context, repoPath string, incremental bool, progressWriter io.Writer, repoName string) error {
 	args := []string{"--git-dir=.", "repack", "-a", "-d", "-k", "-q"}
 	if incremental {
 		packs, err := filepath.Glob(filepath.Join(repoPath, "objects", "pack", "pack-*.pack"))
-		if err != nil || len(packs) <= maxPacksBeforeRepack {
+		if err != nil {
 			return err
 		}
-		args = append(args, "-f")
+		var largest, total int64
+		for _, pack := range packs {
+			fi, err := os.Stat(pack)
+			if err != nil {
+				return err
+			}
+			total += fi.Size()
+			largest = max(largest, fi.Size())
+		}
+		switch {
+		case len(packs) <= 1:
+			return nil
+		case float64(total-largest) < fullRepackRatio*float64(largest):
+			// The geometric merge only packs whole packs, so it never drops objects
+			args = []string{"--git-dir=.", "-c", "repack.writeBitmaps=false", "repack", "-d", "-q", "--geometric=2"}
+		default:
+			args = append(args, "-f")
+		}
 	}
 	if progressWriter != nil {
 		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Compressing converted objects...\n", repoName)

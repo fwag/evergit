@@ -3,6 +3,7 @@ package converter
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -357,14 +358,82 @@ func TestConversionRepacks(t *testing.T) {
 		t.Error("full conversion was not repacked: no object is stored as a delta")
 	}
 
-	for i := 2; i <= maxPacksBeforeRepack+1; i++ {
-		commitBigFileVersion(t, up, i)
+	gitRaw(t, info.ServingPath, nil, "--git-dir=.", "fsck", "--strict", "--no-dangling")
+	assertCompatMapComplete(t, info.ServingPath)
+}
+
+// commitRandomFile commits size bytes that do not compress, to control pack sizes.
+func commitRandomFile(t *testing.T, up, name string, size int) {
+	t.Helper()
+	data := make([]byte, size)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(up, name), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitRaw(t, up, nil, "add", name)
+	gitRaw(t, up, nil, "commit", "-q", "-m", "add "+name)
+}
+
+// largestPack returns the name of the largest pack of a repository.
+func largestPack(t *testing.T, repoPath string) string {
+	t.Helper()
+	packs, err := filepath.Glob(filepath.Join(repoPath, "objects", "pack", "pack-*.pack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	largest, size := "", int64(-1)
+	for _, p := range packs {
+		if fi, err := os.Stat(p); err == nil && fi.Size() > size {
+			largest, size = filepath.Base(p), fi.Size()
+		}
+	}
+	return largest
+}
+
+func TestIncrementalPacksAreMergedWithoutRepackingEverything(t *testing.T) {
+	up := newTestUpstream(t)
+	// Git merges packs geometrically by object count: the main history has many objects
+	// in a subdirectory, so small updates do not rewrite a large tree
+	if err := os.Mkdir(filepath.Join(up, "data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 500; i++ {
+		if err := os.WriteFile(filepath.Join(up, "data", fmt.Sprintf("file%03d", i)), []byte(fmt.Sprintf("content of file %d\n", i)), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitRaw(t, up, nil, "add", ".")
+	gitRaw(t, up, nil, "commit", "-q", "-m", "many files")
+	info := newTestRepoInfo(t, up)
+	m := NewManager(0)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	main := largestPack(t, info.ServingPath)
+
+	// Small updates are merged with each other, and never rewrite the large pack
+	for i := 0; i < 10; i++ {
+		commitToUpstream(t, up, fmt.Sprintf("small update %d", i))
 		if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 			t.Fatal(err)
 		}
-		if n := packCount(t, info.ServingPath); n > maxPacksBeforeRepack {
-			t.Fatalf("after update %d the serving repository has %d packs, want at most %d", i, n, maxPacksBeforeRepack)
+		if got := largestPack(t, info.ServingPath); got != main {
+			t.Fatalf("update %d rewrote the large pack %s into %s", i, main, got)
 		}
+	}
+	if n := packCount(t, info.ServingPath); n > 4 {
+		t.Errorf("10 small updates left %d packs, want them merged geometrically", n)
+	}
+
+	// Once the updates reach a quarter of the large pack, everything is repacked
+	commitRandomFile(t, up, "update", 64*1024)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := packCount(t, info.ServingPath); n != 1 {
+		t.Errorf("after large updates %d packs remain, want a full repack into 1", n)
 	}
 	gitRaw(t, info.ServingPath, nil, "--git-dir=.", "fsck", "--strict", "--no-dangling")
 	assertCompatMapComplete(t, info.ServingPath)
