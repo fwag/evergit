@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -333,9 +334,12 @@ func TestConverterBackupPreservation(t *testing.T) {
 }
 
 // newTestUpstream creates a SHA1 upstream repository with a single commit.
+// upstreamCount gives test upstreams distinct names: local submodules are identified by name.
+var upstreamCount atomic.Int64
+
 func newTestUpstream(t *testing.T) string {
 	t.Helper()
-	upstreamPath := filepath.Join(t.TempDir(), "upstream.git")
+	upstreamPath := filepath.Join(t.TempDir(), fmt.Sprintf("upstream%d.git", upstreamCount.Add(1)))
 	if _, err := runCmd("", "git", "init", "--initial-branch=main", "--object-format=sha1", upstreamPath); err != nil {
 		t.Fatalf("failed to init upstream: %v", err)
 	}
@@ -729,10 +733,10 @@ func TestOnlyBranchesAndTagsAreMirrored(t *testing.T) {
 	}
 }
 
-func TestSubmodulesAreConvertedWithSyntheticHash(t *testing.T) {
+func TestGitlinkWithoutURLNeedsApproval(t *testing.T) {
 	upstreamPath := newTestUpstream(t)
 	sha1 := strings.Repeat("ab", 20)
-	// A submodule entry (gitlink) records a SHA-1 commit of another repository
+	// A gitlink records a SHA-1 commit of another repository, here without a .gitmodules entry
 	if _, err := runCmd(upstreamPath, "git", "update-index", "--add", "--cacheinfo", "160000,"+sha1+",libs/dependency"); err != nil {
 		t.Fatal(err)
 	}
@@ -741,12 +745,13 @@ func TestSubmodulesAreConvertedWithSyntheticHash(t *testing.T) {
 	}
 
 	info := newTestRepoInfo(t, upstreamPath)
-	err := NewManager(0).EnsureRepo(context.Background(), info, nil)
-	if err != nil {
-		t.Fatalf("EnsureRepo failed for repository with submodule: %v", err)
-	}
+	manager := NewManager(0)
+	assertNeedsApproval(t, manager.EnsureRepo(context.Background(), info, nil), "local/test/repo", "path:libs/dependency")
 
-	// Verify the gitlink in the converted serving repository is zero-padded to 64 hex chars
+	approveSynthetic(t, manager, "local/test/repo path:libs/dependency")
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatalf("EnsureRepo failed for repository with approved submodule: %v", err)
+	}
 	out, err := runCmd(info.ServingPath, "git", "ls-tree", "HEAD", "libs/dependency")
 	if err != nil {
 		t.Fatalf("git ls-tree failed: %v", err)
@@ -918,24 +923,17 @@ func TestSubmoduleRecursionDepthLimit(t *testing.T) {
 
 	superInfo := newTestRepoInfo(t, superUpstream)
 	mgr := NewManager(0)
-	mgr.SetMaxSubmoduleDepth(0) // Disable recursion
-	err := mgr.EnsureRepo(context.Background(), superInfo, nil)
-	if err != nil {
-		t.Fatalf("EnsureRepo failed: %v", err)
-	}
+	mgr.SetMaxSubmoduleDepth(0)
 
-	// When depth is 0, submodule is not pre-converted, and gitlink falls back to synthetic padding
-	out, err := runCmd(superInfo.ServingPath, "git", "ls-tree", "HEAD", "libs/sub")
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedSynthetic := subCommitSHA1 + strings.Repeat("0", 24)
-	if !strings.Contains(out, expectedSynthetic) {
-		t.Errorf("expected synthetic hash %s with depth=0, got: %q", expectedSynthetic, out)
+	// Exceeding the depth fails rather than recording the gitlink with the synthetic SHA-256, which
+	// would depend on how the repository was reached
+	err := mgr.EnsureRepo(context.Background(), superInfo, nil)
+	if !errors.Is(err, ErrSubmoduleDepth) {
+		t.Fatalf("EnsureRepo with depth 0 = %v, want ErrSubmoduleDepth", err)
 	}
 }
 
-func TestSubmoduleCircularReferencePrevention(t *testing.T) {
+func TestSubmoduleCycleFails(t *testing.T) {
 	// Repo A references Repo B as a submodule, and Repo B references Repo A as a submodule
 	repoA := newTestUpstream(t)
 	repoB := newTestUpstream(t)
@@ -966,9 +964,10 @@ func TestSubmoduleCircularReferencePrevention(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Fails promptly instead of deadlocking on the conversion further up the chain
 	err := mgr.EnsureRepo(ctx, infoA, nil)
-	if err != nil {
-		t.Fatalf("EnsureRepo failed during circular submodule resolution: %v", err)
+	if !errors.Is(err, ErrSubmoduleCycle) {
+		t.Fatalf("EnsureRepo with circular submodules = %v, want ErrSubmoduleCycle", err)
 	}
 }
 

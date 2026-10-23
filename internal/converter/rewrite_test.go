@@ -329,7 +329,7 @@ func TestChunksAreCompressed(t *testing.T) {
 	gitRaw(t, "", nil, "init", "-q", "--bare", "--object-format=sha256", target)
 
 	// Without the final repack of a conversion, which would hide uncompressed chunks
-	if _, err := rewriteObjects(context.Background(), up, target, make(map[sha1ID]sha256ID), newGitlinkResolver(nil), nil); err != nil {
+	if _, err := rewriteObjects(context.Background(), up, target, make(map[sha1ID]sha256ID), newGitlinkResolution(nil), nil); err != nil {
 		t.Fatal(err)
 	}
 	if !hasDeltas(t, target) {

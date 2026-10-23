@@ -30,6 +30,9 @@ type Config struct {
 	AllowedHosts []string
 	// Shorthands maps short prefix aliases to their target domains (e.g. "github" -> "github.com")
 	Shorthands map[string]string
+	// SyntheticGitlinksFile lists submodules approved for synthetic SHA-256s (see SyntheticGitlink);
+	// it is read at every conversion, so approvals apply without a restart
+	SyntheticGitlinksFile string
 	// UpstreamOverrides maps a host to a local upstream path. Deliberately not exposed via flags
 	// or environment variables; tests set it to serve fixtures without network access.
 	UpstreamOverrides map[string]string
@@ -81,6 +84,8 @@ func Load() *Config {
 		Debug:          debug,
 		AllowedHosts:   ParseHostList(getEnv("EVERGIT_ALLOWED_HOSTS", strings.Join(DefaultAllowedHosts, ","))),
 		Shorthands:     ParseShorthands(getEnv("EVERGIT_SHORTHANDS", DefaultShorthands)),
+
+		SyntheticGitlinksFile: os.Getenv("EVERGIT_SYNTHETIC_GITLINKS"),
 	}
 }
 

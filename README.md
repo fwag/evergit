@@ -18,7 +18,7 @@ It is designed to solve a critical interoperability gap: **Git does not allow re
 ### Limitations
 
 - **Only branches and tags are mirrored.** Forge-specific refs such as GitHub's `refs/pull/*` or GitLab's `refs/merge-requests/*` are not served.
-- **Defunct historical submodules use synthetic zero-padding.** For active submodules listed in `HEAD:.gitmodules`, Evergit automatically pre-converts them to SHA-256 and records their **real cryptographic SHA-256 commit hashes** in the superproject tree. For obsolete submodules found only in ancient history (e.g. removed dependencies from years ago), Evergit falls back to deterministic zero-padding (`<sha1>` + 24 zeros) so the conversion never fails on unreachable historical remotes.
+- **Submodules must be convertible, or explicitly approved.** Evergit converts the submodules a history records and uses their **real SHA-256 commit hashes**. When a submodule cannot be converted (no URL in the recording commit's `.gitmodules`, a host outside `-allowed-hosts`, an unusable URL, or a repository or commit that no longer exists upstream), the conversion fails with a message naming the submodule, until the administrator allows its host or approves recording its commits with a synthetic SHA-256 (`<sha1>` + 24 zeros) in the `-synthetic-gitlinks` file. A temporarily unavailable submodule also fails the conversion, which can be retried. So the result never depends on when or where it ran.
 
 ---
 
@@ -47,6 +47,7 @@ go build -o evergit ./cmd/evergit
 - `-min-free-disk`: Minimum free disk in GB required before cloning new mirrors; also settable via `EVERGIT_MIN_FREE_DISK_GB` (default: `1`)
 - `-debug`: Enable debug logging; also settable via `EVERGIT_DEBUG` (default: `false`)
 - `-allowed-hosts`: Comma-separated upstream hosts clients may request; also settable via `EVERGIT_ALLOWED_HOSTS` (default: `github.com,gitlab.com,bitbucket.org`). Self-hosted forges must be added explicitly.
+- `-synthetic-gitlinks`: File approving synthetic SHA-256s for submodules that cannot be converted (see [Submodules that cannot be converted](#submodules-that-cannot-be-converted)); also settable via `EVERGIT_SYNTHETIC_GITLINKS`. It is read again at every conversion, so approvals apply without a restart.
 - `-shorthands`: Comma-separated domain shorthand mappings in `alias=domain` format; also settable via `EVERGIT_SHORTHANDS` (default: `github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org`). Pass `none` to disable shorthands.
 
 ---
@@ -153,14 +154,39 @@ git submodule update --init
 ```
 
 #### How it works under the hood:
-1. **Pre-Conversion of Active Submodules:**
-   Before converting a superproject (e.g. `libvirt`), Evergit reads `HEAD:.gitmodules` from the mirror. It automatically resolves and pre-converts any active submodules (e.g. `keycodemapdb`) to SHA-256 into Evergit's storage cache, bounded by a recursion depth (default: `1`, with cycle protection).
-2. **Real Cryptographic SHA-256 Translation:**
-   Evergit loads the translation map from the submodule's `objects/loose-object-idx`. When converting the superproject, Evergit translates gitlink commits to their **real cryptographic SHA-256 hashes**.
-3. **Seamless Client Clones:**
+1. **Discovery from the history itself:**
+   Before converting a superproject (e.g. `libvirt`), Evergit lists every submodule commit its history records, with the URL that *the recording commit's own* `.gitmodules` gives for the path, including submodules that were removed or moved long ago.
+2. **Conversion of the submodules:**
+   Each submodule (e.g. `keycodemapdb`) is converted the same way, recursively, so its SHA-256 is the same whether it is cloned directly or reached as a submodule. If it lacks a recorded commit, it is refreshed regardless of the cache TTL, and commits that no branch or tag reaches (e.g. only a pull request ref) are fetched by id and kept under `refs/evergit-pinned/`.
+3. **Real Cryptographic SHA-256 Translation:**
+   Gitlinks record the submodule's real SHA-256 commit, from its `objects/loose-object-idx`. A submodule pointing into its own repository (e.g. a `gh-pages` docs submodule) is translated from that repository's objects. Every decision is recorded in the serving repository (`evergit-gitlinks`), so later updates and rebuilds never translate a submodule commit differently.
+4. **Failures instead of guesses:**
+   A temporary failure (busy server, unreachable upstream) fails the conversion with a message asking to retry (HTTP 503 with `Retry-After`). A submodule that cannot be converted for good fails it until the administrator decides (HTTP 403, see below). Submodule cycles between repositories and nesting deeper than 10 levels fail with an error.
+5. **Seamless Client Clones:**
    When your client runs `git submodule update --init`, the request routes to Evergit via the scoped `insteadOf` rule. The client requests the real SHA-256 commit from Evergit, which Evergit serves directly from its cache, resulting in a clean working tree.
-4. **Resilience to Ancient History:**
-   If a repository's history references dead or defunct submodules that no longer exist in `HEAD:.gitmodules`, Evergit gracefully falls back to synthetic zero-padding (`<sha1>` + 24 zeros) so ancient commits still convert without failing on unreachable third-party servers.
+
+#### Submodules that cannot be converted
+
+Some submodules cannot be converted: the recording commit's `.gitmodules` gives no URL, the host is not in `-allowed-hosts`, the URL is unusable (e.g. `git://`), or the repository or commit no longer exists upstream. Cloning then fails with a message for the administrator, for example:
+
+```
+remote: Evergit: submodule needs administrator approval: submodules of gitlab.com/libvirt/libvirt cannot be converted:
+remote:   https://git.savannah.gnu.org/git/gnulib.git/: upstream host "git.savannah.gnu.org" is not allowed (10 commit(s))
+remote:
+remote: Ask the Evergit administrator to allow their hosts (-allowed-hosts), or to approve synthetic SHA-256s for them in the synthetic gitlinks file (-synthetic-gitlinks):
+remote:   gitlab.com/libvirt/libvirt https://git.savannah.gnu.org/git/gnulib.git/
+```
+
+The administrator either adds the host to `-allowed-hosts`, so the submodule is converted, or approves recording its commits with a synthetic SHA-256 (`<sha1>` + 24 zeros) by adding the suggested line to the `-synthetic-gitlinks` file:
+
+```
+# <superproject>              <submodule: URL as in .gitmodules, or path:<path> for a gitlink without URL>
+gitlab.com/libvirt/libvirt    git://git.sv.gnu.org/gnulib.git
+gitlab.com/libvirt/libvirt    path:.gnulib
+*                             https://git.savannah.gnu.org/git/gnulib.git/
+```
+
+`*` approves a submodule for every superproject. Once recorded, a decision is kept for the repository, also if the approval is later removed.
 
 > **Do not enable `extensions.compatObjectFormat` in your clones or in the superproject.** Git's SHA-1 compatibility mode
 > must compute a SHA-1 id for every object it writes, and it cannot do so for objects received by `git fetch` or for

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -27,6 +28,7 @@ func main() {
 	minFreeDiskFlag := flag.Int("min-free-disk", -1, "Minimum free disk space in GB required before cloning new mirrors (default: 1)")
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
 	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
+	syntheticGitlinks := flag.String("synthetic-gitlinks", "", "File of \"<superproject> <submodule>\" lines approving synthetic SHA-256s for submodules that cannot be converted")
 	shorthands := flag.String("shorthands", "", "Comma-separated domain shorthand mappings in alias=domain format (default: github=github.com,gitlab=gitlab.com,bitbucket=bitbucket.org)")
 	flag.Parse()
 
@@ -79,6 +81,9 @@ func main() {
 	if *shorthands != "" {
 		cfg.Shorthands = config.ParseShorthands(*shorthands)
 	}
+	if *syntheticGitlinks != "" {
+		cfg.SyntheticGitlinksFile = *syntheticGitlinks
+	}
 
 	log.Printf("Initializing Evergit Daemon...")
 	log.Printf("Storage Root:    %s", cfg.StorageRoot)
@@ -94,6 +99,18 @@ func main() {
 	}
 	log.Printf("Allowed hosts:   %s", strings.Join(cfg.AllowedHosts, ", "))
 	log.Printf("Shorthands:      %s", config.FormatShorthands(cfg.Shorthands))
+	if cfg.SyntheticGitlinksFile != "" {
+		// Read again at every conversion; checked here so a mistake shows at startup
+		approvals, err := config.LoadSyntheticGitlinks(cfg.SyntheticGitlinksFile)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			log.Printf("Synthetic gitlinks: %s (does not exist yet, approves nothing)", cfg.SyntheticGitlinksFile)
+		case err != nil:
+			log.Fatalf("Failed to load synthetic gitlinks: %v", err)
+		default:
+			log.Printf("Synthetic gitlinks: %s (%d approvals)", cfg.SyntheticGitlinksFile, len(approvals))
+		}
+	}
 
 	// Ensure Storage Root exists
 	if err := os.MkdirAll(cfg.StorageRoot, 0755); err != nil {

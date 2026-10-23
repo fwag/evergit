@@ -47,8 +47,8 @@ var signatureMarkers = []string{
 	"-----BEGIN SSH SIGNATURE-----",
 }
 
-// gitlinkResolver translates a submodule commit id recorded in a tree.
-type gitlinkResolver func(id sha1ID) (sha256ID, error)
+// errObjectMissing is returned for an object the repository does not contain.
+var errObjectMissing = errors.New("object missing")
 
 // cutLine splits off the first line of data, including its newline if present.
 func cutLine(data []byte) (line, rest []byte) {
@@ -267,6 +267,9 @@ func (c *catFileBatch) read(id sha1ID) (string, []byte, error) {
 		return "", nil, fmt.Errorf("git cat-file: %w (stderr: %q)", err, c.stderr.String())
 	}
 	fields := strings.Fields(header)
+	if len(fields) == 2 && fields[1] == "missing" {
+		return "", nil, fmt.Errorf("%w: %x", errObjectMissing, id)
+	}
 	if len(fields) != 3 {
 		return "", nil, fmt.Errorf("object %x: %s", id, strings.TrimSpace(header))
 	}
@@ -409,7 +412,7 @@ type objectRewriter struct {
 	chunk    []packedObject // objects in pack
 	ids      map[sha1ID]sha256ID
 	added    []sha1ID // objects converted in this run, in conversion order
-	gitlink  gitlinkResolver
+	gitlinks *gitlinkResolution
 	progress func(converted int)
 }
 
@@ -457,10 +460,23 @@ func (r *objectRewriter) convert(id sha1ID, name string) (sha256ID, error) {
 }
 
 func (r *objectRewriter) convertTreeEntry(mode, name []byte, id sha1ID) (sha256ID, error) {
-	if string(mode) == "160000" {
-		return r.gitlink(id)
+	if string(mode) != "160000" {
+		return r.convert(id, string(name))
 	}
-	return r.convert(id, string(name))
+	newID, ok, err := r.gitlinks.resolve(id)
+	if err != nil {
+		return sha256ID{}, err
+	}
+	if !ok {
+		// A submodule pointing into this repository
+		if newID, err = r.convert(id, ""); errors.Is(err, errObjectMissing) {
+			return sha256ID{}, fmt.Errorf("no SHA-256 was decided for submodule commit %x", id)
+		} else if err != nil {
+			return sha256ID{}, err
+		}
+	}
+	r.gitlinks.decided[id] = newID
+	return newID, nil
 }
 
 func (r *objectRewriter) convertHex(s string) (string, error) {
@@ -530,7 +546,7 @@ func (r *objectRewriter) flushChunk() error {
 
 // rewriteObjects converts every object reachable from the mirror's refs that is not yet in ids
 // into packs in targetPath, and returns the converted ids in conversion order.
-func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids map[sha1ID]sha256ID, gitlink gitlinkResolver, progress func(int)) ([]sha1ID, error) {
+func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids map[sha1ID]sha256ID, gitlinks *gitlinkResolution, progress func(int)) ([]sha1ID, error) {
 	// Parents before children keeps the recursion in convert shallow: commits only recurse into trees
 	commits, err := runCmdContext(ctx, 0, mirrorPath, "git", "rev-list", "--reverse", "--topo-order", "--all")
 	if err != nil {
@@ -552,7 +568,7 @@ func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids map[
 	if err := os.MkdirAll(packDir, 0755); err != nil {
 		return nil, err
 	}
-	r := &objectRewriter{ctx: ctx, cat: cat, repoPath: targetPath, packDir: packDir, ids: ids, gitlink: gitlink, progress: progress}
+	r := &objectRewriter{ctx: ctx, cat: cat, repoPath: targetPath, packDir: packDir, ids: ids, gitlinks: gitlinks, progress: progress}
 	if err := r.startChunk(); err != nil {
 		return nil, err
 	}
@@ -572,9 +588,14 @@ func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids map[
 	return r.added, nil
 }
 
-// loadTranslationTable reads a loose-object-idx ("<sha256> <sha1>" lines) into a map.
+// loadTranslationTable reads a repository's loose-object-idx into a map.
 func loadTranslationTable(repoPath string) (map[sha1ID]sha256ID, error) {
-	f, err := os.Open(filepath.Join(repoPath, "objects", "loose-object-idx"))
+	return loadTranslationFile(filepath.Join(repoPath, "objects", "loose-object-idx"))
+}
+
+// loadTranslationFile reads "<sha256> <sha1>" lines into a map.
+func loadTranslationFile(path string) (map[sha1ID]sha256ID, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -593,7 +614,7 @@ func loadTranslationTable(repoPath string) (map[sha1ID]sha256ID, error) {
 			_, err = hex.Decode(newID[:], []byte(newHex))
 		}
 		if err != nil || len(newHex) != 2*len(newID) {
-			return nil, fmt.Errorf("malformed loose-object-idx line %q", scanner.Text())
+			return nil, fmt.Errorf("malformed line %q in %s", scanner.Text(), path)
 		}
 		ids[oldID] = newID
 	}
@@ -678,35 +699,18 @@ func updateRefsFromMirror(ctx context.Context, mirrorPath, targetPath string, id
 	return nil
 }
 
-// newGitlinkResolver translates gitlinks through the translation tables of the pre-converted
-// submodules. Trees do not know their path, so the lookup is by commit id alone; tables that
-// disagree about a commit are an error rather than an arbitrary choice.
-func newGitlinkResolver(submoduleCommitMap map[string]map[string]string) gitlinkResolver {
-	paths := make([]string, 0, len(submoduleCommitMap))
-	for p := range submoduleCommitMap {
-		paths = append(paths, p)
+// writeGitlinkDecisions atomically records the SHA-256 decided for each submodule commit.
+func writeGitlinkDecisions(repoPath string, decided map[sha1ID]sha256ID) error {
+	lines := make([]string, 0, len(decided))
+	for oldID, newID := range decided {
+		lines = append(lines, fmt.Sprintf("%x %x\n", newID, oldID))
 	}
-	slices.Sort(paths)
-	return func(id sha1ID) (sha256ID, error) {
-		key := hex.EncodeToString(id[:])
-		found := ""
-		for _, p := range paths {
-			if v, ok := submoduleCommitMap[p][key]; ok && len(v) == sha256HexLen {
-				if found != "" && found != v {
-					return sha256ID{}, fmt.Errorf("submodule commit %s has conflicting SHA-256 translations %s and %s", key, found, v)
-				}
-				found = v
-			}
-		}
-		if found == "" {
-			found = key + syntheticSHA256Padding
-		}
-		var newID sha256ID
-		if _, err := hex.Decode(newID[:], []byte(found)); err != nil {
-			return sha256ID{}, err
-		}
-		return newID, nil
+	slices.Sort(lines)
+	path := filepath.Join(repoPath, gitlinksFile)
+	if err := os.WriteFile(path+".tmp", []byte(strings.Join(lines, "")), 0644); err != nil {
+		return err
 	}
+	return os.Rename(path+".tmp", path)
 }
 
 // maxPacksBeforeRepack is how many packs incremental conversions may accumulate before the serving
@@ -754,7 +758,7 @@ func isIncrementalRewrite(servingPath string) bool {
 
 // convertObjects converts the mirror with object-level translation, incrementally when the serving
 // repository was produced the same way.
-func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, submoduleCommitMap map[string]map[string]string) (err error) {
+func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution) (err error) {
 	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
 		return fmt.Errorf("failed to create repos directory: %w", err)
 	}
@@ -788,7 +792,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 		}
 	}
 
-	added, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, newGitlinkResolver(submoduleCommitMap), progress)
+	added, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, progress)
 	if err != nil {
 		return err
 	}
@@ -796,9 +800,12 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 		_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Converting %s: %d objects, done.\n", info.RepoName, len(added))
 	}
 
-	// The translation table is written before refs, so no served commit lacks its SHA-1 id
+	// Translations are written before refs, so no served commit lacks its SHA-1 id
 	if err := writeTranslationTable(targetPath, incremental, ids, added); err != nil {
 		return fmt.Errorf("failed to write loose-object-idx: %w", err)
+	}
+	if err := writeGitlinkDecisions(targetPath, gitlinks.decided); err != nil {
+		return fmt.Errorf("failed to record gitlinks: %w", err)
 	}
 	if err := updateRefsFromMirror(ctx, info.MirrorPath, targetPath, ids); err != nil {
 		return err

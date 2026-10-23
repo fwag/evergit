@@ -218,6 +218,12 @@ func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCm
 		if errors.Is(err, converter.ErrServerBusy) {
 			_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: error: server busy with other conversions, please retry shortly\n")
 		}
+		if errors.Is(err, converter.ErrSubmoduleNotApproved) {
+			_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: error: submodules need administrator approval, see the message below\n")
+		}
+		if errors.Is(err, converter.ErrSubmoduleUnavailable) {
+			_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: error: a submodule could not be converted, please retry later\n")
+		}
 		writeError(ch, fmt.Errorf("gitconv failed: %w", err))
 		return err
 	}

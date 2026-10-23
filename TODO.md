@@ -16,6 +16,16 @@ This checklist tracks security, rate-limiting, and hardening improvements across
   - [ ] `refs/evergit-backups/*` reaches the serving repo (`fast-export --all`, and the explicit refspec in `syncNativeSHA256`), so clients can fetch commits that upstream removed, e.g. leaked secrets or DMCA takedowns.
   - [ ] Decide: keep backups in the mirror only and stop serving them, or document the behavior explicitly.
 
+- [ ] **[High] Submodule URLs can make the server clone its own local repositories**
+  - [ ] `resolveSubmoduleInfo` treats any submodule URL starting with `/` or `file://` as a local path, for any parent repository, bypassing `AllowedHosts`. A public repository whose `.gitmodules` points at a server path makes Evergit clone and convert any git repository the daemon can read (disk/CPU use, and a yes/no oracle on local repositories and commits through real vs padded gitlinks).
+  - [ ] Local mirrors are named by basename only (`mirrors/local/submodule/<name>.git`), so different local repositories collide.
+  - [ ] A relative `file://` URL is joined onto `https:/github.com/...`, which git parses as an scp-style ssh target with host `https`.
+  - [ ] Fix: drop the branch from production code; tests inject local upstreams through `UpstreamOverrides`.
+
+- [ ] **[Low] Shell injection in `/setup.sh` through the `Host` header**
+  - [ ] Without `PublicURL`, `r.Host` is rendered unescaped into `HTTP_BASE="..."`; Go accepts `Host: $(id;...)`, which runs in the victim's shell under `curl | bash`. Needs an attacker-influenced Host header (reverse proxy, cache poisoning).
+  - [ ] Fix: require `PublicURL` or strictly validate the host, and render values with single-quote shell escaping.
+
 - [x] **[Low] Reject `/git-receive-pack` before `EnsureRepo`**
   - [x] Push is currently refused only by `git-http-backend` (no `REMOTE_USER`), after a sync/conversion has already been triggered. Return `403` immediately.
 
@@ -104,3 +114,30 @@ HAProxy sits at the network boundary to absorb volumetric traffic and manage net
     - [x] If `<sha1>` is not found under `subPath` (e.g. submodule moved or path varied in history), search across all other pre-converted submodules for `<sha1>`.
     - [x] If `<sha1>` is not found in any map (e.g. defunct historical submodules like `.gnulib`), fall back to the synthetic zero-padded hash (`<sha1>` + 24 zeros) so ancient history converts without error.
   - [x] Verify that client `git submodule update --init` successfully fetches and checks out the real SHA-256 commit from Evergit, leaving working tree clean.
+
+---
+
+## 5. Reproducible SHA-256 Conversion
+
+Goal: the same SHA-1 history always converts to the same SHA-256 history, across runs, instances and cache rebuilds.
+
+- [x] **Object-level conversion** following Git's hash function transition design, byte-identical to Git's own `compatObjectFormat` translation (replaces `git fast-export | git fast-import`, which stripped signatures, dropped `mergetag`/unknown headers and tags of trees, normalized modes, forged nested tags and lost files).
+- [x] **Consistent submodule gitlinks**
+  - [x] Discover submodules from every commit's own `.gitmodules` for the gitlinks it records, instead of `HEAD` plus the last 50 `.gitmodules` changes of `git log --all` (which included instance-specific backup refs, and dropped one of two URLs for the same path at random).
+  - [x] Fail the conversion when a submodule has a temporary problem (busy, unreachable, cancelled), never pad; no automatic retry. HTTP 503 with `Retry-After`, SSH message asking to retry.
+  - [x] No synthetic SHA-256 without administrator approval: a gitlink without URL, a host outside `-allowed-hosts`, an unusable URL or a repository/commit gone upstream fails the conversion (HTTP 403) with the suggested approval line, until the host is allowed or the submodule is approved in the `-synthetic-gitlinks` file (re-read at every conversion).
+  - [x] Refresh a submodule within its TTL when it lacks a recorded commit, and fetch commits that no branch or tag reaches by id (pinned under `refs/evergit-pinned/`).
+  - [x] Record every gitlink decision (`evergit-gitlinks`) and reuse it in incremental conversions and rebuilds.
+  - [x] Convert a repository's submodules the same way however it is reached (the depth limit, now 10, fails instead of padding), so a repository's SHA-256 no longer depends on request order.
+  - [x] Submodule cycles fail clearly instead of deadlocking; the visited set is propagated into the conversion job. A submodule pointing into its own repository is translated from its own objects.
+  - [ ] Cycles between repositories that are resolvable commit by commit (A@v2 -> B@v1 -> A@v1) still fail; converting them would need cross-repository translation.
+- [ ] **Stale serving after a failed conversion**
+  - [ ] When a conversion fails after a successful fetch (e.g. `ErrServerBusy`), the next request sees an unchanged mirror, reports success and serves the old version until upstream changes again. Decide "changed" against a record of the last successful conversion instead of the mirror before the fetch.
+- [ ] **Conversion spec versioning**
+  - [ ] Spec version constant and per-repository state file (replacing the `evergit-conversion` marker); rebuild on mismatch.
+  - [ ] Golden corpus of fixture repositories with expected SHA-256 refs; startup canary refusing conversions when the output changed.
+  - [ ] Optional `-git-path` to pin the git binary; CI against several git versions.
+- [ ] **Scaling limits**
+  - [ ] The SHA-1 -> SHA-256 table is held in memory (~100 bytes per object, ~1 GB for the Linux kernel) and blobs are read whole.
+  - [ ] Incremental pack merges run `repack -f` every 8 updates, which can take minutes on large repositories while clients wait.
+  - [ ] Reusing the source pack's blob deltas would avoid recompressing every file version (conversion time is dominated by raw blob volume: 15 min for libvirt's 33 GB).

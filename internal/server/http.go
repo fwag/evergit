@@ -109,6 +109,15 @@ func writeConversionError(w http.ResponseWriter, info *resolver.RepositoryInfo, 
 		http.Error(w, "Evergit: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	if errors.Is(err, converter.ErrSubmoduleNotApproved) {
+		http.Error(w, "Evergit: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	if errors.Is(err, converter.ErrSubmoduleUnavailable) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "Evergit: "+err.Error()+"\nThe repository is not served until its submodules can be converted; please retry later.", http.StatusServiceUnavailable)
+		return
+	}
 	http.Error(w, "Internal Server Error (gitconv failure)", http.StatusInternalServerError)
 }
 

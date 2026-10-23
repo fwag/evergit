@@ -111,7 +111,7 @@ func TestIDLookup(t *testing.T) {
 	}
 }
 
-func TestCloneOfRepoWithSubmodulesSucceeds(t *testing.T) {
+func TestCloneOfRepoWithSubmodulesNeedsApproval(t *testing.T) {
 	tempDir := t.TempDir()
 	upstreamPath := filepath.Join(tempDir, "upstream")
 	_, _ = runCmd("", "git", "init", "-q", "--initial-branch=main", "--object-format=sha1", upstreamPath)
@@ -122,23 +122,37 @@ func TestCloneOfRepoWithSubmodulesSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	approvals := filepath.Join(tempDir, "synthetic-gitlinks")
 	cfg := &config.Config{
-		StorageRoot:       filepath.Join(tempDir, "storage"),
-		CacheTTL:          5 * time.Minute,
-		AllowedHosts:      []string{"local.test"},
-		UpstreamOverrides: map[string]string{"local.test": upstreamPath},
+		StorageRoot:           filepath.Join(tempDir, "storage"),
+		CacheTTL:              5 * time.Minute,
+		AllowedHosts:          []string{"local.test"},
+		UpstreamOverrides:     map[string]string{"local.test": upstreamPath},
+		SyntheticGitlinksFile: approvals,
 	}
-	httpServer, err := server.NewHTTPServer(cfg, converter.NewManager(cfg.CacheTTL))
+	conv := converter.NewManager(cfg.CacheTTL)
+	conv.SetConfig(cfg)
+	httpServer, err := server.NewHTTPServer(cfg, conv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(httpServer)
 	defer ts.Close()
 
+	// The gitlink has no URL: the clone fails, telling the user which approval the administrator needs
 	cloneDir := filepath.Join(tempDir, "clone")
 	_, err = runCmd("", "git", "clone", "-q", ts.URL+"/local.test/test/repo.git", cloneDir)
+	if err == nil || !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "local.test/test/repo path:libs/dependency") {
+		t.Fatalf("clone of repo with an unapproved submodule = %v, want a 403 suggesting the approval line", err)
+	}
+
+	// Approved by the administrator, without restarting
+	if err := os.WriteFile(approvals, []byte("local.test/test/repo path:libs/dependency\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = runCmd("", "git", "clone", "-q", ts.URL+"/local.test/test/repo.git", cloneDir)
 	if err != nil {
-		t.Fatalf("clone of repo with submodules failed: %v", err)
+		t.Fatalf("clone of repo with approved submodule failed: %v", err)
 	}
 	format, err := runCmd(cloneDir, "git", "rev-parse", "--show-object-format")
 	if err != nil || strings.TrimSpace(format) != "sha256" {
@@ -191,6 +205,55 @@ func TestLoadSheddingReturns503(t *testing.T) {
 	}
 	if retryAfter := rec.Header().Get("Retry-After"); retryAfter != "5" {
 		t.Errorf("Retry-After = %q, want %q", retryAfter, "5")
+	}
+}
+
+func TestUnavailableSubmoduleReturns503WithRetryHint(t *testing.T) {
+	tempDir := t.TempDir()
+	upstreamPath := filepath.Join(tempDir, "upstream")
+	if _, err := runCmd("", "git", "init", "-q", "--initial-branch=main", "--object-format=sha1", upstreamPath); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
+	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
+	_, _ = runCmd(upstreamPath, "git", "config", "-f", ".gitmodules", "submodule.sub.path", "sub")
+	_, _ = runCmd(upstreamPath, "git", "config", "-f", ".gitmodules", "submodule.sub.url", "https://sub.test/owner/sub.git")
+	_, _ = runCmd(upstreamPath, "git", "add", ".gitmodules")
+	_, _ = runCmd(upstreamPath, "git", "update-index", "--add", "--cacheinfo", "160000,"+strings.Repeat("ab", 20)+",sub")
+	if _, err := runCmd(upstreamPath, "git", "commit", "-q", "-m", "add submodule"); err != nil {
+		t.Fatal(err)
+	}
+	// The submodule upstream cannot be read, as with a network error
+	unreadable := filepath.Join(tempDir, "unreadable")
+	if err := os.WriteFile(unreadable, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		StorageRoot:       filepath.Join(tempDir, "storage"),
+		AllowedHosts:      []string{"github.com", "sub.test"},
+		Shorthands:        config.ParseShorthands(config.DefaultShorthands),
+		UpstreamOverrides: map[string]string{"github.com": upstreamPath, "sub.test": unreadable},
+	}
+	conv := converter.NewManager(0)
+	conv.SetConfig(cfg)
+	httpServer, err := server.NewHTTPServer(cfg, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/github.com/owner/repo.git/info/refs?service=git-upload-pack", nil)
+	rec := httptest.NewRecorder()
+	httpServer.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "sub.test") || !strings.Contains(body, "retry later") {
+		t.Errorf("body should name the submodule and suggest retrying, got: %q", body)
 	}
 }
 

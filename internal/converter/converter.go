@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -36,8 +34,9 @@ const DefaultConversionTimeout = 30 * time.Second
 // DefaultExecTimeout is the maximum time a repository conversion may run before being terminated.
 const DefaultExecTimeout = 1 * time.Hour
 
-// DefaultMaxSubmoduleDepth is the maximum recursion depth for discovering and pre-converting active submodules.
-const DefaultMaxSubmoduleDepth = 1
+// DefaultMaxSubmoduleDepth is the maximum nesting of submodules converted for a repository. It only
+// stops runaway nesting: exceeding it fails the conversion rather than changing any SHA-256.
+const DefaultMaxSubmoduleDepth = 10
 
 type Manager struct {
 	cacheTTL          time.Duration
@@ -212,16 +211,27 @@ func (m *Manager) EnsureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	return m.EnsureRepoWithDepth(ctx, info, progressWriter, depth)
 }
 
-// EnsureRepoWithDepth checks or converts a repository with bounded recursion depth for active submodules.
+// EnsureRepoWithDepth checks or converts a repository, converting submodules nested at most depth levels.
 func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
+	return m.ensureRepo(ctx, info, progressWriter, depth, nil)
+}
+
+func canonicalRepoID(info *resolver.RepositoryInfo) string {
+	return info.Domain + "/" + info.Owner + "/" + info.RepoName
+}
+
+// ensureRepo checks or converts a repository. A non-empty want lists commits the repository must
+// contain: the upstream is fetched regardless of the TTL, commits no branch or tag reaches are
+// fetched by id, and a fetch failure is returned instead of serving the cached repository.
+func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, want []string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	canonicalID := info.Domain + "/" + info.Owner + "/" + info.RepoName
+	canonicalID := canonicalRepoID(info)
 	ctxWithVisited, ok := withVisitedRepo(ctx, canonicalID)
 	if !ok {
-		// Cycle detected: this repository is already in the parent conversion chain
-		return nil
+		// Waiting for the conversion further up the chain would deadlock
+		return fmt.Errorf("%w: %s is already being converted further up the chain of submodules", ErrSubmoduleCycle, canonicalID)
 	}
 	ctx = ctxWithVisited
 
@@ -250,13 +260,14 @@ func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.Reposi
 	}()
 
 	lock.mu.Lock()
-	if lock.job != nil {
+	for lock.job != nil {
 		job := lock.job
-		if !job.canceled {
+		if !job.canceled && len(want) == 0 {
 			lock.mu.Unlock()
 			return m.waitJob(ctx, lock, job)
 		}
-		// Previous job was canceled and is shutting down; wait for it to exit before starting anew
+		// A canceled job is shutting down, and a running job may not fetch the wanted commits: wait
+		// for it to exit before starting anew
 		lock.mu.Unlock()
 		select {
 		case <-job.done:
@@ -267,7 +278,7 @@ func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.Reposi
 	}
 
 	// 1. Check if the repository already exists and is within its TTL
-	if !m.needsSync(info) {
+	if len(want) == 0 && !m.needsSync(info) {
 		lock.mu.Unlock()
 		return nil
 	}
@@ -278,12 +289,14 @@ func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.Reposi
 		timeout = DefaultExecTimeout
 	}
 	jobCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	// The job outlives this request, but submodule conversions it starts must see the chain
+	jobCtx = context.WithValue(jobCtx, visitedReposKey{}, ctx.Value(visitedReposKey{}))
 	job.cancel = cancel
 	lock.job = job
 	lock.mu.Unlock()
 
 	go func() {
-		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth)
+		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth, want)
 		job.mu.Lock()
 		job.err = err
 		close(job.done)
@@ -334,14 +347,18 @@ func (m *Manager) waitJob(ctx context.Context, lock *repoLock, job *repoJob) err
 	}
 }
 
-func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
+func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, want []string) error {
 	// 1. Check if the repository already exists and is within its TTL
-	if !m.needsSync(info) {
+	if len(want) == 0 && !m.needsSync(info) {
 		return nil
 	}
 
 	// 2. Clone/Fetch the upstream mirror
 	changed, err := m.syncMirror(ctx, info)
+	var cached *cacheFallbackError
+	if errors.As(err, &cached) && len(want) == 0 {
+		changed, err = false, nil // serve the cached repository
+	}
 	if err != nil {
 		return err
 	}
@@ -349,6 +366,14 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 	// If the upstream mirror is natively SHA-256, there is nothing to convert
 	if isRepoSHA256(info.MirrorPath) {
 		return m.syncNativeSHA256(ctx, info, changed, progressWriter)
+	}
+
+	if len(want) > 0 {
+		pinned, err := pinCommits(ctx, info, want)
+		if err != nil {
+			return err
+		}
+		changed = changed || pinned
 	}
 
 	// Skip conversion when the serving repo is a complete conversion and the mirror did not change
@@ -360,15 +385,14 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 		return nil
 	}
 
-	// 3. Opportunistically pre-convert active submodules and load their commit translation maps
-	submoduleCommitMap := m.prepareSubmodules(ctx, info, progressWriter, depth)
-
-	// 4. Convert mirror to serving repo (SHA1 -> SHA256 conversion)
-	if err := m.convertRepo(ctx, info, progressWriter, submoduleCommitMap); err != nil {
+	// 3. Convert the submodules whose commits the history records, deciding every gitlink's SHA-256
+	gitlinks, err := m.resolveGitlinks(ctx, info, progressWriter, depth)
+	if err != nil {
 		return err
 	}
 
-	return nil
+	// 4. Convert mirror to serving repo (SHA1 -> SHA256 conversion)
+	return m.convertRepo(ctx, info, progressWriter, gitlinks)
 }
 
 // isRepoSHA256 checks if a git repository is configured with the sha256 object format.
@@ -528,7 +552,7 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 		_, err := runCmdContext(ctx, upstreamTimeout, "", "git", "-c", "http.followRedirects=false", "clone", "--bare", "--", info.RemoteURL, info.MirrorPath)
 		if err != nil {
 			_ = os.RemoveAll(info.MirrorPath)
-			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, err)
+			return false, fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, markGone(err))
 		}
 		return true, nil // Newly cloned, definitely changed
 	} else {
@@ -537,7 +561,7 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 		if err != nil {
 			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
 				log.Printf("WARNING: cannot read refs of mirror %s (%v), skipping upstream fetch and serving cached repository", info.MirrorPath, err)
-				return false, nil
+				return false, &cacheFallbackError{err}
 			}
 			return false, fmt.Errorf("failed to read refs of mirror %s: %w", info.MirrorPath, err)
 		}
@@ -556,9 +580,9 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 			// Check if we have an existing serving repository to fall back to
 			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
 				log.Printf("WARNING: Upstream fetch failed for %s (%v). Falling back to cached repository.", info.RemoteURL, err)
-				return false, nil
+				return false, &cacheFallbackError{markGone(err)}
 			}
-			return false, fmt.Errorf("upstream fetch failed and no local cache available for %s: %w", info.RemoteURL, err)
+			return false, fmt.Errorf("upstream fetch failed and no local cache available for %s: %w", info.RemoteURL, markGone(err))
 		}
 
 		// Read new refs after fetching & backup creation
@@ -582,6 +606,20 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 	}
 }
 
+// cacheFallbackError reports that the upstream could not be fetched but a converted repository
+// exists, which can be served as cached.
+type cacheFallbackError struct {
+	err error
+}
+
+func (e *cacheFallbackError) Error() string {
+	return "upstream unavailable, cached repository can be served: " + e.err.Error()
+}
+
+func (e *cacheFallbackError) Unwrap() error {
+	return e.err
+}
+
 // looksLikeBareRepo is a deliberately structural check, so a transient git failure can never
 // cause a valid mirror (and its backup refs) to be deleted.
 func looksLikeBareRepo(path string) bool {
@@ -597,229 +635,7 @@ func looksLikeBareRepo(path string) bool {
 // scoped to heads and tags, "git fetch --prune" can never delete refs/evergit-backups/*.
 var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
-type submoduleEntry struct {
-	Name string
-	Path string
-	URL  string
-}
-
-func parseGitmodulesConfig(out string) []submoduleEntry {
-	subMap := make(map[string]*submoduleEntry)
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		key, val, found := strings.Cut(line, "=")
-		if !found {
-			continue
-		}
-		parts := strings.Split(key, ".")
-		if len(parts) >= 3 && parts[0] == "submodule" {
-			name := strings.Join(parts[1:len(parts)-1], ".")
-			prop := parts[len(parts)-1]
-			entry := subMap[name]
-			if entry == nil {
-				entry = &submoduleEntry{Name: name}
-				subMap[name] = entry
-			}
-			switch prop {
-			case "path":
-				entry.Path = val
-			case "url":
-				entry.URL = val
-			}
-		}
-	}
-	var res []submoduleEntry
-	for _, entry := range subMap {
-		if entry.Path != "" && entry.URL != "" {
-			res = append(res, *entry)
-		}
-	}
-	return res
-}
-
-func listActiveSubmodules(ctx context.Context, mirrorPath string) ([]submoduleEntry, error) {
-	uniqueEntries := make(map[string]submoduleEntry)
-
-	// 1. Check HEAD:.gitmodules
-	if out, err := runCmdContext(ctx, 10*time.Second, mirrorPath, "git", "config", "--blob", "HEAD:.gitmodules", "--list"); err == nil {
-		for _, entry := range parseGitmodulesConfig(out) {
-			key := entry.Path + "\x00" + entry.URL
-			uniqueEntries[key] = entry
-		}
-	}
-
-	// 2. Discover historical submodules and previous paths across git history
-	if commitsOut, err := runCmdContext(ctx, 10*time.Second, mirrorPath, "git", "log", "--all", "--format=%H", "-n", "50", "--", ".gitmodules"); err == nil {
-		for _, commit := range strings.Fields(commitsOut) {
-			if blobOut, err := runCmdContext(ctx, 5*time.Second, mirrorPath, "git", "config", "--blob", commit+":.gitmodules", "--list"); err == nil {
-				for _, entry := range parseGitmodulesConfig(blobOut) {
-					key := entry.Path + "\x00" + entry.URL
-					if _, exists := uniqueEntries[key]; !exists {
-						uniqueEntries[key] = entry
-					}
-				}
-			}
-		}
-	}
-
-	if len(uniqueEntries) == 0 {
-		return nil, nil
-	}
-
-	res := make([]submoduleEntry, 0, len(uniqueEntries))
-	for _, entry := range uniqueEntries {
-		res = append(res, entry)
-	}
-	return res, nil
-}
-
-func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.RepositoryInfo) (*resolver.RepositoryInfo, error) {
-	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
-		return nil, errors.New("empty submodule URL")
-	}
-
-	storageRoot := ""
-	if m.cfg != nil && m.cfg.StorageRoot != "" {
-		storageRoot = m.cfg.StorageRoot
-	} else if parentInfo.MirrorPath != "" {
-		storageRoot = filepath.Dir(filepath.Dir(filepath.Dir(parentInfo.MirrorPath)))
-	}
-
-	// Handle local/fixture repos used in testing
-	if parentInfo.Domain == "local" || strings.HasPrefix(rawURL, "/") || strings.HasPrefix(rawURL, "file://") {
-		localPath := strings.TrimPrefix(rawURL, "file://")
-		if !filepath.IsAbs(localPath) && parentInfo.RemoteURL != "" {
-			parentDir := filepath.Dir(parentInfo.RemoteURL)
-			localPath = filepath.Clean(filepath.Join(parentDir, localPath))
-		}
-		repoName := strings.TrimSuffix(filepath.Base(localPath), ".git")
-		if storageRoot == "" {
-			storageRoot = "./storage"
-		}
-		return &resolver.RepositoryInfo{
-			Domain:      "local",
-			Owner:       "submodule",
-			RepoName:    repoName,
-			RemoteURL:   localPath,
-			MirrorPath:  filepath.Join(storageRoot, "mirrors", "local", "submodule", repoName+".git"),
-			ServingPath: filepath.Join(storageRoot, "repos", "local", "submodule", repoName+".git"),
-			BuildsPath:  filepath.Join(storageRoot, "builds", "local", "submodule", repoName+".git"),
-		}, nil
-	}
-
-	cfg := m.cfg
-	if cfg == nil {
-		cfg = &config.Config{
-			StorageRoot:  storageRoot,
-			AllowedHosts: config.DefaultAllowedHosts,
-			Shorthands:   map[string]string{"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"},
-		}
-	}
-
-	var targetPath string
-	if strings.HasPrefix(rawURL, "./") || strings.HasPrefix(rawURL, "../") {
-		// Relative URL: relative to parent repository's remote path
-		parentBase := path.Join(parentInfo.Domain, parentInfo.Owner)
-		targetPath = path.Clean(path.Join(parentBase, rawURL))
-	} else if strings.HasPrefix(rawURL, "git@") {
-		// git@domain:owner/repo.git
-		trimmed := strings.TrimPrefix(rawURL, "git@")
-		domain, repoPart, found := strings.Cut(trimmed, ":")
-		if !found {
-			return nil, fmt.Errorf("invalid git@ submodule URL %q", rawURL)
-		}
-		targetPath = domain + "/" + repoPart
-	} else if strings.Contains(rawURL, "://") {
-		u, err := url.Parse(rawURL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse submodule URL %q: %w", rawURL, err)
-		}
-		host := u.Hostname()
-		repoPart := strings.TrimPrefix(u.Path, "/")
-		targetPath = host + "/" + repoPart
-	} else {
-		targetPath = rawURL
-	}
-
-	targetPath = strings.TrimSuffix(targetPath, ".git")
-	return resolver.ParsePath(targetPath, cfg)
-}
-
-// loadSubmoduleTranslations reads a submodule's SHA-1 -> SHA-256 translations from its loose-object-idx.
-func loadSubmoduleTranslations(servingPath string) (map[string]string, error) {
-	f, err := os.Open(filepath.Join(servingPath, "objects", "loose-object-idx"))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	sha1ToSHA256 := make(map[string]string)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		sha256, sha1, found := strings.Cut(scanner.Text(), " ")
-		if found && len(sha256) == sha256HexLen && len(sha1) == sha1HexLen {
-			sha1ToSHA256[sha1] = sha256
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return sha1ToSHA256, nil
-}
-
-func (m *Manager) prepareSubmodules(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) map[string]map[string]string {
-	submodules, err := listActiveSubmodules(ctx, info.MirrorPath)
-	if err != nil || len(submodules) == 0 {
-		return nil
-	}
-
-	submoduleCommitMap := make(map[string]map[string]string)
-	translationsCache := make(map[string]map[string]string)
-
-	for _, entry := range submodules {
-		subInfo, err := m.resolveSubmoduleInfo(entry.URL, info)
-		if err != nil {
-			if m.debug {
-				log.Printf("[%s] Submodule %q (%s) cannot be resolved: %v", info.RepoName, entry.Path, entry.URL, err)
-			}
-			continue
-		}
-
-		if depth > 0 {
-			if err := m.EnsureRepoWithDepth(ctx, subInfo, progressWriter, depth-1); err != nil {
-				log.Printf("[%s] Warning: failed to pre-convert submodule %q: %v", info.RepoName, entry.Path, err)
-			}
-		}
-
-		translations, cached := translationsCache[subInfo.ServingPath]
-		if !cached {
-			if loaded, err := loadSubmoduleTranslations(subInfo.ServingPath); err == nil && len(loaded) > 0 {
-				translations = loaded
-				translationsCache[subInfo.ServingPath] = translations
-				if m.debug {
-					log.Printf("[%s] Loaded %d commit translations for submodule repo %s", info.RepoName, len(translations), subInfo.ServingPath)
-				}
-			} else {
-				translationsCache[subInfo.ServingPath] = nil
-			}
-		}
-
-		if len(translations) > 0 {
-			submoduleCommitMap[entry.Path] = translations
-			if m.debug {
-				log.Printf("[%s] Mapped %d commit translations to submodule path %q", info.RepoName, len(translations), entry.Path)
-			}
-		}
-	}
-	return submoduleCommitMap
-}
-
-func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, submoduleCommitMap map[string]map[string]string) error {
+func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution) error {
 	// Guard against unbounded concurrent conversions across all repositories
 	if m.conversionSem != nil {
 		wait := m.conversionWait
@@ -836,7 +652,7 @@ func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo
 		}
 	}
 
-	return m.convertObjects(ctx, info, progressWriter, submoduleCommitMap)
+	return m.convertObjects(ctx, info, progressWriter, gitlinks)
 }
 
 // syntheticSHA256Padding turns the SHA-1 of a submodule commit without a known translation into a
