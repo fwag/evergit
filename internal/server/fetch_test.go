@@ -128,3 +128,38 @@ func mustRun(t *testing.T, dir, name string, args ...string) string {
 	}
 	return out
 }
+
+func TestCloneThroughEquivalentURLs(t *testing.T) {
+	tempDir := t.TempDir()
+	upstream := filepath.Join(tempDir, "upstream")
+	mustRun(t, "", "git", "init", "-q", "--initial-branch=main", "--object-format=sha1", upstream)
+	mustRun(t, upstream, "git", "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-q", "--allow-empty", "-m", "initial")
+
+	cfg := &config.Config{
+		StorageRoot:       filepath.Join(tempDir, "storage"),
+		AllowedHosts:      []string{"github.com"},
+		Shorthands:        config.ParseShorthands(config.DefaultShorthands),
+		UpstreamOverrides: map[string]string{"github.com": upstream},
+	}
+	conv := converter.NewManager(0)
+	conv.SetConfig(cfg)
+	httpServer, err := server.NewHTTPServer(cfg, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(httpServer)
+	defer ts.Close()
+
+	// All name the same repository: a shorthand, no ".git", and another case on a case-insensitive forge
+	var heads []string
+	for i, path := range []string{"/github.com/owner/repo.git", "/github/owner/repo.git", "/github.com/owner/repo", "/github/Owner/Repo"} {
+		clone := filepath.Join(tempDir, "clone"+string(rune('0'+i)))
+		mustRun(t, "", "git", "clone", "-q", ts.URL+path, clone)
+		heads = append(heads, mustRun(t, clone, "git", "rev-parse", "HEAD"))
+	}
+	for _, head := range heads[1:] {
+		if head != heads[0] {
+			t.Errorf("clones through equivalent URLs differ: %v", heads)
+		}
+	}
+}

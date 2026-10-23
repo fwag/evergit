@@ -93,8 +93,17 @@ func NewHTTPServer(cfg *config.Config, conv *converter.Manager) (*HTTPServer, er
 			return
 		}
 
-		// Serve using git-http-backend cgi
-		cgiHandler.ServeHTTP(w, r)
+		// Serve using git-http-backend cgi, at the repository's canonical path: the request may use a
+		// shorthand ("github/..."), omit ".git" or differ in case on case-insensitive forges
+		canonical, err := filepath.Rel(filepath.Join(cfg.StorageRoot, "repos"), info.ServingPath)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		backendReq := r.Clone(r.Context())
+		backendReq.URL.Path = "/" + filepath.ToSlash(canonical) + strings.TrimPrefix(r.URL.Path, "/"+repoPath)
+		backendReq.URL.RawPath = ""
+		cgiHandler.ServeHTTP(w, backendReq)
 	})
 
 	return s, nil
