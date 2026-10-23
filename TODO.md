@@ -16,11 +16,11 @@ This checklist tracks security, rate-limiting, and hardening improvements across
   - [ ] `refs/evergit-backups/*` reaches the serving repo (`fast-export --all`, and the explicit refspec in `syncNativeSHA256`), so clients can fetch commits that upstream removed, e.g. leaked secrets or DMCA takedowns.
   - [ ] Decide: keep backups in the mirror only and stop serving them, or document the behavior explicitly.
 
-- [ ] **[High] Submodule URLs can make the server clone its own local repositories**
-  - [ ] `resolveSubmoduleInfo` treats any submodule URL starting with `/` or `file://` as a local path, for any parent repository, bypassing `AllowedHosts`. A public repository whose `.gitmodules` points at a server path makes Evergit clone and convert any git repository the daemon can read (disk/CPU use, and a yes/no oracle on local repositories and commits through real vs padded gitlinks).
-  - [ ] Local mirrors are named by basename only (`mirrors/local/submodule/<name>.git`), so different local repositories collide.
-  - [ ] A relative `file://` URL is joined onto `https:/github.com/...`, which git parses as an scp-style ssh target with host `https`.
-  - [ ] Fix: drop the branch from production code; tests inject local upstreams through `UpstreamOverrides`.
+- [x] **[High] Submodule URLs can make the server clone its own local repositories**
+  - [x] `resolveSubmoduleInfo` treats any submodule URL starting with `/` or `file://` as a local path, for any parent repository, bypassing `AllowedHosts`. A public repository whose `.gitmodules` points at a server path makes Evergit clone and convert any git repository the daemon can read (disk/CPU use, and a yes/no oracle on local repositories and commits through real vs padded gitlinks).
+  - [x] Local mirrors are named by basename only (`mirrors/local/submodule/<name>.git`), so different local repositories collide.
+  - [x] A relative `file://` URL is joined onto `https:/github.com/...`, which git parses as an scp-style ssh target with host `https`.
+  - [x] Fix: dropped the branch; local paths and non-network URL schemes are rejected (and so need an approval like any submodule that cannot be converted). Tests mirror local upstreams from per-upstream hosts through `UpstreamOverrides`.
 
 - [ ] **[Low] Shell injection in `/setup.sh` through the `Host` header**
   - [ ] Without `PublicURL`, `r.Host` is rendered unescaped into `HTTP_BASE="..."`; Go accepts `Host: $(id;...)`, which runs in the victim's shell under `curl | bash`. Needs an attacker-influenced Host header (reverse proxy, cache poisoning).

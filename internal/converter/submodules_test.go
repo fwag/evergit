@@ -15,28 +15,44 @@ import (
 	"evergit/internal/resolver"
 )
 
-// newSubmoduleManager stores local submodules under root, so separate managers share nothing.
-func newSubmoduleManager(root string, ttl time.Duration) *Manager {
+// Test upstreams are mirrored like any upstream: each from its own allowed host, which is overridden
+// to the upstream's local path (an override applies to a whole host).
+
+// hostOf is the host a test upstream is mirrored from.
+func hostOf(upstream string) string {
+	return strings.TrimSuffix(filepath.Base(upstream), ".git") + ".test"
+}
+
+// urlOf is the URL of a test upstream, e.g. for .gitmodules.
+func urlOf(upstream string) string {
+	return "https://" + hostOf(upstream) + "/test/" + filepath.Base(upstream)
+}
+
+// newSubmoduleManager stores everything under root, so separate managers share nothing, and mirrors
+// the given test upstreams.
+func newSubmoduleManager(root string, ttl time.Duration, upstreams ...string) *Manager {
+	cfg := &config.Config{
+		StorageRoot:       root,
+		AllowedHosts:      slices.Clone(config.DefaultAllowedHosts),
+		UpstreamOverrides: make(map[string]string),
+	}
+	for _, upstream := range upstreams {
+		cfg.AllowedHosts = append(cfg.AllowedHosts, hostOf(upstream))
+		cfg.UpstreamOverrides[hostOf(upstream)] = upstream
+	}
 	m := NewManager(ttl)
-	m.SetConfig(&config.Config{StorageRoot: root, AllowedHosts: config.DefaultAllowedHosts})
+	m.SetConfig(cfg)
 	return m
 }
 
-func repoInfoAt(root, upstream, name string) *resolver.RepositoryInfo {
-	return &resolver.RepositoryInfo{
-		Domain:      "local",
-		Owner:       "test",
-		RepoName:    name,
-		RemoteURL:   upstream,
-		MirrorPath:  filepath.Join(root, "mirrors", "local", "test", name+".git"),
-		ServingPath: filepath.Join(root, "repos", "local", "test", name+".git"),
-		BuildsPath:  filepath.Join(root, "builds", "local", "test", name+".git"),
+// repoInfo resolves a test upstream as Evergit resolves its URL.
+func repoInfo(t *testing.T, m *Manager, upstream string) *resolver.RepositoryInfo {
+	t.Helper()
+	info, err := resolver.ParsePath(hostOf(upstream)+"/test/"+filepath.Base(upstream), m.cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-// submoduleServingPath is where a local submodule is converted under root.
-func submoduleServingPath(root, upstream string) string {
-	return filepath.Join(root, "repos", "local", "submodule", filepath.Base(upstream))
+	return info
 }
 
 // addGitlink records commit of sub at path in super, with a .gitmodules entry unless url is "".
@@ -88,7 +104,7 @@ func gitlinkOf(t *testing.T, repoPath, rev, path string) string {
 func TestSubmoduleTemporaryFailureFailsConversion(t *testing.T) {
 	sub := newTestUpstream(t)
 	super := newTestUpstream(t)
-	addGitlink(t, super, "sub", sub, gitLine(t, sub, nil, "rev-parse", "HEAD"))
+	addGitlink(t, super, "sub", urlOf(sub), gitLine(t, sub, nil, "rev-parse", "HEAD"))
 	// Reading the submodule upstream fails ("Could not read from remote repository", as for network
 	// errors): unlike a missing repository, not a permanent reason for the synthetic SHA-256
 	if err := os.RemoveAll(sub); err != nil {
@@ -98,9 +114,9 @@ func TestSubmoduleTemporaryFailureFailsConversion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	err := newSubmoduleManager(root, 0).EnsureRepo(context.Background(), info, nil)
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	err := m.EnsureRepo(context.Background(), info, nil)
 	if !errors.Is(err, ErrSubmoduleUnavailable) {
 		t.Fatalf("EnsureRepo = %v, want ErrSubmoduleUnavailable", err)
 	}
@@ -113,17 +129,16 @@ func TestSubmoduleGoneUpstreamNeedsApproval(t *testing.T) {
 	sub := newTestUpstream(t)
 	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
 	super := newTestUpstream(t)
-	addGitlink(t, super, "sub", sub, commit)
+	addGitlink(t, super, "sub", urlOf(sub), commit)
 	if err := os.RemoveAll(sub); err != nil {
 		t.Fatal(err)
 	}
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	m := newSubmoduleManager(root, 0)
-	assertNeedsApproval(t, m.EnsureRepo(context.Background(), info, nil), "local/test/super", sub)
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	assertNeedsApproval(t, m.EnsureRepo(context.Background(), info, nil), canonicalRepoID(info), urlOf(sub))
 
-	approveSynthetic(t, m, "local/test/super "+sub)
+	approveSynthetic(t, m, canonicalRepoID(info)+" "+urlOf(sub))
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -136,14 +151,13 @@ func TestSubmoduleCommitMissingUpstreamNeedsApproval(t *testing.T) {
 	sub := newTestUpstream(t)
 	super := newTestUpstream(t)
 	missing := strings.Repeat("ab", 20)
-	addGitlink(t, super, "sub", sub, missing)
+	addGitlink(t, super, "sub", urlOf(sub), missing)
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	m := newSubmoduleManager(root, 0)
-	assertNeedsApproval(t, m.EnsureRepo(context.Background(), info, nil), "local/test/super", sub)
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	assertNeedsApproval(t, m.EnsureRepo(context.Background(), info, nil), canonicalRepoID(info), urlOf(sub))
 
-	approveSynthetic(t, m, "* "+sub)
+	approveSynthetic(t, m, "* "+urlOf(sub))
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -158,18 +172,16 @@ func TestSubmoduleHostNotAllowedNeedsApproval(t *testing.T) {
 	commit := strings.Repeat("cd", 20)
 	addGitlink(t, super, "lib", url, commit)
 
-	// A superproject on an allowed forge, whose submodule lives on a host that is not allowed
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	info.Domain, info.Owner = "github.com", "owner"
-	m := newSubmoduleManager(root, 0)
+	// The submodule lives on a host that is not allowed
+	m := newSubmoduleManager(t.TempDir(), 0, super)
+	info := repoInfo(t, m, super)
 	err := m.EnsureRepo(context.Background(), info, nil)
-	assertNeedsApproval(t, err, "github.com/owner/super", url)
+	assertNeedsApproval(t, err, canonicalRepoID(info), url)
 	if !strings.Contains(err.Error(), "-allowed-hosts") {
 		t.Errorf("error should mention allowing the host:\n%v", err)
 	}
 
-	approveSynthetic(t, m, "github.com/owner/super "+url)
+	approveSynthetic(t, m, canonicalRepoID(info)+" "+url)
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -181,11 +193,10 @@ func TestSubmoduleHostNotAllowedNeedsApproval(t *testing.T) {
 func TestSubmoduleWithinTTLIsRefreshed(t *testing.T) {
 	sub := newTestUpstream(t)
 	super := newTestUpstream(t)
-	addGitlink(t, super, "sub", sub, gitLine(t, sub, nil, "rev-parse", "HEAD"))
+	addGitlink(t, super, "sub", urlOf(sub), gitLine(t, sub, nil, "rev-parse", "HEAD"))
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	m := newSubmoduleManager(root, time.Hour)
+	m := newSubmoduleManager(t.TempDir(), time.Hour, super, sub)
+	info := repoInfo(t, m, super)
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +204,7 @@ func TestSubmoduleWithinTTLIsRefreshed(t *testing.T) {
 	// The superproject records a submodule commit newer than the converted submodule
 	commitToUpstream(t, sub, "sub 2")
 	newCommit := gitLine(t, sub, nil, "rev-parse", "HEAD")
-	addGitlink(t, super, "sub", sub, newCommit)
+	addGitlink(t, super, "sub", urlOf(sub), newCommit)
 	old := time.Now().Add(-2 * time.Hour)
 	if err := os.Chtimes(filepath.Join(info.ServingPath, "HEAD"), old, old); err != nil {
 		t.Fatal(err)
@@ -202,7 +213,7 @@ func TestSubmoduleWithinTTLIsRefreshed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want, err := LookupID(submoduleServingPath(root, sub), "sha1", newCommit)
+	want, err := LookupID(repoInfo(t, m, sub).ServingPath, "sha1", newCommit)
 	if err != nil {
 		t.Fatalf("submodule was not refreshed: %v", err)
 	}
@@ -214,23 +225,23 @@ func TestSubmoduleWithinTTLIsRefreshed(t *testing.T) {
 func TestSubmoduleConversionIndependentOfRequestOrder(t *testing.T) {
 	leaf := newTestUpstream(t)
 	mid := newTestUpstream(t)
-	addGitlink(t, mid, "leaf", leaf, gitLine(t, leaf, nil, "rev-parse", "HEAD"))
+	addGitlink(t, mid, "leaf", urlOf(leaf), gitLine(t, leaf, nil, "rev-parse", "HEAD"))
 	top := newTestUpstream(t)
-	addGitlink(t, top, "mid", mid, gitLine(t, mid, nil, "rev-parse", "HEAD"))
+	addGitlink(t, top, "mid", urlOf(mid), gitLine(t, mid, nil, "rev-parse", "HEAD"))
 
 	// Requested directly
-	direct := t.TempDir()
-	midInfo := repoInfoAt(direct, mid, "mid")
-	if err := newSubmoduleManager(direct, 0).EnsureRepo(context.Background(), midInfo, nil); err != nil {
+	direct := newSubmoduleManager(t.TempDir(), 0, mid, leaf)
+	midInfo := repoInfo(t, direct, mid)
+	if err := direct.EnsureRepo(context.Background(), midInfo, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Reached as a submodule
-	nested := t.TempDir()
-	if err := newSubmoduleManager(nested, 0).EnsureRepo(context.Background(), repoInfoAt(nested, top, "top"), nil); err != nil {
+	nested := newSubmoduleManager(t.TempDir(), 0, top, mid, leaf)
+	if err := nested.EnsureRepo(context.Background(), repoInfo(t, nested, top), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	if got, want := headOf(t, submoduleServingPath(nested, mid)), headOf(t, midInfo.ServingPath); got != want {
+	if got, want := headOf(t, repoInfo(t, nested, mid).ServingPath), headOf(t, midInfo.ServingPath); got != want {
 		t.Errorf("submodule reached through a superproject converted to %s, directly to %s", got, want)
 	}
 }
@@ -239,7 +250,7 @@ func TestSubmoduleDiscoveredFromOldHistory(t *testing.T) {
 	sub := newTestUpstream(t)
 	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
 	super := newTestUpstream(t)
-	addGitlink(t, super, "old", sub, commit)
+	addGitlink(t, super, "old", urlOf(sub), commit)
 	recording := gitLine(t, super, nil, "rev-parse", "HEAD")
 	// The submodule is removed, and .gitmodules changes many times afterwards
 	gitRaw(t, super, nil, "rm", "-q", "--cached", "old")
@@ -252,12 +263,12 @@ func TestSubmoduleDiscoveredFromOldHistory(t *testing.T) {
 		gitRaw(t, super, nil, "commit", "-q", "-m", fmt.Sprintf("dummy %d", i))
 	}
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	if err := newSubmoduleManager(root, 0).EnsureRepo(context.Background(), info, nil); err != nil {
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
-	want, err := LookupID(submoduleServingPath(root, sub), "sha1", commit)
+	want, err := LookupID(repoInfo(t, m, sub).ServingPath, "sha1", commit)
 	if err != nil {
 		t.Fatalf("submodule only in old history was not converted: %v", err)
 	}
@@ -280,14 +291,14 @@ func TestSubmoduleCommitOnNoBranchIsFetched(t *testing.T) {
 	gitRaw(t, sub, nil, "checkout", "-q", "main")
 	gitRaw(t, sub, nil, "branch", "-D", "pr")
 	super := newTestUpstream(t)
-	addGitlink(t, super, "sub", sub, commit)
+	addGitlink(t, super, "sub", urlOf(sub), commit)
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	if err := newSubmoduleManager(root, 0).EnsureRepo(context.Background(), info, nil); err != nil {
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
-	want, err := LookupID(submoduleServingPath(root, sub), "sha1", commit)
+	want, err := LookupID(repoInfo(t, m, sub).ServingPath, "sha1", commit)
 	if err != nil {
 		t.Fatalf("commit on no branch was not fetched into the submodule: %v", err)
 	}
@@ -300,16 +311,15 @@ func TestGitlinkDecisionsAreKept(t *testing.T) {
 	sub := newTestUpstream(t)
 	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
 	super := newTestUpstream(t)
-	addGitlink(t, super, "dir/sub", sub, commit)
+	addGitlink(t, super, "dir/sub", urlOf(sub), commit)
 	away := sub + ".away"
 	if err := os.Rename(sub, away); err != nil {
 		t.Fatal(err)
 	}
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	m := newSubmoduleManager(root, 0)
-	approveSynthetic(t, m, "local/test/super "+sub)
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	approveSynthetic(t, m, canonicalRepoID(info)+" "+urlOf(sub))
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -371,11 +381,11 @@ func TestSubmodulePointingIntoItsOwnRepository(t *testing.T) {
 	commitToUpstream(t, super, "pages")
 	pages := gitLine(t, super, nil, "rev-parse", "HEAD")
 	gitRaw(t, super, nil, "checkout", "-q", "main")
-	addGitlink(t, super, "docs", super, pages)
+	addGitlink(t, super, "docs", urlOf(super), pages)
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	if err := newSubmoduleManager(root, 0).EnsureRepo(context.Background(), info, nil); err != nil {
+	m := newSubmoduleManager(t.TempDir(), 0, super)
+	info := repoInfo(t, m, super)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := gitlinkOf(t, info.ServingPath, "main", "docs"), gitLine(t, info.ServingPath, nil, "--git-dir=.", "rev-parse", "gh-pages"); got != want {
@@ -411,16 +421,16 @@ func TestStateRecordsSubmoduleDecisions(t *testing.T) {
 	commitToUpstream(t, gone, "only in the gone repository") // not the same commit as sub's
 	goneCommit := gitLine(t, gone, nil, "rev-parse", "HEAD")
 	super := newTestUpstream(t)
-	addGitlink(t, super, "sub", sub, subCommit)
-	addGitlink(t, super, "gone", gone, goneCommit)
+	addGitlink(t, super, "sub", urlOf(sub), subCommit)
+	addGitlink(t, super, "gone", urlOf(gone), goneCommit)
 	if err := os.RemoveAll(gone); err != nil {
 		t.Fatal(err)
 	}
 
-	root := t.TempDir()
-	info := repoInfoAt(root, super, "super")
-	m := newSubmoduleManager(root, 0)
-	approveSynthetic(t, m, "local/test/super "+gone)
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub, gone)
+	info := repoInfo(t, m, super)
+	approval := canonicalRepoID(info) + " " + urlOf(gone)
+	approveSynthetic(t, m, approval)
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -432,16 +442,52 @@ func TestStateRecordsSubmoduleDecisions(t *testing.T) {
 	if state.ConversionVersion != conversionVersion {
 		t.Errorf("conversion_version = %d, want %d", state.ConversionVersion, conversionVersion)
 	}
-	want, err := LookupID(submoduleServingPath(root, sub), "sha1", subCommit)
+	want, err := LookupID(repoInfo(t, m, sub).ServingPath, "sha1", subCommit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := state.Submodules[sub].Translated[subCommit]; got != want {
+	if got := state.Submodules[urlOf(sub)].Translated[subCommit]; got != want {
 		t.Errorf("state records %s for submodule %s commit %s, want %s", got, sub, subCommit, want)
 	}
-	synthetic := state.Submodules[gone].Synthetic
+	synthetic := state.Submodules[urlOf(gone)].Synthetic
 	if len(synthetic) != 1 || !slices.Equal(synthetic[0].Commits, []string{goneCommit}) ||
-		synthetic[0].ApprovedBy != "local/test/super "+gone || !strings.Contains(synthetic[0].Reason, "gone upstream") {
+		synthetic[0].ApprovedBy != approval || !strings.Contains(synthetic[0].Reason, "gone upstream") {
 		t.Errorf("synthetic decisions of %s = %+v, want commit %s approved by its line, gone upstream", gone, synthetic, goneCommit)
+	}
+}
+
+func TestSubmoduleURLsNeverReachLocalFiles(t *testing.T) {
+	m := newSubmoduleManager(t.TempDir(), 0)
+	for _, parent := range []*resolver.RepositoryInfo{
+		{Domain: "github.com", Owner: "owner", RepoName: "repo"},
+		{Domain: "local", Owner: "test", RepoName: "repo"}, // treated as local paths in the past
+	} {
+		for _, url := range []string{"/srv/evergit/storage/repos/x.git", "file:///etc/x.git", "file://localhost/srv/x.git", "file:x.git"} {
+			if info, err := m.resolveSubmoduleInfo(url, parent); err == nil {
+				t.Errorf("submodule %q of %s resolved to %s (%s), want an error", url, canonicalRepoID(parent), canonicalRepoID(info), info.RemoteURL)
+			}
+		}
+	}
+}
+
+func TestSubmoduleWithLocalPathIsNotCloned(t *testing.T) {
+	// A repository on the server that a public superproject points at
+	secret := newTestUpstream(t)
+	super := newTestUpstream(t)
+	addGitlink(t, super, "secret", secret, gitLine(t, secret, nil, "rev-parse", "HEAD"))
+
+	root := t.TempDir()
+	m := newSubmoduleManager(root, 0, super)
+	info := repoInfo(t, m, super)
+	err := m.EnsureRepo(context.Background(), info, nil)
+	assertNeedsApproval(t, err, canonicalRepoID(info), secret)
+
+	// Only the superproject was mirrored
+	mirrors, err := filepath.Glob(filepath.Join(root, "mirrors", "*", "*", "*.git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mirrors) != 1 || mirrors[0] != info.MirrorPath {
+		t.Errorf("mirrors = %v, want only the superproject's %s", mirrors, info.MirrorPath)
 	}
 }

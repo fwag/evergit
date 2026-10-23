@@ -565,26 +565,10 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 		storageRoot = filepath.Dir(filepath.Dir(filepath.Dir(parentInfo.MirrorPath)))
 	}
 
-	// Handle local/fixture repos used in testing
-	if parentInfo.Domain == "local" || strings.HasPrefix(rawURL, "/") || strings.HasPrefix(rawURL, "file://") {
-		localPath := strings.TrimPrefix(rawURL, "file://")
-		if !filepath.IsAbs(localPath) && parentInfo.RemoteURL != "" {
-			parentDir := filepath.Dir(parentInfo.RemoteURL)
-			localPath = filepath.Clean(filepath.Join(parentDir, localPath))
-		}
-		repoName := strings.TrimSuffix(filepath.Base(localPath), ".git")
-		if storageRoot == "" {
-			storageRoot = "./storage"
-		}
-		return &resolver.RepositoryInfo{
-			Domain:      "local",
-			Owner:       "submodule",
-			RepoName:    repoName,
-			RemoteURL:   localPath,
-			MirrorPath:  filepath.Join(storageRoot, "mirrors", "local", "submodule", repoName+".git"),
-			ServingPath: filepath.Join(storageRoot, "repos", "local", "submodule", repoName+".git"),
-			BuildsPath:  filepath.Join(storageRoot, "builds", "local", "submodule", repoName+".git"),
-		}, nil
+	// Submodules are mirrored from allowed hosts only: a URL in a public repository's .gitmodules
+	// must never make Evergit read the server's own files
+	if strings.HasPrefix(rawURL, "/") {
+		return nil, fmt.Errorf("local path %q is not mirrored", rawURL)
 	}
 
 	cfg := m.cfg
@@ -614,6 +598,9 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse submodule URL %q: %w", rawURL, err)
 		}
+		if !slices.Contains(networkSchemes, u.Scheme) {
+			return nil, fmt.Errorf("URL scheme %q is not mirrored", u.Scheme)
+		}
 		host := u.Hostname()
 		repoPart := strings.TrimPrefix(u.Path, "/")
 		targetPath = host + "/" + repoPart
@@ -624,6 +611,9 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 	targetPath = strings.TrimSuffix(targetPath, ".git")
 	return resolver.ParsePath(targetPath, cfg)
 }
+
+// networkSchemes are the URL schemes of submodules that can be mirrored from an allowed host.
+var networkSchemes = []string{"https", "http", "ssh", "git", "git+ssh", "ssh+git"}
 
 // loadSubmoduleTranslations reads a submodule's SHA-1 -> SHA-256 translations from its loose-object-idx.
 func loadSubmoduleTranslations(servingPath string) (map[string]string, error) {
