@@ -3,6 +3,7 @@ package converter
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -397,6 +398,7 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 	if err != nil {
 		return err
 	}
+	defer gitlinks.close()
 
 	// 4. Convert mirror to serving repo (SHA1 -> SHA256 conversion)
 	return m.convertRepo(ctx, info, progressWriter, gitlinks)
@@ -952,24 +954,16 @@ func (m *Manager) logBackupRefs(info *resolver.RepositoryInfo) {
 	}
 	backups := parseShowRef(backupRefsOut) // refname -> sha256
 
-	// One pass over the translation map, keeping only the backup targets
-	sha256ToSha1 := make(map[string]string)
-	for _, sha256 := range backups {
-		sha256ToSha1[sha256] = "unknown"
-	}
-	if f, err := os.Open(filepath.Join(info.ServingPath, "objects", "loose-object-idx")); err == nil {
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			sha256, sha1, found := strings.Cut(scanner.Text(), " ")
-			if _, wanted := sha256ToSha1[sha256]; found && wanted {
-				sha256ToSha1[sha256] = sha1
+	index, _ := openTranslationIndex(filepath.Join(info.ServingPath, sha256IndexFile), len(sha256ID{}))
+	defer index.Close()
+	for refName, sha256 := range backups {
+		sha1 := "unknown"
+		if key, err := hex.DecodeString(sha256); err == nil {
+			if value, ok := index.lookup(key); ok {
+				sha1 = hex.EncodeToString(value)
 			}
 		}
-		f.Close()
-	}
-
-	for refName, sha256 := range backups {
-		log.Printf("[Backup] Preserved history: %s -> SHA256: %s (SHA1: %s)", refName, sha256, sha256ToSha1[sha256])
+		log.Printf("[Backup] Preserved history: %s -> SHA256: %s (SHA1: %s)", refName, sha256, sha1)
 	}
 }
 
@@ -998,6 +992,20 @@ func LookupID(repoPath, format, id string) (string, error) {
 	id = strings.ToLower(id)
 	if len(id) < minIDPrefix || len(id) > maxLen || strings.Trim(id, "0123456789abcdef") != "" {
 		return "", fmt.Errorf("%w: %q is not a %s id of %d to %d hex digits", ErrIDInvalid, id, format, minIDPrefix, maxLen)
+	}
+
+	// Binary search in the translation index; repositories converted before it existed are scanned
+	indexFile := map[string]string{"sha1": sha1IndexFile, "sha256": sha256IndexFile}[format]
+	if index, err := openTranslationIndex(filepath.Join(repoPath, indexFile), maxLen/2); err == nil {
+		defer index.Close()
+		switch matches := index.withPrefix(id, 2); len(matches) {
+		case 0:
+			return "", fmt.Errorf("%w: %s", ErrIDNotFound, id)
+		case 1:
+			return hex.EncodeToString(matches[0]), nil
+		default:
+			return "", fmt.Errorf("%w: %s", ErrIDAmbiguous, id)
+		}
 	}
 
 	f, err := os.Open(filepath.Join(repoPath, "objects", "loose-object-idx"))

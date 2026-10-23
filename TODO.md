@@ -35,8 +35,8 @@ This checklist tracks security, rate-limiting, and hardening improvements across
 - [x] **[Low] Log injection via SSH command**
   - [x] `executeGitCommand` logs `rawCmd` with `%s`; a client can forge log lines with embedded newlines. Use `%q`.
 
-- [ ] **[Low] `LookupID` scans the whole `loose-object-idx` per request**
-  - [ ] Expensive on very large repositories; consider an index or sorted file with binary search.
+- [x] **[Low] `LookupID` scans the whole `loose-object-idx` per request**
+  - [x] Expensive on very large repositories (1.2 GB for the Linux kernel). It now uses the sorted, memory-mapped translation indexes (`evergit-sha1.idx`, `evergit-sha256.idx`).
 
 ---
 
@@ -138,7 +138,8 @@ Goal: the same SHA-1 history always converts to the same SHA-256 history, across
   - [x] Golden test pinning the SHA-256 of a fixed SHA-1 history; a change requires bumping `conversionVersion`.
   - Not needed since object-level conversion: object ids no longer depend on the git version (git only reads objects, indexes and repacks the bytes Evergit writes), so no startup canary, `-git-path` or git version matrix.
 - [ ] **Scaling limits**
-  - [ ] The SHA-1 -> SHA-256 table is held in memory (~100 bytes per object, ~1 GB for the Linux kernel) and blobs are read whole.
+  - [x] Incremental conversions loaded the whole SHA-1 -> SHA-256 table (16 s and 1.4 GB per update of the Linux kernel); they now walk only new history and look earlier objects up in the sorted, memory-mapped indexes (5.6 s and ~0.5 GB).
+  - [ ] A full conversion still holds its translations in memory (~230 bytes per object: 2.7 GB for the Linux kernel's 11.9 million objects) and reads blobs whole; each update rewrites both indexes (2 x 620 MB for the kernel).
   - [x] Incremental pack merges ran `repack -f` every 8 updates (about 1.5 hours on the Linux kernel) while clients waited. Updates are now merged geometrically; a full `repack -f` runs only once update packs reach 25% of the main pack, while the current copy is served (`-request-wait`).
   - [x] Conversions were cancelled when their clients disconnected and limited to 1 hour, so behind a proxy timeout large repositories never converted. They now run to `-max-conversion-time` (default 12h); requests wait at most `-request-wait`.
   - [ ] Reusing the source pack's blob deltas would avoid recompressing every file version (conversion time is dominated by raw blob volume: 15 min for libvirt's 33 GB).

@@ -410,7 +410,7 @@ type objectRewriter struct {
 	packDir  string
 	pack     *packWriter
 	chunk    []packedObject // objects in pack
-	ids      map[sha1ID]sha256ID
+	ids      *translations
 	added    []sha1ID // objects converted in this run, in conversion order
 	gitlinks *gitlinkResolution
 	progress func(converted int)
@@ -421,7 +421,7 @@ type objectRewriter struct {
 }
 
 func (r *objectRewriter) convert(id sha1ID, name string) (sha256ID, error) {
-	if newID, ok := r.ids[id]; ok {
+	if newID, ok := r.ids.lookup(id); ok {
 		return newID, nil
 	}
 	typ, data, err := r.cat.read(id)
@@ -447,7 +447,7 @@ func (r *objectRewriter) convert(id sha1ID, name string) (sha256ID, error) {
 		return sha256ID{}, fmt.Errorf("failed to write %s %x to pack: %w", typ, id, err)
 	}
 	r.chunk = append(r.chunk, packedObject{id: newID, name: name})
-	r.ids[id] = newID
+	r.ids.added[id] = newID
 	r.added = append(r.added, id)
 	if r.progress != nil && len(r.added)%progressObjectInterval == 0 {
 		r.progress(len(r.added))
@@ -566,11 +566,16 @@ func (r *objectRewriter) flushChunk() error {
 }
 
 // rewriteObjects converts every object reachable from the mirror's refs that is not yet in ids
-// into packs in targetPath. It returns the converted ids in conversion order, and the objects
-// mergetags refer to but the repository lacks, with a merge recording each.
-func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids map[sha1ID]sha256ID, gitlinks *gitlinkResolution, progress func(int)) ([]sha1ID, map[string]string, error) {
+// into packs in targetPath, walking only history not reachable from exclude (refs converted
+// before). It returns the converted ids in conversion order, and the objects mergetags refer to but
+// the repository lacks, with a merge recording each.
+func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *translations, gitlinks *gitlinkResolution, exclude []string, progress func(int)) ([]sha1ID, map[string]string, error) {
 	// Parents before children keeps the recursion in convert shallow: commits only recurse into trees
-	commits, err := runCmdContext(ctx, 0, mirrorPath, "git", "rev-list", "--reverse", "--topo-order", "--all")
+	args := []string{"rev-list", "--reverse", "--topo-order", "--all"}
+	if len(exclude) > 0 {
+		args = append(append(args, "--not"), exclude...)
+	}
+	commits, err := runCmdContext(ctx, 0, mirrorPath, "git", args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -610,82 +615,8 @@ func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids map[
 	return r.added, r.missingMergetags, nil
 }
 
-// loadTranslationTable reads a repository's loose-object-idx into a map.
-func loadTranslationTable(repoPath string) (map[sha1ID]sha256ID, error) {
-	return loadTranslationFile(filepath.Join(repoPath, "objects", "loose-object-idx"))
-}
-
-// loadTranslationFile reads "<sha256> <sha1>" lines into a map.
-func loadTranslationFile(path string) (map[sha1ID]sha256ID, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	ids := make(map[sha1ID]sha256ID)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		newHex, oldHex, found := strings.Cut(scanner.Text(), " ")
-		if !found || strings.HasPrefix(newHex, "#") {
-			continue
-		}
-		oldID, err := parseSHA1Hex(oldHex)
-		var newID sha256ID
-		if err == nil && len(newHex) == 2*len(newID) {
-			_, err = hex.Decode(newID[:], []byte(newHex))
-		}
-		if err != nil || len(newHex) != 2*len(newID) {
-			return nil, fmt.Errorf("malformed line %q in %s", scanner.Text(), path)
-		}
-		ids[oldID] = newID
-	}
-	return ids, scanner.Err()
-}
-
-// writeTranslationTable atomically writes loose-object-idx, appending added to the existing table
-// when extend is set.
-func writeTranslationTable(repoPath string, extend bool, ids map[sha1ID]sha256ID, added []sha1ID) error {
-	path := filepath.Join(repoPath, "objects", "loose-object-idx")
-	tmpPath := path + ".tmp"
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmpPath)
-
-	w := bufio.NewWriter(out)
-	if extend {
-		old, err := os.Open(path)
-		if err != nil {
-			out.Close()
-			return err
-		}
-		_, err = io.Copy(w, old)
-		old.Close()
-		if err != nil {
-			out.Close()
-			return err
-		}
-	} else {
-		_, _ = w.WriteString("# loose-object-idx\n")
-	}
-	for _, id := range added {
-		newID := ids[id]
-		fmt.Fprintf(w, "%x %x\n", newID, id)
-	}
-	if err := w.Flush(); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
-}
-
 // updateRefs points every ref of the target at the translation of the mirror's ref.
-func updateRefs(ctx context.Context, refs map[string]string, targetPath string, ids map[sha1ID]sha256ID) error {
+func updateRefs(ctx context.Context, refs map[string]string, targetPath string, ids *translations) error {
 	names := make([]string, 0, len(refs))
 	for name := range refs {
 		names = append(names, name)
@@ -698,7 +629,7 @@ func updateRefs(ctx context.Context, refs map[string]string, targetPath string, 
 		if err != nil {
 			return err
 		}
-		newID, ok := ids[id]
+		newID, ok := ids.lookup(id)
 		if !ok {
 			return fmt.Errorf("ref %s points to unconverted object %x", name, id)
 		}
@@ -793,11 +724,19 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	previous, _ := loadState(info.ServingPath)
 	state := newRepoState(previous)
 	targetPath := info.ServingPath
-	ids := make(map[sha1ID]sha256ID)
+	ids := &translations{added: make(map[sha1ID]sha256ID)}
+	var exclude []string
 	if incremental {
 		log.Printf("Starting incremental object conversion for repository %s...", info.RepoName)
-		if ids, err = loadTranslationTable(info.ServingPath); err != nil {
-			return fmt.Errorf("failed to load loose-object-idx: %w", err)
+		if err := ensureTranslationIndexes(info.ServingPath); err != nil {
+			return fmt.Errorf("failed to index loose-object-idx: %w", err)
+		}
+		if ids.known, err = openTranslationIndex(filepath.Join(info.ServingPath, sha1IndexFile), len(sha1ID{})); err != nil {
+			return err
+		}
+		defer ids.known.Close()
+		for _, id := range previous.ConvertedRefs {
+			exclude = append(exclude, id)
 		}
 	} else {
 		log.Printf("Starting full object conversion for repository %s...", info.RepoName)
@@ -824,7 +763,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err != nil {
 		return err
 	}
-	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, progress)
+	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, exclude, progress)
 	if err != nil {
 		return err
 	}
@@ -836,7 +775,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	}
 
 	// Translations are written before refs, so no served commit lacks its SHA-1 id
-	if err := writeTranslationTable(targetPath, incremental, ids, added); err != nil {
+	if err := appendTranslationTable(targetPath, added, ids); err != nil {
 		return fmt.Errorf("failed to write loose-object-idx: %w", err)
 	}
 	state.recordGitlinks(gitlinks)
@@ -851,6 +790,9 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 		if err := pruneServingRefs(info); err != nil {
 			return err
 		}
+	}
+	if err := writeTranslationIndexes(targetPath, ids.known, ids.added); err != nil {
+		return fmt.Errorf("failed to write translation indexes: %w", err)
 	}
 	// Repacking after the refs are set orders the pack and its bitmap by reachability
 	if err := repackConverted(ctx, targetPath, incremental, progressWriter, info.RepoName); err != nil {

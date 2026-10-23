@@ -249,39 +249,13 @@ func gitmodulesURLs(ctx context.Context, mirrorPath string, commits []string) (m
 	return urls, nil
 }
 
-// convertedTips returns the SHA-1 ids of the serving repository's refs, whose history has already
-// been converted.
-func convertedTips(servingPath string) ([]string, error) {
-	out, err := runCmd(servingPath, "git", "--git-dir=.", "for-each-ref", "--format=%(objectname)")
-	if err != nil {
-		return nil, err
-	}
-	wanted := make(map[string]bool)
-	for _, id := range strings.Fields(out) {
-		wanted[id] = true
-	}
-	f, err := os.Open(filepath.Join(servingPath, "objects", "loose-object-idx"))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	var tips []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		if newID, oldID, found := strings.Cut(scanner.Text(), " "); found && wanted[newID] {
-			tips = append(tips, oldID)
-		}
-	}
-	return tips, scanner.Err()
-}
-
 // gitlinkResolution decides the SHA-256 recorded for each submodule commit, in order of precedence:
 // a decision recorded by an earlier conversion, the submodules' translation tables, the synthetic
 // SHA-256 for commits with a permanent reason, and otherwise the repository's own objects (a
 // submodule pointing into its own repository).
 type gitlinkResolution struct {
 	decided map[sha1ID]sha256ID // extended with every decision of this conversion
-	tables  []map[string]string // sha1 -> sha256 of converted submodules
+	tables  []*translationIndex // SHA-1 indexes of converted submodules
 	padded  map[string]bool
 
 	// For the conversion state: the commits each submodule records that this conversion decides,
@@ -311,7 +285,8 @@ func (g *gitlinkResolution) resolve(id sha1ID) (newID sha256ID, ok bool, err err
 	key := hex.EncodeToString(id[:])
 	found := ""
 	for _, table := range g.tables {
-		if v, ok := table[key]; ok && len(v) == sha256HexLen {
+		if value, ok := table.lookup(id[:]); ok {
+			v := hex.EncodeToString(value)
 			if found != "" && found != v {
 				return sha256ID{}, false, fmt.Errorf("submodule commit %s has conflicting SHA-256 translations %s and %s", key, found, v)
 			}
@@ -330,9 +305,16 @@ func (g *gitlinkResolution) resolve(id sha1ID) (newID sha256ID, ok bool, err err
 	return newID, true, nil
 }
 
+// close releases the submodules' indexes.
+func (g *gitlinkResolution) close() {
+	for _, table := range g.tables {
+		_ = table.Close()
+	}
+}
+
 // resolveGitlinks converts the submodules of the commits the conversion will add and decides the
 // SHA-256 of every submodule commit they record. Earlier decisions are kept, also across rebuilds.
-func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) (*gitlinkResolution, error) {
+func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) (_ *gitlinkResolution, err error) {
 	var decided map[sha1ID]sha256ID
 	if previous, err := loadState(info.ServingPath); err == nil {
 		if decided, err = previous.gitlinkDecisions(); err != nil {
@@ -342,12 +324,17 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 		return nil, err
 	}
 	res := newGitlinkResolution(decided)
+	defer func() {
+		if err != nil {
+			res.close()
+		}
+	}()
 
+	// Gitlinks of history converted before are decided already
 	var exclude []string
-	if isIncrementalRewrite(info.ServingPath) {
-		var err error
-		if exclude, err = convertedTips(info.ServingPath); err != nil {
-			return nil, err
+	if state := currentState(info.ServingPath); state != nil && isIncrementalRewrite(info.ServingPath) {
+		for _, id := range state.ConvertedRefs {
+			exclude = append(exclude, id)
 		}
 	}
 	targets, err := discoverGitlinks(ctx, info.MirrorPath, exclude)
@@ -417,6 +404,9 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 		}
 
 		table, gone, err := m.ensureSubmoduleCommits(ctx, subInfo, pending, progressWriter, depth-1)
+		if table != nil {
+			res.tables = append(res.tables, table)
+		}
 		if errors.Is(err, ErrSubmoduleCycle) || errors.Is(err, ErrSubmoduleDepth) || errors.Is(err, ErrSubmoduleUnavailable) || errors.Is(err, ErrSubmoduleNotApproved) {
 			return nil, fmt.Errorf("submodule %s of %s: %w", submodule, info.RepoName, err)
 		}
@@ -426,7 +416,6 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 		if len(gone) > 0 {
 			synthetic(gone, "commit or repository gone upstream")
 		}
-		res.tables = append(res.tables, table)
 	}
 
 	// The synthetic SHA-256 is only recorded if the administrator approved it
@@ -476,12 +465,18 @@ func (m *Manager) syntheticGitlinksFile() string {
 
 // ensureSubmoduleCommits converts a submodule so that its translation table covers commits, and
 // returns the table and the commits that do not exist upstream.
-func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.RepositoryInfo, commits []string, progressWriter io.Writer, depth int) (map[string]string, []string, error) {
-	missingFrom := func() (map[string]string, []string) {
-		table, _ := loadSubmoduleTranslations(subInfo.ServingPath)
+func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.RepositoryInfo, commits []string, progressWriter io.Writer, depth int) (*translationIndex, []string, error) {
+	// missingFrom opens the submodule's index (none for a natively SHA-256 submodule, whose
+	// commits have no SHA-1) and lists the commits it lacks
+	missingFrom := func() (*translationIndex, []string) {
+		var table *translationIndex
+		if ensureTranslationIndexes(subInfo.ServingPath) == nil {
+			table, _ = openTranslationIndex(filepath.Join(subInfo.ServingPath, sha1IndexFile), len(sha1ID{}))
+		}
 		var missing []string
 		for _, c := range commits {
-			if _, ok := table[c]; !ok {
+			id, err := parseSHA1Hex(c)
+			if _, ok := table.lookup(id[:]); err != nil || !ok {
 				missing = append(missing, c)
 			}
 		}
@@ -501,6 +496,7 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 	}
 
 	// Refresh regardless of the TTL, fetching commits that no branch or tag reaches
+	_ = table.Close()
 	err = m.ensureRepo(ctx, subInfo, progressWriter, depth, missing)
 	if err != nil && !errors.Is(err, errUpstreamGone) {
 		return nil, nil, err
@@ -615,25 +611,3 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 
 // networkSchemes are the URL schemes of submodules that can be mirrored from an allowed host.
 var networkSchemes = []string{"https", "http", "ssh", "git", "git+ssh", "ssh+git"}
-
-// loadSubmoduleTranslations reads a submodule's SHA-1 -> SHA-256 translations from its loose-object-idx.
-func loadSubmoduleTranslations(servingPath string) (map[string]string, error) {
-	f, err := os.Open(filepath.Join(servingPath, "objects", "loose-object-idx"))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	sha1ToSHA256 := make(map[string]string)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		sha256, sha1, found := strings.Cut(scanner.Text(), " ")
-		if found && len(sha256) == sha256HexLen && len(sha1) == sha1HexLen {
-			sha1ToSHA256[sha1] = sha256
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return sha1ToSHA256, nil
-}
