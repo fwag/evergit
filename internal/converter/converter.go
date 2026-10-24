@@ -217,10 +217,11 @@ func (m *Manager) EnsureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	return m.EnsureRepoWithDepth(ctx, info, progressWriter, depth)
 }
 
-// EnsureRepoWithin is EnsureRepo for clients behind proxies with short timeouts: it waits at most
-// wait for a running sync or conversion. Then it returns nil if a converted copy can be served
-// (a repository being updated stays consistent for readers), or ErrConversionInProgress. Either
-// way the conversion continues.
+// EnsureRepoWithin is EnsureRepo for clients behind proxies with short timeouts. It waits at most
+// the given duration for a running sync or conversion and returns its result if it ends in time.
+// Otherwise it returns nil if a converted copy exists, which can be served (a repository being
+// updated stays consistent for readers), or ErrConversionInProgress if none does. Either way the
+// conversion continues in the background. A duration of 0 waits until the end.
 func (m *Manager) EnsureRepoWithin(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, wait time.Duration) error {
 	if wait <= 0 {
 		return m.EnsureRepo(ctx, info, progressWriter)
