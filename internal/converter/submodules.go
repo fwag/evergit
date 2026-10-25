@@ -510,11 +510,11 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 	return table, missing, nil
 }
 
-// pinCommits makes wanted commits part of the mirror's history under refs/evergit-pinned/, fetching
+// pinCommits makes required commits part of the mirror's history under refs/evergit-pinned/, fetching
 // them by id when the mirror lacks them. Commits the upstream does not have are skipped; other
 // failures are returned.
-func (m *Manager) pinCommits(ctx context.Context, info *resolver.RepositoryInfo, want []string) error {
-	for _, c := range want {
+func (m *Manager) pinCommits(ctx context.Context, info *resolver.RepositoryInfo, requiredCommits []string) error {
+	for _, c := range requiredCommits {
 		if _, err := parseSHA1Hex(c); err != nil {
 			return err
 		}

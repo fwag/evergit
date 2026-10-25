@@ -248,10 +248,10 @@ func canonicalRepoID(info *resolver.RepositoryInfo) string {
 	return info.Domain + "/" + info.Owner + "/" + info.RepoName
 }
 
-// ensureRepo checks or converts a repository. A non-empty want lists commits the repository must
-// contain: the upstream is fetched regardless of the TTL, commits no branch or tag reaches are
+// ensureRepo checks or converts a repository. A non-empty requiredCommits lists commits the repository
+// must contain: the upstream is fetched regardless of the TTL, commits no branch or tag reaches are
 // fetched by id, and a fetch failure is returned instead of serving the cached repository.
-func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, want []string) error {
+func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, requiredCommits []string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -290,11 +290,11 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	lock.mu.Lock()
 	for lock.job != nil {
 		job := lock.job
-		if len(want) == 0 {
+		if len(requiredCommits) == 0 {
 			lock.mu.Unlock()
 			return m.waitJob(ctx, job)
 		}
-		// A running job may not fetch the wanted commits: wait for it to exit before starting anew
+		// A running job may not fetch the required commits: wait for it to exit before starting a new one
 		lock.mu.Unlock()
 		select {
 		case <-job.done:
@@ -305,7 +305,7 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	}
 
 	// 1. Check if the repository already exists and is within its TTL
-	if len(want) == 0 && !m.needsSync(info) {
+	if len(requiredCommits) == 0 && !m.needsSync(info) {
 		lock.mu.Unlock()
 		return nil
 	}
@@ -323,7 +323,7 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 
 	go func() {
 		defer cancel()
-		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth, want)
+		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth, requiredCommits)
 		job.mu.Lock()
 		job.err = err
 		close(job.done)
@@ -357,16 +357,16 @@ func (m *Manager) waitJob(ctx context.Context, job *repoJob) error {
 	}
 }
 
-func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, want []string) error {
+func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, requiredCommits []string) error {
 	// 1. Check if the repository already exists and is within its TTL
-	if len(want) == 0 && !m.needsSync(info) {
+	if len(requiredCommits) == 0 && !m.needsSync(info) {
 		return nil
 	}
 
 	// 2. Clone/Fetch the upstream mirror
 	err := m.syncMirror(ctx, info)
 	var cached *cacheFallbackError
-	if errors.As(err, &cached) && len(want) == 0 {
+	if errors.As(err, &cached) && len(requiredCommits) == 0 {
 		err = nil // serve the cached repository
 	}
 	if err != nil {
@@ -378,8 +378,8 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 		return m.syncNativeSHA256(ctx, info, progressWriter)
 	}
 
-	if len(want) > 0 {
-		if err := m.pinCommits(ctx, info, want); err != nil {
+	if len(requiredCommits) > 0 {
+		if err := m.pinCommits(ctx, info, requiredCommits); err != nil {
 			return err
 		}
 	}
