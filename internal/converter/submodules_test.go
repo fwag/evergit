@@ -512,3 +512,103 @@ func TestRelativeSubmoduleURLsResolveLikeGit(t *testing.T) {
 		}
 	}
 }
+
+func TestDiscoverGitlinksQuotedAndSpecialPaths(t *testing.T) {
+	super := newTestUpstream(t)
+	dummyCommit := strings.Repeat("12", 20)
+
+	testCases := []struct {
+		name    string
+		path    string
+		url     string
+		wantSub string
+	}{
+		{
+			name:    "quoted path with embedded double quote and gitmodules",
+			path:    `sub"quote`,
+			url:     "https://example.com/sub-quote.git",
+			wantSub: "https://example.com/sub-quote.git",
+		},
+		{
+			name:    "quoted path with tab and gitmodules",
+			path:    "sub\ttab",
+			url:     "https://example.com/sub-tab.git",
+			wantSub: "https://example.com/sub-tab.git",
+		},
+		{
+			name:    "path with spaces and gitmodules",
+			path:    "sub dir",
+			url:     "https://example.com/sub-dir.git",
+			wantSub: "https://example.com/sub-dir.git",
+		},
+		{
+			name:    "unquoted path with backticks without gitmodules",
+			path:    "`backtick`",
+			url:     "",
+			wantSub: "path:`backtick`",
+		},
+		{
+			name:    "unquoted path with single quotes without gitmodules",
+			path:    "'x'",
+			url:     "",
+			wantSub: "path:'x'",
+		},
+		{
+			name:    "quoted path with embedded double quote without gitmodules",
+			path:    `sub"no-modules`,
+			url:     "",
+			wantSub: `path:sub"no-modules`,
+		},
+		{
+			name:    "quoted path with tab without gitmodules",
+			path:    "sub\ttab-no-modules",
+			url:     "",
+			wantSub: "path:sub\ttab-no-modules",
+		},
+	}
+
+	for _, tc := range testCases {
+		addGitlink(t, super, tc.path, tc.url, dummyCommit)
+	}
+
+	targets, err := discoverGitlinks(context.Background(), super, nil)
+	if err != nil {
+		t.Fatalf("discoverGitlinks: %v", err)
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			commits := targets[tc.wantSub]
+			if commits == nil || !commits[dummyCommit] {
+				t.Errorf("targets[%q] = %v, want commit %s", tc.wantSub, commits, dummyCommit)
+			}
+		})
+	}
+}
+
+func TestSubmoduleWithQuotedPath(t *testing.T) {
+	sub := newTestUpstream(t)
+	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	super := newTestUpstream(t)
+	quotedPath := `sub"quote`
+	tabPath := "sub\ttab"
+	addGitlink(t, super, quotedPath, urlOf(sub), commit)
+	addGitlink(t, super, tabPath, urlOf(sub), commit)
+
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	want, err := LookupID(repoInfo(t, m, sub).ServingPath, "sha1", commit)
+	if err != nil {
+		t.Fatalf("submodule was not converted: %v", err)
+	}
+	if got := gitlinkOf(t, info.ServingPath, "HEAD", quotedPath); got != want {
+		t.Errorf("gitlink at %q = %s, want real SHA-256 %s", quotedPath, got, want)
+	}
+	if got := gitlinkOf(t, info.ServingPath, "HEAD", tabPath); got != want {
+		t.Errorf("gitlink at %q = %s, want real SHA-256 %s", tabPath, got, want)
+	}
+}
+

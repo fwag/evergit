@@ -170,8 +170,10 @@ func discoverGitlinks(ctx context.Context, mirrorPath string, exclude []string) 
 		if len(fields) != 2*(parents+1)+1 || fields[parents] != "160000" {
 			continue
 		}
-		if unquoted, err := strconv.Unquote(p); err == nil && strings.HasPrefix(p, "\"") {
-			p = unquoted
+		if strings.HasPrefix(p, "\"") {
+			if unquoted, err := strconv.Unquote(p); err == nil {
+				p = unquoted
+			}
 		}
 		if _, seen := recorded[commit]; !seen {
 			commits = append(commits, commit)
