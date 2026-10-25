@@ -848,6 +848,11 @@ func runCmdTimeout(timeout time.Duration, dir, name string, args ...string) (str
 
 // runCmdContext runs a command with context cancellation and an optional timeout.
 func runCmdContext(ctx context.Context, timeout time.Duration, dir, name string, args ...string) (string, error) {
+	return runCmdStdin(ctx, timeout, dir, nil, name, args...)
+}
+
+// runCmdStdin is runCmdContext feeding stdin to the command.
+func runCmdStdin(ctx context.Context, timeout time.Duration, dir string, stdin io.Reader, name string, args ...string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -860,6 +865,7 @@ func runCmdContext(ctx context.Context, timeout time.Duration, dir, name string,
 	// Child processes (e.g. git-remote-https) may keep the output pipes open after a kill
 	cmd.WaitDelay = 10 * time.Second
 	cmd.Dir = dir
+	cmd.Stdin = stdin
 	cmd.Env = GitEnv("GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=true",
 		// Abort transfers slower than 1 KiB/s for 60s, so a hung upstream cannot hold the repo lock
 		"GIT_HTTP_LOW_SPEED_LIMIT=1024", "GIT_HTTP_LOW_SPEED_TIME=60")

@@ -571,11 +571,7 @@ func (r *objectRewriter) flushChunk() error {
 // the repository lacks, with a merge recording each.
 func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *translations, gitlinks *gitlinkResolution, exclude []string, progress func(int)) ([]sha1ID, map[string]string, error) {
 	// Parents before children keeps the recursion in convert shallow: commits only recurse into trees
-	args := []string{"rev-list", "--reverse", "--topo-order", "--all"}
-	if len(exclude) > 0 {
-		args = append(append(args, "--not"), exclude...)
-	}
-	commits, err := runCmdContext(ctx, 0, mirrorPath, "git", args...)
+	commits, err := runCmdStdin(ctx, 0, mirrorPath, excludedRevisions(exclude), "git", "rev-list", "--reverse", "--topo-order", "--all", "--stdin")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -613,6 +609,20 @@ func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *tra
 		return nil, nil, err
 	}
 	return r.added, r.missingMergetags, nil
+}
+
+// excludedRevisions lists ids as negated revisions for git's --stdin, once each. Passed as
+// arguments, the refs of a large repository would exceed the system's argument size limit.
+func excludedRevisions(ids []string) io.Reader {
+	var b strings.Builder
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			b.WriteString("^" + id + "\n")
+		}
+	}
+	return strings.NewReader(b.String())
 }
 
 // updateRefs points every ref of the target at the translation of the mirror's ref.

@@ -134,12 +134,9 @@ const pathPrefix = "path:"
 // refs but not from exclude, by submodule.
 func discoverGitlinks(ctx context.Context, mirrorPath string, exclude []string) (gitlinkTargets, error) {
 	// Merges are diffed against all parents (-c), so a gitlink a merge introduces is listed too
-	args := []string{"log", "--all", "--root", "-c", "-r", "--raw", "--no-abbrev", "--no-renames", "--format=commit %H"}
-	if len(exclude) > 0 {
-		args = append(append(args, "--not"), exclude...)
-	}
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", "log", "--all", "--root", "-c", "-r", "--raw", "--no-abbrev", "--no-renames", "--format=commit %H", "--stdin")
 	cmd.Dir = mirrorPath
+	cmd.Stdin = excludedRevisions(exclude)
 	cmd.Env = GitEnv()
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
