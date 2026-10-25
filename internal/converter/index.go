@@ -139,6 +139,7 @@ func (t *translations) lookup(id sha1ID) (sha256ID, bool) {
 // writeTranslationIndexes writes both indexes of repoPath: the records of old (an earlier sha1
 // index, or nil) merged with added. Each index is written to a temporary file and renamed.
 func writeTranslationIndexes(repoPath string, old *translationIndex, added map[sha1ID]sha256ID) error {
+	// Each record is [20-byte SHA-1][32-byte SHA-256], sorted by SHA-1 key.
 	records := make([]indexRecord, 0, len(added))
 	for oldID, newID := range added {
 		var r indexRecord
@@ -156,7 +157,8 @@ func writeTranslationIndexes(repoPath string, old *translationIndex, added map[s
 		return err
 	}
 
-	// The SHA-256 index of the same records: swap the halves and sort again
+	// The SHA-256 index of the same records: swap the halves to [32-byte SHA-256][20-byte SHA-1]
+	// and sort by SHA-256 key.
 	for i, r := range records {
 		var swapped indexRecord
 		copy(swapped[:], r[len(sha1ID{}):])
@@ -177,7 +179,8 @@ func writeTranslationIndexes(repoPath string, old *translationIndex, added map[s
 }
 
 // writeMergedIndex writes the sorted union of oldLen records read by old and the sorted added
-// records. A key present in both keeps the added record.
+// records. When old is nil (initial full conversion), oldLen is 0 and old is never invoked.
+// A key present in both keeps the added record.
 func writeMergedIndex(path string, keyLen int, old func(i int) []byte, oldLen int, added []indexRecord) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
@@ -194,6 +197,7 @@ func writeMergedIndex(path string, keyLen int, old func(i int) []byte, oldLen in
 			_, _ = w.Write(old(i))
 			i++
 		default:
+			// If the key is present in both, discard the old record in favor of added.
 			if i < oldLen && bytes.Equal(old(i)[:keyLen], added[j][:keyLen]) {
 				i++
 			}

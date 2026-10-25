@@ -130,9 +130,12 @@ type gitlinkTargets map[string]map[string]bool
 // pathPrefix identifies a gitlink without URL by its path.
 const pathPrefix = "path:"
 
+// progressCommitInterval specifies how often submodule discovery progress is reported (in commits).
+const progressCommitInterval = 1000
+
 // discoverGitlinks lists the submodule commits recorded by the commits reachable from the mirror's
 // refs but not from exclude, by submodule.
-func discoverGitlinks(ctx context.Context, mirrorPath string, exclude []string) (gitlinkTargets, error) {
+func discoverGitlinks(ctx context.Context, mirrorPath string, exclude []string, progress func(n int)) (gitlinkTargets, error) {
 	// Merges are diffed against all parents (-c), so a gitlink a merge introduces is listed too
 	cmd := exec.CommandContext(ctx, "git", "log", "--all", "--root", "-c", "-r", "--raw", "--no-abbrev", "--no-renames", "--format=commit %H", "--stdin")
 	cmd.Dir = mirrorPath
@@ -152,12 +155,17 @@ func discoverGitlinks(ctx context.Context, mirrorPath string, exclude []string) 
 	recorded := make(map[string][]gitlink)
 	var commits []string
 	commit := ""
+	scanned := 0
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if c, ok := strings.CutPrefix(line, "commit "); ok {
 			commit = c
+			scanned++
+			if progress != nil && scanned%progressCommitInterval == 0 {
+				progress(scanned)
+			}
 			continue
 		}
 		meta, p, ok := strings.Cut(line, "\t")
@@ -186,6 +194,9 @@ func discoverGitlinks(ctx context.Context, mirrorPath string, exclude []string) 
 	}
 	if err := cmd.Wait(); err != nil {
 		return nil, fmt.Errorf("git log failed in %s: %w (stderr: %q)", mirrorPath, err, strings.TrimSpace(stderr.String()))
+	}
+	if progress != nil && scanned > 0 {
+		progress(scanned)
 	}
 
 	urls, err := gitmodulesURLs(ctx, mirrorPath, commits)
@@ -336,9 +347,22 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 			exclude = append(exclude, id)
 		}
 	}
-	targets, err := discoverGitlinks(ctx, info.MirrorPath, exclude)
+	if progressWriter != nil {
+		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Scanning history for submodules...\n", info.RepoName)
+	}
+	var scannedCommits int
+	progress := func(n int) {
+		scannedCommits = n
+		if progressWriter != nil {
+			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Scanning %s: %d commits...", info.RepoName, n)
+		}
+	}
+	targets, err := discoverGitlinks(ctx, info.MirrorPath, exclude, progress)
 	if err != nil {
 		return nil, err
+	}
+	if progressWriter != nil && scannedCommits > 0 {
+		_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Scanning %s: %d commits, done.\n", info.RepoName, scannedCommits)
 	}
 
 	// A missing file approves nothing, so it can be configured before the first approval
@@ -360,6 +384,9 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 		submodules = append(submodules, submodule)
 	}
 	slices.Sort(submodules)
+	if progressWriter != nil && len(submodules) > 0 {
+		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Resolving %d submodule(s)...\n", info.RepoName, len(submodules))
+	}
 	for _, submodule := range submodules {
 		var pending []string
 		for target := range targets[submodule] {
@@ -578,7 +605,7 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 		cfg = &config.Config{
 			StorageRoot:  storageRoot,
 			AllowedHosts: config.DefaultAllowedHosts,
-			Shorthands:   map[string]string{"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"},
+			Shorthands:   config.ParseShorthands(config.DefaultShorthands),
 		}
 	}
 

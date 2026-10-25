@@ -571,7 +571,7 @@ func TestDiscoverGitlinksQuotedAndSpecialPaths(t *testing.T) {
 		addGitlink(t, super, tc.path, tc.url, dummyCommit)
 	}
 
-	targets, err := discoverGitlinks(context.Background(), super, nil)
+	targets, err := discoverGitlinks(context.Background(), super, nil, nil)
 	if err != nil {
 		t.Fatalf("discoverGitlinks: %v", err)
 	}
@@ -583,6 +583,53 @@ func TestDiscoverGitlinksQuotedAndSpecialPaths(t *testing.T) {
 				t.Errorf("targets[%q] = %v, want commit %s", tc.wantSub, commits, dummyCommit)
 			}
 		})
+	}
+}
+
+func TestDiscoverGitlinksProgress(t *testing.T) {
+	super := newTestUpstream(t)
+	dummyCommit := strings.Repeat("12", 20)
+	addGitlink(t, super, "sub1", "https://example.com/sub1.git", dummyCommit)
+	addGitlink(t, super, "sub2", "https://example.com/sub2.git", dummyCommit)
+
+	var lastScanned int
+	targets, err := discoverGitlinks(context.Background(), super, nil, func(n int) {
+		lastScanned = n
+	})
+	if err != nil {
+		t.Fatalf("discoverGitlinks: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Errorf("targets = %d, want 2", len(targets))
+	}
+	if lastScanned <= 0 {
+		t.Errorf("lastScanned = %d, want > 0", lastScanned)
+	}
+}
+
+func TestSubmoduleResolutionEmitsProgress(t *testing.T) {
+	sub := newTestUpstream(t)
+	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	super := newTestUpstream(t)
+	addGitlink(t, super, "sub", urlOf(sub), commit)
+
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	var progressBuf strings.Builder
+	if err := m.EnsureRepo(context.Background(), info, &progressBuf); err != nil {
+		t.Fatal(err)
+	}
+
+	out := progressBuf.String()
+	for _, expected := range []string{
+		"Scanning history for submodules...",
+		fmt.Sprintf("Scanning %s: ", info.RepoName),
+		"Resolving 1 submodule(s)...",
+		"Converting SHA-1 objects to SHA-256...",
+	} {
+		if !strings.Contains(out, expected) {
+			t.Errorf("progress output missing %q, got:\n%s", expected, out)
+		}
 	}
 }
 
