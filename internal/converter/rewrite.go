@@ -731,6 +731,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	}
 
 	incremental := isIncrementalRewrite(info.ServingPath)
+	start := time.Now()
 	previous, _ := loadState(info.ServingPath)
 	state := newRepoState(previous)
 	targetPath := info.ServingPath
@@ -813,5 +814,13 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err := state.save(targetPath); err != nil {
 		return fmt.Errorf("failed to record conversion state: %w", err)
 	}
-	return m.publishConversion(info, targetPath, incremental)
+	if err := m.publishConversion(info, targetPath, incremental); err != nil {
+		return err
+	}
+	kind := "full"
+	if incremental {
+		kind = "incremental"
+	}
+	log.Printf("Completed %s object conversion for repository %s in %v (%d objects)", kind, info.RepoName, time.Since(start).Round(time.Millisecond), len(added))
+	return nil
 }
