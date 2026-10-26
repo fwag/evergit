@@ -60,8 +60,22 @@ func resolveRedirects(ctx context.Context, remote string, allowedHosts []string)
 			return "", err
 		}
 		req.Header.Set("User-Agent", "git/evergit")
-		resp, err := upstreamClient.Do(req)
+		var resp *http.Response
+		for attempt := 0; attempt < 2; attempt++ {
+			resp, err = upstreamClient.Do(req)
+			if err == nil || ctx.Err() != nil {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
 		if err != nil {
+			if hop == 0 {
+				return "", fmt.Errorf("probe upstream redirect for %s: %w", current, err)
+			}
 			return current, nil // git reports the error itself
 		}
 		resp.Body.Close()
@@ -70,7 +84,7 @@ func resolveRedirects(ctx context.Context, remote string, allowedHosts []string)
 		}
 		location, err := resp.Location()
 		if err != nil {
-			return current, nil
+			return "", fmt.Errorf("upstream %s returned redirect status %d without Location header: %w", current, resp.StatusCode, err)
 		}
 		base, isRepository := strings.CutSuffix(location.Path, "/info/refs")
 		host := strings.ToLower(location.Hostname())

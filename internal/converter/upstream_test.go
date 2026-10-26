@@ -112,3 +112,34 @@ func TestUpstreamRedirectToPlainHTTPIsRefused(t *testing.T) {
 		t.Errorf("redirect from HTTPS to HTTP = %v, want ErrRedirectNotAllowed", err)
 	}
 }
+
+func TestUpstreamRedirectProbeFailureReportsError(t *testing.T) {
+	// Pointing at a port where nothing is listening to trigger an immediate connection failure
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := resolveRedirects(ctx, "https://127.0.0.1:54321/repo.git", []string{"127.0.0.1"})
+	if err == nil || !strings.Contains(err.Error(), "probe upstream redirect for") {
+		t.Fatalf("expected probe failure error, got: %v", err)
+	}
+}
+
+func TestUpstreamRedirectMissingLocationReportsError(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Respond 302 without Location header
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(server.Close)
+
+	client := *upstreamClient
+	client.Transport = server.Client().Transport
+	previous := upstreamClient
+	upstreamClient = &client
+	t.Cleanup(func() { upstreamClient = previous })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := resolveRedirects(ctx, server.URL+"/repo.git", []string{"127.0.0.1"})
+	if err == nil || !strings.Contains(err.Error(), "without Location header") {
+		t.Fatalf("expected missing location error, got: %v", err)
+	}
+}
