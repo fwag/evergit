@@ -601,6 +601,38 @@ func TestSubmoduleCommitRecordedUnderAnotherURLOutsideConvertedHistory(t *testin
 	}
 }
 
+func TestRequestForPartialSubmoduleCompletesIt(t *testing.T) {
+	sub := newTestUpstream(t)
+	recorded := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	commitToUpstream(t, sub, "later")
+	later := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	super := newTestUpstream(t)
+	addGitlink(t, super, "sub", urlOf(sub), recorded)
+
+	// Within the TTL, a converted repository is served as it is, but not a partial one
+	m := newSubmoduleManager(t.TempDir(), time.Hour, super, sub)
+	if err := m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil); err != nil {
+		t.Fatal(err)
+	}
+	subInfo := repoInfo(t, m, sub)
+	recordedID, err := LookupID(subInfo.ServingPath, "sha1", recorded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.EnsureRepo(context.Background(), subInfo, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LookupID(subInfo.ServingPath, "sha1", later); err != nil {
+		t.Errorf("request for a partially converted submodule did not complete it: %v", err)
+	}
+	if got, err := LookupID(subInfo.ServingPath, "sha1", recorded); err != nil || got != recordedID {
+		t.Errorf("completing the submodule changed %s from %s to %s (%v)", recorded, recordedID, got, err)
+	}
+	if branches := gitLine(t, subInfo.ServingPath, nil, "--git-dir=.", "for-each-ref", "--format=%(refname)", "refs/heads/"); !strings.Contains(branches, "refs/heads/main") {
+		t.Errorf("completed submodule does not serve its branches: %q", branches)
+	}
+}
+
 func TestMarkGoneClassifiesUpstreamErrors(t *testing.T) {
 	cases := []struct {
 		stderr string

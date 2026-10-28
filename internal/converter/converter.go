@@ -300,7 +300,12 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 		job := lock.job
 		if len(requiredCommits) == 0 {
 			lock.mu.Unlock()
-			return m.waitJob(ctx, job)
+			if err := m.waitJob(ctx, job); err != nil || !servedPartially(info.ServingPath) {
+				return err
+			}
+			// The job converted the repository partially, for submodule commits: complete it
+			lock.mu.Lock()
+			continue
 		}
 		// A running job may not fetch the required commits: wait for it to exit before starting a new one
 		lock.mu.Unlock()
@@ -580,12 +585,20 @@ func (a *asyncWriter) Close() {
 	}
 }
 
+// needsSync reports whether a request for the repository itself must sync and convert it.
 func (m *Manager) needsSync(info *resolver.RepositoryInfo) bool {
 	fi, err := os.Stat(filepath.Join(info.ServingPath, "HEAD"))
 	if err != nil {
 		return true // Serving repo doesn't exist, must clone and convert
 	}
-	return time.Since(fi.ModTime()) > m.cacheTTL
+	// A repository converted partially for submodule commits is completed when requested itself
+	return servedPartially(info.ServingPath) || time.Since(fi.ModTime()) > m.cacheTTL
+}
+
+// servedPartially reports whether the serving repository is a partial conversion.
+func servedPartially(servingPath string) bool {
+	state, err := loadState(servingPath)
+	return err == nil && state.Partial
 }
 
 // syncMirror clones or fetches the upstream into the mirror, archiving overwritten and deleted refs.
