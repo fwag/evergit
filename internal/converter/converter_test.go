@@ -1137,7 +1137,7 @@ func TestConversionContinuesAfterClientsDisconnect(t *testing.T) {
 
 	// The conversion still finishes, so a long one is not restarted by every request
 	manager.WaitIdle()
-	if !convertedUpToDate(info) {
+	if !convertedUpToDate(info, false) {
 		t.Error("conversion did not finish after its client disconnected")
 	}
 }
@@ -1158,7 +1158,7 @@ func TestEnsureRepoWithinBoundsTheWait(t *testing.T) {
 	}
 	manager.ReleaseConversionSlot()
 	manager.WaitIdle()
-	if !convertedUpToDate(info) {
+	if !convertedUpToDate(info, false) {
 		t.Fatal("conversion did not finish in the background")
 	}
 
@@ -1176,7 +1176,7 @@ func TestEnsureRepoWithinBoundsTheWait(t *testing.T) {
 	}
 	manager.ReleaseConversionSlot()
 	manager.WaitIdle()
-	if !convertedUpToDate(info) {
+	if !convertedUpToDate(info, false) {
 		t.Error("update did not finish in the background")
 	}
 }

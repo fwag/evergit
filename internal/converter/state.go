@@ -27,6 +27,9 @@ type repoState struct {
 	// ConvertedRefs are the mirror's refs (SHA-1) at the last successful conversion, recorded as its
 	// last step: a conversion is complete only if they match the mirror
 	ConvertedRefs map[string]string `json:"converted_refs,omitempty"`
+	// Partial records a conversion of the pinned refs only (see pinnedPrefix): the repository is
+	// converted as far as the submodule commits superprojects record, and ConvertedRefs are those refs
+	Partial bool `json:"partial,omitempty"`
 	// Submodules records the SHA-256 decided for every submodule commit, by submodule as in
 	// config.SyntheticGitlink (URL, or "path:<path>" for a gitlink without URL). A submodule commit
 	// recorded under several submodules has the same SHA-256 under each.

@@ -577,7 +577,7 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 		return table, missing
 	}
 
-	err := m.ensureRepo(ctx, subInfo, progressWriter, depth, nil)
+	err := m.ensureRepo(ctx, subInfo, progressWriter, depth, nil, false)
 	if errors.Is(err, errUpstreamGone) {
 		return nil, commits, nil
 	}
@@ -591,7 +591,7 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 
 	// Refresh regardless of the TTL, fetching commits that no branch or tag reaches
 	_ = table.Close()
-	err = m.ensureRepo(ctx, subInfo, progressWriter, depth, missing)
+	err = m.ensureRepo(ctx, subInfo, progressWriter, depth, missing, false)
 	if err != nil && !errors.Is(err, errUpstreamGone) {
 		return nil, nil, err
 	}
@@ -675,7 +675,7 @@ func (m *Manager) pinCommits(ctx context.Context, info *resolver.RepositoryInfo,
 		if _, err := parseSHA1Hex(c); err != nil {
 			return err
 		}
-		ref := "refs/evergit-pinned/" + c
+		ref := pinnedPrefix + c
 		if _, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "cat-file", "-e", c+"^{commit}"); err == nil {
 			if _, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "update-ref", ref, c); err != nil {
 				return err

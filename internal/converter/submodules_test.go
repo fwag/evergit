@@ -432,6 +432,104 @@ func TestSubmodulePointingIntoItsOwnRepositoryGoneUpstreamNeedsApproval(t *testi
 	assertNeedsApproval(t, m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil), canonicalRepoID(repoInfo(t, m, super)), urlOf(super))
 }
 
+func TestPartialConversionExtendsWithoutChangingIDs(t *testing.T) {
+	up := newTestUpstream(t)
+	commitToUpstream(t, up, "second")
+	needed := gitLine(t, up, nil, "rev-parse", "HEAD")
+	gitRaw(t, up, nil, "checkout", "-q", "-b", "other", "HEAD~1")
+	commitToUpstream(t, up, "other branch")
+	other := gitLine(t, up, nil, "rev-parse", "HEAD")
+	gitRaw(t, up, nil, "checkout", "-q", "main")
+	commitToUpstream(t, up, "third")
+	later := gitLine(t, up, nil, "rev-parse", "HEAD")
+
+	m := newSubmoduleManager(t.TempDir(), 0, up)
+	info := repoInfo(t, m, up)
+	ctx := context.Background()
+	idOf := func(commit string) string {
+		t.Helper()
+		id, err := LookupID(info.ServingPath, "sha1", commit)
+		if err != nil {
+			t.Fatalf("commit %s not converted: %v", commit, err)
+		}
+		return id
+	}
+	assertNotConverted := func(commits ...string) {
+		t.Helper()
+		for _, c := range commits {
+			if _, err := LookupID(info.ServingPath, "sha1", c); err == nil {
+				t.Errorf("commit %s converted beyond the history of the required commits", c)
+			}
+		}
+	}
+	branches := func() string {
+		return gitLine(t, info.ServingPath, nil, "--git-dir=.", "for-each-ref", "--format=%(refname)", "refs/heads/")
+	}
+
+	// Only the history of the required commit is converted, and only its pinned ref is served
+	if err := m.ensureRepo(ctx, info, nil, DefaultMaxSubmoduleDepth, []string{needed}, true); err != nil {
+		t.Fatal(err)
+	}
+	neededID := idOf(needed)
+	assertNotConverted(other, later)
+	if b := branches(); b != "" {
+		t.Errorf("partial conversion serves branches: %s", b)
+	}
+	build, err := os.Readlink(info.ServingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extended := func(step string) {
+		t.Helper()
+		if got := idOf(needed); got != neededID {
+			t.Errorf("%s: SHA-256 of %s changed from %s to %s", step, needed, neededID, got)
+		}
+		if b, _ := os.Readlink(info.ServingPath); b != build {
+			t.Errorf("%s: repository rebuilt instead of extended", step)
+		}
+	}
+
+	// Another required commit extends it
+	if err := m.ensureRepo(ctx, info, nil, DefaultMaxSubmoduleDepth, []string{other}, true); err != nil {
+		t.Fatal(err)
+	}
+	extended("another required commit")
+	assertNotConverted(later)
+
+	// A request for the repository itself converts it completely
+	if err := m.EnsureRepo(ctx, info, nil); err != nil {
+		t.Fatal(err)
+	}
+	extended("complete conversion")
+	if b := branches(); !strings.Contains(b, "refs/heads/main") {
+		t.Errorf("complete conversion does not serve the branches: %q", b)
+	}
+
+	// Every object has the SHA-256 of a complete conversion from scratch
+	fresh := newSubmoduleManager(t.TempDir(), 0, up)
+	freshInfo := repoInfo(t, fresh, up)
+	if err := fresh.EnsureRepo(ctx, freshInfo, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []string{needed, other, later} {
+		want, err := LookupID(freshInfo.ServingPath, "sha1", c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := idOf(c); got != want {
+			t.Errorf("commit %s is %s after partial conversions, %s converted completely", c, got, want)
+		}
+	}
+
+	// A complete conversion is never reduced to a partial one
+	if err := m.ensureRepo(ctx, info, nil, DefaultMaxSubmoduleDepth, []string{needed}, true); err != nil {
+		t.Fatal(err)
+	}
+	if b := branches(); !strings.Contains(b, "refs/heads/main") {
+		t.Errorf("complete conversion reduced to a partial one: branches %q", b)
+	}
+}
+
 func TestMarkGoneClassifiesUpstreamErrors(t *testing.T) {
 	cases := []struct {
 		stderr string

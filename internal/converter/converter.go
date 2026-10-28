@@ -247,7 +247,7 @@ func (m *Manager) EnsureRepoWithin(ctx context.Context, info *resolver.Repositor
 
 // EnsureRepoWithDepth checks or converts a repository, converting submodules nested at most depth levels.
 func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
-	return m.ensureRepo(ctx, info, progressWriter, depth, nil)
+	return m.ensureRepo(ctx, info, progressWriter, depth, nil, false)
 }
 
 func canonicalRepoID(info *resolver.RepositoryInfo) string {
@@ -256,8 +256,10 @@ func canonicalRepoID(info *resolver.RepositoryInfo) string {
 
 // ensureRepo checks or converts a repository. A non-empty requiredCommits lists commits the repository
 // must contain: the upstream is fetched regardless of the TTL, commits no branch or tag reaches are
-// fetched by id, and a fetch failure is returned instead of serving the cached repository.
-func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, requiredCommits []string) error {
+// fetched by id, and a fetch failure is returned instead of serving the cached repository. With
+// partial, a repository not converted completely before is converted only as far as the history of
+// the required commits and those required before (see partialConversion).
+func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, requiredCommits []string, partial bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -329,7 +331,7 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 
 	go func() {
 		defer cancel()
-		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth, requiredCommits)
+		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth, requiredCommits, partial)
 		job.mu.Lock()
 		job.err = err
 		close(job.done)
@@ -363,7 +365,7 @@ func (m *Manager) waitJob(ctx context.Context, job *repoJob) error {
 	}
 }
 
-func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, requiredCommits []string) error {
+func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, requiredCommits []string, partial bool) error {
 	// 1. Check if the repository already exists and is within its TTL
 	if len(requiredCommits) == 0 && !m.needsSync(info) {
 		return nil
@@ -389,26 +391,60 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 			return err
 		}
 	}
+	partial = partial && len(requiredCommits) > 0 && partialConversion(info.ServingPath)
+	var heads []string // nil: the history of all refs
+	if partial {
+		refs, err := listRefs(info.MirrorPath)
+		if err != nil {
+			return err
+		}
+		heads = slices.Sorted(maps.Values(pinnedRefs(refs)))
+	}
 
 	// Skip conversion when the serving repo is a complete conversion of the mirror's current refs.
 	// Comparing with the last successful conversion, rather than with the mirror before the fetch,
 	// retries a conversion that failed after its fetch instead of serving the old version. Touching
 	// HEAD restarts the TTL. Anything else, such as a lost translation table, is converted again.
-	if convertedUpToDate(info) {
+	if convertedUpToDate(info, partial) {
 		now := time.Now()
 		_ = os.Chtimes(filepath.Join(info.ServingPath, "HEAD"), now, now)
 		return nil
 	}
 
 	// 3. Convert the submodules whose commits the history records, deciding every gitlink's SHA-256
-	gitlinks, err := m.resolveGitlinks(ctx, info, progressWriter, depth, nil)
+	gitlinks, err := m.resolveGitlinks(ctx, info, progressWriter, depth, heads)
 	if err != nil {
 		return err
 	}
 	defer gitlinks.close()
 
 	// 4. Convert mirror to serving repo (SHA1 -> SHA256 conversion)
-	return m.convertRepo(ctx, info, progressWriter, gitlinks)
+	return m.convertRepo(ctx, info, progressWriter, gitlinks, partial)
+}
+
+// partialConversion reports whether a repository needed for submodule commits can be converted
+// partially: one never converted, or converted partially before. A complete conversion is never
+// reduced, which would remove its branches and tags.
+func partialConversion(servingPath string) bool {
+	if state, err := loadState(servingPath); err == nil {
+		return state.Partial
+	}
+	_, err := os.Stat(filepath.Join(servingPath, "HEAD"))
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// pinnedPrefix holds the submodule commits that superprojects record (see pinCommits).
+const pinnedPrefix = "refs/evergit-pinned/"
+
+// pinnedRefs returns the refs under pinnedPrefix.
+func pinnedRefs(refs map[string]string) map[string]string {
+	pinned := make(map[string]string)
+	for name, id := range refs {
+		if strings.HasPrefix(name, pinnedPrefix) {
+			pinned[name] = id
+		}
+	}
+	return pinned
 }
 
 // isRepoSHA256 checks if a git repository is configured with the sha256 object format.
@@ -621,13 +657,16 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 }
 
 // convertedUpToDate reports whether the serving repository is a complete conversion of the
-// mirror's current refs.
-func convertedUpToDate(info *resolver.RepositoryInfo) bool {
+// mirror's current refs, or with partial, of its current pinned refs.
+func convertedUpToDate(info *resolver.RepositoryInfo, partial bool) bool {
 	state := currentState(info.ServingPath)
-	if state == nil || !isIncrementalRewrite(info.ServingPath) {
+	if state == nil || state.Partial != partial || !isIncrementalRewrite(info.ServingPath) {
 		return false
 	}
 	refs, err := listRefs(info.MirrorPath)
+	if partial {
+		refs = pinnedRefs(refs)
+	}
 	return err == nil && maps.Equal(refs, state.ConvertedRefs)
 }
 
@@ -684,7 +723,7 @@ func looksLikeBareRepo(path string) bool {
 // scoped to heads and tags, "git fetch --prune" can never delete refs/evergit-backups/*.
 var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
-func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution) error {
+func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution, partial bool) error {
 	// Guard against unbounded concurrent conversions across all repositories
 	if m.conversionSem != nil {
 		wait := m.conversionWait
@@ -701,7 +740,7 @@ func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo
 		}
 	}
 
-	return m.convertObjects(ctx, info, progressWriter, gitlinks)
+	return m.convertObjects(ctx, info, progressWriter, gitlinks, partial)
 }
 
 // syntheticSHA256Padding turns the SHA-1 of a submodule commit without a known translation into a

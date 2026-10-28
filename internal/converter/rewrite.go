@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -745,8 +746,9 @@ func isIncrementalRewrite(servingPath string) bool {
 }
 
 // convertObjects converts the mirror with object-level translation, incrementally when the serving
-// repository was produced the same way.
-func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution) (err error) {
+// repository was produced the same way. With partial, only the history of the pinned refs is
+// converted and served.
+func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution, partial bool) (err error) {
 	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
 		return fmt.Errorf("failed to create repos directory: %w", err)
 	}
@@ -755,6 +757,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	start := time.Now()
 	previous, _ := loadState(info.ServingPath)
 	state := newRepoState(previous)
+	state.Partial = partial
 	targetPath := info.ServingPath
 	ids := &translations{added: make(map[sha1ID]sha256ID)}
 	var exclude []string
@@ -795,7 +798,12 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err != nil {
 		return err
 	}
-	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, nil, exclude, progress)
+	var heads []string // nil: the history of all refs
+	if partial {
+		refs = pinnedRefs(refs)
+		heads = slices.Sorted(maps.Values(refs))
+	}
+	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, heads, exclude, progress)
 	if err != nil {
 		return err
 	}
@@ -841,6 +849,9 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	kind := "full"
 	if incremental {
 		kind = "incremental"
+	}
+	if partial {
+		kind += " partial"
 	}
 	log.Printf("Completed %s object conversion for repository %s in %v (%d objects)", kind, info.RepoName, time.Since(start).Round(time.Millisecond), len(added))
 	return nil
