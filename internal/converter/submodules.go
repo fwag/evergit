@@ -26,9 +26,11 @@ import (
 // conversion of the same history, so it is decided from the history itself: the submodule URL comes
 // from the .gitmodules of the commit recording the gitlink, and the submodule is converted. When
 // that is impossible (no URL, host not allowed, unusable URL, repository or commit gone upstream),
-// the synthetic SHA-256 is only used if the administrator approved it (config.SyntheticGitlink);
-// otherwise, as for temporary failures, the conversion fails. Decisions are recorded so later
-// conversions of the same repository never translate a submodule commit differently.
+// the commit is translated from another URL the history records it under, or another URL of the
+// same path; failing that, the synthetic SHA-256 is only used if the administrator approved it
+// (config.SyntheticGitlink); otherwise, as for temporary failures, the conversion fails. Decisions
+// are recorded so later conversions of the same repository never translate a submodule commit
+// differently.
 
 // ErrSubmoduleCycle is returned when converting a repository requires converting a repository that
 // is already being converted further up the same chain of submodules.
@@ -259,6 +261,45 @@ func gitmodulesURLs(ctx context.Context, mirrorPath string, commits []string) (m
 		urls[commits[i]] = byBlob[blob]
 	}
 	return urls, nil
+}
+
+// submoduleAliases returns, for each submodule URL in the history of the mirror's refs, the other
+// URLs the same path had, e.g. after the submodule moved. A gitlink without URL ("path:<path>") gets
+// those of its path.
+func submoduleAliases(ctx context.Context, mirrorPath string) (map[string][]string, error) {
+	out, err := runCmdContext(ctx, 0, mirrorPath, "git", "log", "--all", "--full-history", "--format=%H", "--", ".gitmodules")
+	if err != nil {
+		return nil, err
+	}
+	urls, err := gitmodulesURLs(ctx, mirrorPath, strings.Fields(out))
+	if err != nil {
+		return nil, err
+	}
+	byPath := make(map[string]map[string]bool)
+	for _, paths := range urls {
+		for p, u := range paths {
+			if byPath[p] == nil {
+				byPath[p] = make(map[string]bool)
+			}
+			byPath[p][u] = true
+		}
+	}
+	aliases := make(map[string][]string)
+	for p, set := range byPath {
+		list := slices.Sorted(maps.Keys(set))
+		aliases[pathPrefix+p] = list
+		for _, u := range list {
+			for _, other := range list {
+				if other != u && !slices.Contains(aliases[u], other) {
+					aliases[u] = append(aliases[u], other)
+				}
+			}
+		}
+	}
+	for u := range aliases {
+		slices.Sort(aliases[u])
+	}
+	return aliases, nil
 }
 
 // gitlinkResolution decides the SHA-256 recorded for each submodule commit, in order of precedence:
@@ -500,21 +541,43 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 		}
 	}
 
-	// The same commit may be recorded under other submodules elsewhere in the history, e.g. after
-	// the submodule moved or changed URL: it is translated from those. The decision depends only on
-	// the history, never on what other repositories had converted before, so it is the same in any
-	// order and however far the repository is converted
+	// The same commit may be recorded under other submodules elsewhere in the history, and a
+	// submodule that moved, e.g. from git.qemu.org to gitlab.com, has the commits recorded under its
+	// old URLs: such a commit is translated from those, as a commit is the same in any repository
+	// containing it. The decision depends only on the history, never on what other repositories had
+	// converted before, so it is the same in any order and however far the repository is converted
 	recording := targets
-	if heads != nil && len(problems) > 0 {
-		if recording, err = discoverGitlinks(ctx, info.MirrorPath, nil, exclude, nil); err != nil {
+	var aliases map[string][]string
+	if len(problems) > 0 {
+		if heads != nil {
+			if recording, err = discoverGitlinks(ctx, info.MirrorPath, nil, exclude, nil); err != nil {
+				return nil, err
+			}
+		}
+		if aliases, err = submoduleAliases(ctx, info.MirrorPath); err != nil {
 			return nil, err
 		}
 	}
-	others := make([]string, 0, len(recording))
+	recorders := make([]string, 0, len(recording))
 	for submodule := range recording {
-		others = append(others, submodule)
+		recorders = append(recorders, submodule)
 	}
-	slices.Sort(others)
+	slices.Sort(recorders)
+	// candidates lists the other submodules a commit can be translated from, in order of precedence
+	candidates := func(submodule, commit string) []string {
+		var list []string
+		for _, other := range recorders {
+			if other != submodule && recording[other][commit] {
+				list = append(list, other)
+			}
+		}
+		for _, other := range aliases[submodule] {
+			if !slices.Contains(list, other) {
+				list = append(list, other)
+			}
+		}
+		return list
+	}
 	// The synthetic SHA-256 is only recorded if the administrator approved it
 	var unapproved, unapprovedReasons []string
 	for _, p := range problems {
@@ -525,10 +588,7 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 				return nil, err
 			}
 			resolved := false
-			for _, other := range others {
-				if other == p.submodule || !recording[other][c] {
-					continue
-				}
+			for _, other := range candidates(p.submodule, c) {
 				if _, _, ok := lookup(other, id); !ok {
 					if _, _, err := convertSubmodule(other, []string{c}); err != nil {
 						return nil, err

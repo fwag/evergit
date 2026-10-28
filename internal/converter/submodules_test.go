@@ -601,6 +601,39 @@ func TestSubmoduleCommitRecordedUnderAnotherURLOutsideConvertedHistory(t *testin
 	}
 }
 
+func TestSubmoduleMovedTranslatesCommitsRecordedUnderOldURL(t *testing.T) {
+	leaf := newTestUpstream(t)
+	old := gitLine(t, leaf, nil, "rev-parse", "HEAD")
+	commitToUpstream(t, leaf, "second")
+	current := gitLine(t, leaf, nil, "rev-parse", "HEAD")
+	// Recorded under a URL that cannot be mirrored any more, as git.qemu.org; the submodule then
+	// moved to the leaf's URL without changing the recorded commit
+	const gone = "https://unusable.invalid/test/leaf.git"
+	super := newTestUpstream(t)
+	addGitlink(t, super, "lib", gone, old)
+	addGitlink(t, super, "lib", gone, current)
+	gitRaw(t, super, nil, "config", "-f", ".gitmodules", "submodule.lib.url", urlOf(leaf))
+	gitRaw(t, super, nil, "add", ".gitmodules")
+	gitRaw(t, super, nil, "commit", "-q", "-m", "move lib")
+
+	// Both commits are translated from the URL the path moved to, without any approval
+	m := newSubmoduleManager(t.TempDir(), 0, super, leaf)
+	info := repoInfo(t, m, super)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	leafPath := repoInfo(t, m, leaf).ServingPath
+	for rev, commit := range map[string]string{"HEAD~2": old, "HEAD": current} {
+		want, err := LookupID(leafPath, "sha1", commit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := gitlinkOf(t, info.ServingPath, rev, "lib"); got != want {
+			t.Errorf("%s:lib = %s, want the real SHA-256 %s", rev, got, want)
+		}
+	}
+}
+
 func TestRequestForPartialSubmoduleCompletesIt(t *testing.T) {
 	sub := newTestUpstream(t)
 	recorded := gitLine(t, sub, nil, "rev-parse", "HEAD")
