@@ -252,7 +252,18 @@ func TestServeSetupScript(t *testing.T) {
 		t.Errorf("expected ssh dry-run output, got:\n%s", string(dryRunSSHOut))
 	}
 
-	// 4. Test explicit PublicURL override
+	// 4. Test running script in bash with --dry-run --remote upstream
+	cmdRemote := exec.Command("bash", "-s", "--", "--dry-run", "--remote", "upstream")
+	cmdRemote.Stdin = strings.NewReader(scriptContent)
+	dryRunRemoteOut, err := cmdRemote.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running script with --dry-run --remote failed: %v\nOutput: %s", err, string(dryRunRemoteOut))
+	}
+	if !strings.Contains(string(dryRunRemoteOut), "evergit.remote upstream") {
+		t.Errorf("expected evergit.remote in dry-run output, got:\n%s", string(dryRunRemoteOut))
+	}
+
+	// 5. Test explicit PublicURL override
 	cfg.PublicURL = "https://evergit.corp:8443"
 	resp2, err := http.Get(baseURL + "/install.sh")
 	if err != nil {

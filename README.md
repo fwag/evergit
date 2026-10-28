@@ -79,6 +79,9 @@ curl -fsSL http://localhost:8080/setup.sh | bash -s -- --dir ~/tmp
 # Scope to a specific directory
 curl -fsSL http://localhost:8080/setup.sh | bash -s -- --dir ~/build
 
+# Configure default remote name (e.g. upstream for fork/subtree repos)
+curl -fsSL http://localhost:8080/setup.sh | bash -s -- --dir ~/build --remote upstream
+
 # Configure for SSH clones instead of HTTP
 curl -fsSL http://localhost:8080/setup.sh | bash -s -- --dir ~/tmp --ssh
 
@@ -136,14 +139,21 @@ git config --local include.path ../.gitconfig
 
 *(Alternatively, you can configure them globally via `git config --global alias.from-sha1 ...`, `alias.to-sha1 ...`, and `alias.update-submodules ...`)*
 
-Then, inside a clone of a converted repository (e.g. a submodule):
+Then, inside a clone of a converted repository (e.g. a submodule or subtree):
 ```bash
-git checkout $(git from-sha1 722a661)   # check out a legacy SHA-1 commit
-git to-sha1                             # legacy SHA-1 id of HEAD
-git to-sha1 v1.2.0                      # ...or of any revision
+git checkout $(git from-sha1 722a661)            # check out a legacy SHA-1 commit
+git checkout $(git from-sha1 722a661 upstream)   # ...or specify remote explicitly
+git to-sha1                                      # legacy SHA-1 id of HEAD
+git to-sha1 v1.2.0                               # ...or of any revision
+git to-sha1 HEAD upstream                        # ...or with explicit remote
 ```
 
-The aliases derive the Evergit URL from the `origin` remote. For clones made over SSH, point them at the HTTP server once per clone (or set `url` under `[evergit]` in `.gitconfig`):
+#### Remote Resolution & Subtree / Fork Support
+The aliases resolve the Evergit repository URL using the following priority:
+1. **Explicit argument:** Pass the remote name directly (e.g. `git from-sha1 722a661 upstream`).
+2. **Repository configuration:** Pin the remote per repository via `git config evergit.remote upstream`.
+3. **Auto-detection:** Automatically finds any configured remote pointing to Evergit, or checks `upstream` before `origin` (ideal for fork and subtree repositories where `origin` points to an internal forge).
+4. **Explicit Evergit URL:** For clones made over SSH without matching remotes, set `evergit.url` once per clone (or in `.gitconfig`):
 ```bash
 git config evergit.url http://localhost:8080/github.com/owner/repo.git
 ```

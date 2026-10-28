@@ -14,11 +14,16 @@ DRY_RUN=0
 TARGET_DIR=""
 SCOPE_GLOBAL=0
 CONFIG_FILE=""
+DEFAULT_REMOTE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dir|-d)
       TARGET_DIR="$2"
+      shift 2
+      ;;
+    --remote|-r)
+      DEFAULT_REMOTE="$2"
       shift 2
       ;;
     --file|-f)
@@ -46,12 +51,13 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --help|-h)
-      echo "Usage: $0 [--dir <path> | --global] [--file <config-file>] [--http | --ssh] [--dry-run] [--uninstall]"
+      echo "Usage: $0 [--dir <path> | --global] [--file <config-file>] [--remote <name>] [--http | --ssh] [--dry-run] [--uninstall]"
       echo ""
       echo "Options:"
       echo "  --dir <path>     Scope Evergit rules to repositories under <path> (default: current directory)"
       echo "  --global         Apply Evergit rules globally across all repositories (intrusive)"
       echo "  --file <path>    Write Evergit rules to a custom gitconfig file (default: ~/.config/evergit/gitconfig)"
+      echo "  --remote <name>  Default remote name to inspect for Evergit repository path (e.g. upstream)"
       echo "  --http / --ssh   Choose transfer protocol (default: http)"
       echo "  --dry-run        Print commands without modifying any configuration"
       echo "  --uninstall      Remove Evergit configuration and includeIf rules"
@@ -98,6 +104,7 @@ if [ "$MODE" = "uninstall" ]; then
     run_cmd git config --global --unset-all "url.${SSH_BASE}/${host}/.insteadOf" 2>/dev/null || true
   done
   run_cmd git config --global --unset-all evergit.url 2>/dev/null || true
+  run_cmd git config --global --unset-all evergit.remote 2>/dev/null || true
   run_cmd git config --global --unset-all alias.from-sha1 2>/dev/null || true
   run_cmd git config --global --unset-all alias.to-sha1 2>/dev/null || true
   run_cmd git config --global --unset-all include.path "$CONFIG_FILE" 2>/dev/null || true
@@ -130,6 +137,7 @@ for host in "${ALLOWED_HOSTS[@]}"; do
   git config --global --unset-all "url.${SSH_BASE}/${host}/.insteadOf" 2>/dev/null || true
 done
 git config --global --unset-all evergit.url 2>/dev/null || true
+git config --global --unset-all evergit.remote 2>/dev/null || true
 git config --global --unset-all alias.from-sha1 2>/dev/null || true
 git config --global --unset-all alias.to-sha1 2>/dev/null || true
 
@@ -155,11 +163,20 @@ for host in "${ALLOWED_HOSTS[@]}"; do
 done
 
 # Set Evergit HTTP URL for lookup aliases
+if [ -f "$CONFIG_FILE" ]; then
+  git config --file "$CONFIG_FILE" --unset-all evergit.url 2>/dev/null || true
+  git config --file "$CONFIG_FILE" --unset-all evergit.remote 2>/dev/null || true
+  git config --file "$CONFIG_FILE" --unset-all alias.from-sha1 2>/dev/null || true
+  git config --file "$CONFIG_FILE" --unset-all alias.to-sha1 2>/dev/null || true
+fi
 run_cmd git config --file "$CONFIG_FILE" evergit.url "${HTTP_BASE}"
+if [ -n "$DEFAULT_REMOTE" ]; then
+  run_cmd git config --file "$CONFIG_FILE" evergit.remote "$DEFAULT_REMOTE"
+fi
 
 # Install SHA-1 <-> SHA-256 helper aliases into CONFIG_FILE
-run_cmd git config --file "$CONFIG_FILE" alias.from-sha1 '!f() { base=$(git config evergit.url || echo "'"${HTTP_BASE}"'"); if [[ "$base" == */*.*/*/* ]]; then u="${base%/}"; else rem=$(git remote get-url origin 2>/dev/null || true); p=$(echo "$rem" | sed -E "s#^[a-zA-Z0-9+.-]+://[^/]+/##; s#^git@[^:]+:##; s#^/##"); u="${base%/}/${p%/}"; fi; curl -fsS "$u/sha1/$1"; }; f'
-run_cmd git config --file "$CONFIG_FILE" alias.to-sha1 '!f() { base=$(git config evergit.url || echo "'"${HTTP_BASE}"'"); if [[ "$base" == */*.*/*/* ]]; then u="${base%/}"; else rem=$(git remote get-url origin 2>/dev/null || true); p=$(echo "$rem" | sed -E "s#^[a-zA-Z0-9+.-]+://[^/]+/##; s#^git@[^:]+:##; s#^/##"); u="${base%/}/${p%/}"; fi; curl -fsS "$u/sha256/$(git rev-parse "${1:-HEAD}")"; }; f'
+run_cmd git config --file "$CONFIG_FILE" alias.from-sha1 '!f() { id="$1"; r="${2:-$(git config evergit.remote || true)}"; base=$(git config evergit.url || echo "'"${HTTP_BASE}"'"); if [[ "$base" == */*.*/*/* ]]; then u="${base%/}"; else rem=""; if [ -n "$r" ]; then rem=$(git remote get-url "$r" 2>/dev/null || true); fi; if [ -z "$rem" ]; then for cand in $(git remote 2>/dev/null); do curl_u=$(git remote get-url "$cand" 2>/dev/null || true); if [[ "$curl_u" == *evergit* ]]; then rem="$curl_u"; break; fi; done; fi; if [ -z "$rem" ]; then rem=$(git remote get-url upstream 2>/dev/null || git remote get-url origin 2>/dev/null || true); fi; if [ -z "$rem" ]; then echo "Error: no valid remote found (specify remote: git from-sha1 <id> [remote])" >&2; return 1; fi; p=$(echo "$rem" | sed -E "s#^[a-zA-Z0-9+.-]+://[^/]+/##; s#^[a-zA-Z0-9._-]+@[^:]+:##; s#^/##"); u="${base%/}/${p%/}"; fi; curl -fsS "$u/sha1/$id"; }; f'
+run_cmd git config --file "$CONFIG_FILE" alias.to-sha1 '!f() { arg1="$1"; arg2="$2"; rev="HEAD"; r=""; if [ -n "$arg2" ]; then rev="${arg1:-HEAD}"; r="$arg2"; elif [ -n "$arg1" ]; then if git remote get-url "$arg1" >/dev/null 2>&1 && ! git rev-parse --verify --quiet "$arg1^{commit}" >/dev/null 2>&1; then r="$arg1"; else rev="$arg1"; fi; fi; [ -z "$r" ] && r=$(git config evergit.remote || true); base=$(git config evergit.url || echo "'"${HTTP_BASE}"'"); if [[ "$base" == */*.*/*/* ]]; then u="${base%/}"; else rem=""; if [ -n "$r" ]; then rem=$(git remote get-url "$r" 2>/dev/null || true); fi; if [ -z "$rem" ]; then for cand in $(git remote 2>/dev/null); do curl_u=$(git remote get-url "$cand" 2>/dev/null || true); if [[ "$curl_u" == *evergit* ]]; then rem="$curl_u"; break; fi; done; fi; if [ -z "$rem" ]; then rem=$(git remote get-url upstream 2>/dev/null || git remote get-url origin 2>/dev/null || true); fi; if [ -z "$rem" ]; then echo "Error: no valid remote found (specify remote: git to-sha1 [rev] [remote])" >&2; return 1; fi; p=$(echo "$rem" | sed -E "s#^[a-zA-Z0-9+.-]+://[^/]+/##; s#^[a-zA-Z0-9._-]+@[^:]+:##; s#^/##"); u="${base%/}/${p%/}"; fi; curl -fsS "$u/sha256/$(git rev-parse "$rev")"; }; f'
 
 if [ "$SCOPE_GLOBAL" -eq 1 ]; then
   echo "Enabling Evergit globally in ~/.gitconfig..."

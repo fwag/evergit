@@ -17,8 +17,8 @@ import (
 
 // The aliases documented in the README, verbatim.
 const (
-	aliasFromSHA1 = `!f() { base=$(git config evergit.url || git remote get-url origin); curl -fsS "${base%/}/sha1/$1"; }; f`
-	aliasToSHA1   = `!f() { base=$(git config evergit.url || git remote get-url origin); curl -fsS "${base%/}/sha256/$(git rev-parse "${1:-HEAD}")"; }; f`
+	aliasFromSHA1 = `!f() { id="$1"; r="${2:-$(git config evergit.remote || true)}"; base=$(git config evergit.url || true); rem=""; if [ -n "$r" ]; then rem=$(git remote get-url "$r" 2>/dev/null || true); fi; if [ -z "$rem" ]; then for cand in $(git remote 2>/dev/null); do curl_u=$(git remote get-url "$cand" 2>/dev/null || true); if [[ "$curl_u" == *evergit* ]]; then rem="$curl_u"; break; fi; done; fi; if [ -z "$rem" ]; then rem=$(git remote get-url upstream 2>/dev/null || git remote get-url origin 2>/dev/null || true); fi; if [ -z "$base" ]; then if [[ "$rem" =~ ^https?://.* ]]; then base=$(echo "$rem" | grep -oE '^[a-zA-Z0-9+.-]+://[^/]+'); else base="https://evergit.suse.de"; fi; fi; if [[ "$base" == */*.*/*/* ]]; then u="${base%/}"; else if [ -z "$rem" ]; then echo "Error: no valid remote found (specify remote: git from-sha1 <id> [remote])" >&2; return 1; fi; p=$(echo "$rem" | sed -E "s#^[a-zA-Z0-9+.-]+://[^/]+/##; s#^[a-zA-Z0-9._-]+@[^:]+:##; s#^/##"); u="${base%/}/${p%/}"; fi; curl -fsS "$u/sha1/$id"; }; f`
+	aliasToSHA1   = `!f() { arg1="$1"; arg2="$2"; rev="HEAD"; r=""; if [ -n "$arg2" ]; then rev="${arg1:-HEAD}"; r="$arg2"; elif [ -n "$arg1" ]; then if git remote get-url "$arg1" >/dev/null 2>&1 && ! git rev-parse --verify --quiet "$arg1^{commit}" >/dev/null 2>&1; then r="$arg1"; else rev="$arg1"; fi; fi; [ -z "$r" ] && r=$(git config evergit.remote || true); base=$(git config evergit.url || true); rem=""; if [ -n "$r" ]; then rem=$(git remote get-url "$r" 2>/dev/null || true); fi; if [ -z "$rem" ]; then for cand in $(git remote 2>/dev/null); do curl_u=$(git remote get-url "$cand" 2>/dev/null || true); if [[ "$curl_u" == *evergit* ]]; then rem="$curl_u"; break; fi; done; fi; if [ -z "$rem" ]; then rem=$(git remote get-url upstream 2>/dev/null || git remote get-url origin 2>/dev/null || true); fi; if [ -z "$base" ]; then if [[ "$rem" =~ ^https?://.* ]]; then base=$(echo "$rem" | grep -oE '^[a-zA-Z0-9+.-]+://[^/]+'); else base="https://evergit.suse.de"; fi; fi; if [[ "$base" == */*.*/*/* ]]; then u="${base%/}"; else if [ -z "$rem" ]; then echo "Error: no valid remote found (specify remote: git to-sha1 [rev] [remote])" >&2; return 1; fi; p=$(echo "$rem" | sed -E "s#^[a-zA-Z0-9+.-]+://[^/]+/##; s#^[a-zA-Z0-9._-]+@[^:]+:##; s#^/##"); u="${base%/}/${p%/}"; fi; curl -fsS "$u/sha256/$(git rev-parse "$rev")"; }; f`
 )
 
 func TestIDLookup(t *testing.T) {
@@ -108,6 +108,42 @@ func TestIDLookup(t *testing.T) {
 	_, _ = runCmd(clone, "git", "config", "evergit.url", repoURL)
 	if out, err := runCmd(clone, "git", "to-sha1", "HEAD"); err != nil || out != sha1 {
 		t.Errorf("git to-sha1 with evergit.url = %q (err %v), want %s", out, err, sha1)
+	}
+
+	// Test multi-remote / subtree / fork setup:
+	// origin points to downstream forge (e.g. gitea@src.suse.de:owner/repo.git)
+	// upstream points to evergit SSH (e.g. ssh://git@127.0.0.1:1/local.test/test/repo.git)
+	_, _ = runCmd(clone, "git", "config", "--unset", "evergit.url")
+	_, _ = runCmd(clone, "git", "remote", "set-url", "origin", "gitea@src.suse.de:owner/repo.git")
+	_, _ = runCmd(clone, "git", "remote", "add", "upstream", "ssh://git@127.0.0.1:1/local.test/test/repo.git")
+	_, _ = runCmd(clone, "git", "config", "evergit.url", ts.URL)
+
+	// 1. Explicit remote argument
+	if out, err := runCmd(clone, "git", "from-sha1", sha1[:7], "upstream"); err != nil || out != sha256 {
+		t.Errorf("git from-sha1 with explicit remote = %q (err %v), want %s", out, err, sha256)
+	}
+	if out, err := runCmd(clone, "git", "to-sha1", "HEAD", "upstream"); err != nil || out != sha1 {
+		t.Errorf("git to-sha1 with explicit remote = %q (err %v), want %s", out, err, sha1)
+	}
+
+	// 2. Auto-detection (upstream fallback over origin)
+	if out, err := runCmd(clone, "git", "from-sha1", sha1[:7]); err != nil || out != sha256 {
+		t.Errorf("git from-sha1 auto-detecting upstream = %q (err %v), want %s", out, err, sha256)
+	}
+	if out, err := runCmd(clone, "git", "to-sha1"); err != nil || out != sha1 {
+		t.Errorf("git to-sha1 auto-detecting upstream = %q (err %v), want %s", out, err, sha1)
+	}
+	if out, err := runCmd(clone, "git", "to-sha1", "upstream"); err != nil || out != sha1 {
+		t.Errorf("git to-sha1 passing remote as single argument = %q (err %v), want %s", out, err, sha1)
+	}
+
+	// 3. evergit.remote configuration
+	_, _ = runCmd(clone, "git", "config", "evergit.remote", "upstream")
+	if out, err := runCmd(clone, "git", "from-sha1", sha1[:7]); err != nil || out != sha256 {
+		t.Errorf("git from-sha1 with evergit.remote = %q (err %v), want %s", out, err, sha256)
+	}
+	if out, err := runCmd(clone, "git", "to-sha1"); err != nil || out != sha1 {
+		t.Errorf("git to-sha1 with evergit.remote = %q (err %v), want %s", out, err, sha1)
 	}
 }
 
