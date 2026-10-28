@@ -241,7 +241,13 @@ func TestSubmoduleConversionIndependentOfRequestOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := headOf(t, repoInfo(t, nested, mid).ServingPath), headOf(t, midInfo.ServingPath); got != want {
+	// Reached as a submodule, only the recorded commit's history is converted, with the same ids
+	recorded := gitLine(t, mid, nil, "rev-parse", "HEAD")
+	got, err := LookupID(repoInfo(t, nested, mid).ServingPath, "sha1", recorded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := headOf(t, midInfo.ServingPath); got != want {
 		t.Errorf("submodule reached through a superproject converted to %s, directly to %s", got, want)
 	}
 }
@@ -527,6 +533,71 @@ func TestPartialConversionExtendsWithoutChangingIDs(t *testing.T) {
 	}
 	if b := branches(); !strings.Contains(b, "refs/heads/main") {
 		t.Errorf("complete conversion reduced to a partial one: branches %q", b)
+	}
+}
+
+func TestSubmoduleConvertedOnlyAsFarAsRecordedCommits(t *testing.T) {
+	sub := newTestUpstream(t)
+	recorded := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	// A branch the superproject does not use records a submodule that cannot be converted
+	gitRaw(t, sub, nil, "checkout", "-q", "-b", "extra")
+	addGitlink(t, sub, "unusable", "https://unusable.invalid/test/other.git", strings.Repeat("cd", 20))
+	extra := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	gitRaw(t, sub, nil, "checkout", "-q", "main")
+	super := newTestUpstream(t)
+	addGitlink(t, super, "sub", urlOf(sub), recorded)
+
+	// Converting it completely would need an approval for the other branch's submodule
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	if err := m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil); err != nil {
+		t.Fatal(err)
+	}
+	subPath := repoInfo(t, m, sub).ServingPath
+	if _, err := LookupID(subPath, "sha1", extra); err == nil {
+		t.Errorf("commit %s of a branch no superproject uses was converted", extra)
+	}
+	if branches := gitLine(t, subPath, nil, "--git-dir=.", "for-each-ref", "--format=%(refname)", "refs/heads/"); branches != "" {
+		t.Errorf("submodule reached through a superproject serves branches: %s", branches)
+	}
+}
+
+func TestSubmoduleCommitRecordedUnderAnotherURLOutsideConvertedHistory(t *testing.T) {
+	leaf := newTestUpstream(t)
+	commit := gitLine(t, leaf, nil, "rev-parse", "HEAD")
+	mid := newTestUpstream(t)
+	// Recorded first without a URL, then under the leaf's URL in a later commit
+	addGitlink(t, mid, "unlisted", "", commit)
+	early := gitLine(t, mid, nil, "rev-parse", "HEAD")
+	top := newTestUpstream(t)
+	addGitlink(t, top, "mid", urlOf(mid), early)
+	addGitlink(t, mid, "lib", urlOf(leaf), commit)
+
+	// Reached through top, mid is converted only as far as early, yet the commit gets the real
+	// SHA-256 from the later commit's URL, as a complete conversion of mid decides
+	m := newSubmoduleManager(t.TempDir(), 0, top, mid, leaf)
+	if err := m.EnsureRepo(context.Background(), repoInfo(t, m, top), nil); err != nil {
+		t.Fatal(err)
+	}
+	want, err := LookupID(repoInfo(t, m, leaf).ServingPath, "sha1", commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	midPath := repoInfo(t, m, mid).ServingPath
+	earlyID, err := LookupID(midPath, "sha1", early)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gitlinkOf(t, midPath, earlyID, "unlisted"); got != want {
+		t.Errorf("gitlink without URL = %s, want the real SHA-256 %s", got, want)
+	}
+
+	direct := newSubmoduleManager(t.TempDir(), 0, mid, leaf)
+	directInfo := repoInfo(t, direct, mid)
+	if err := direct.EnsureRepo(context.Background(), directInfo, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := LookupID(directInfo.ServingPath, "sha1", early); err != nil || got != earlyID {
+		t.Errorf("commit %s is %s converted directly, %s reached through a superproject (%v)", early, got, earlyID, err)
 	}
 }
 

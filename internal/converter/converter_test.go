@@ -901,8 +901,9 @@ func TestSubmoduleCycleOfForksDecidesSharedCommitsTheSame(t *testing.T) {
 	addGitlink(t, repoA, "subB", urlOf(repoB), gitLine(t, repoB, nil, "rev-parse", "HEAD"))
 	addGitlink(t, repoB, "subA", urlOf(repoA), shared)
 
-	// Whichever repository is converted first, both forks translate the shared commit the same way:
-	// the commit recorded under the unusable URL is translated by the other fork, as a submodule
+	// Whichever repository is converted first, both forks translate the shared commit the same way.
+	// The commit recorded under the unusable URL gets the synthetic SHA-256 in both: no other
+	// submodule records it, and what other repositories contain depends on the order of conversion
 	converted := func(first string) [2]string {
 		m := newSubmoduleManager(t.TempDir(), 0, repoA, repoB)
 		approveSynthetic(t, m, "* https://unusable.invalid/test/merged.git")
@@ -925,6 +926,9 @@ func TestSubmoduleCycleOfForksDecidesSharedCommitsTheSame(t *testing.T) {
 		}
 		if ids[0] != ids[1] {
 			t.Errorf("converting %s first: shared commit is %s in A but %s in B", filepath.Base(first), ids[0], ids[1])
+		}
+		if got := gitlinkOf(t, repoInfo(t, m, repoA).ServingPath, ids[0], "crypto"); got != own+syntheticSHA256Padding {
+			t.Errorf("converting %s first: gitlink under the unusable URL = %s, want the synthetic SHA-256", filepath.Base(first), got)
 		}
 		return ids
 	}

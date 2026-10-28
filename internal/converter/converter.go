@@ -747,6 +747,13 @@ func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo
 // deterministic placeholder SHA-256.
 const syntheticSHA256Padding = "000000000000000000000000" // 24 zeros
 
+// syntheticID returns the synthetic SHA-256 of a submodule commit: its SHA-1 followed by zeros.
+func syntheticID(id sha1ID) sha256ID {
+	var newID sha256ID
+	copy(newID[:], id[:])
+	return newID
+}
+
 // publishConversion sets HEAD like the mirror's, restarts the TTL and, for a full conversion,
 // atomically publishes the new build.
 func (m *Manager) publishConversion(info *resolver.RepositoryInfo, targetPath string, isIncremental bool) error {
