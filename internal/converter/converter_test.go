@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -841,23 +842,94 @@ func TestSubmoduleRecursionDepthLimit(t *testing.T) {
 	}
 }
 
-func TestSubmoduleCycleFails(t *testing.T) {
-	// Repository A records B as a submodule, and B records A
+func TestSubmoduleCycleConvertsTheSameFromEitherSide(t *testing.T) {
+	// Repository A records B as a submodule, and B records a commit of A only a forge ref reaches
 	repoA := newTestUpstream(t)
 	repoB := newTestUpstream(t)
+	gitRaw(t, repoA, nil, "checkout", "-q", "-b", "pr")
+	commitToUpstream(t, repoA, "pull request")
 	shaA := gitLine(t, repoA, nil, "rev-parse", "HEAD")
+	gitRaw(t, repoA, nil, "update-ref", "refs/pull/1/head", shaA)
+	gitRaw(t, repoA, nil, "checkout", "-q", "main")
+	gitRaw(t, repoA, nil, "branch", "-D", "pr")
 	shaB := gitLine(t, repoB, nil, "rev-parse", "HEAD")
 	addGitlink(t, repoA, "subB", urlOf(repoB), shaB)
 	addGitlink(t, repoB, "subA", urlOf(repoA), shaA)
 
-	m := newSubmoduleManager(t.TempDir(), 0, repoA, repoB)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// Converts instead of deadlocking on the conversion further up the chain
+	converted := func(first string) map[string]string {
+		m := newSubmoduleManager(t.TempDir(), 0, repoA, repoB)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.EnsureRepo(ctx, repoInfo(t, m, first), nil); err != nil {
+			t.Fatalf("EnsureRepo of %s with circular submodules failed: %v", filepath.Base(first), err)
+		}
+		ids := make(map[string]string)
+		for name, upstream := range map[string]string{"A": repoA, "B": repoB} {
+			info := repoInfo(t, m, upstream)
+			if err := m.EnsureRepo(ctx, info, nil); err != nil {
+				t.Fatal(err)
+			}
+			ids[name] = gitLine(t, info.ServingPath, nil, "--git-dir=.", "rev-parse", "HEAD")
+		}
+		// The gitlinks record the real SHA-256 of the other repository's commits
+		convertedA, convertedB := repoInfo(t, m, repoA).ServingPath, repoInfo(t, m, repoB).ServingPath
+		if want, err := LookupID(convertedB, "sha1", shaB); err != nil || gitlinkOf(t, convertedA, "HEAD", "subB") != want {
+			t.Errorf("A:subB = %s, want B's SHA-256 %s (%v)", gitlinkOf(t, convertedA, "HEAD", "subB"), want, err)
+		}
+		ids["B:subA"] = gitlinkOf(t, convertedB, "HEAD", "subA")
+		return ids
+	}
+	fromA, fromB := converted(repoA), converted(repoB)
+	if !maps.Equal(fromA, fromB) {
+		t.Errorf("conversion depends on the repository converted first:\nfrom A: %v\nfrom B: %v", fromA, fromB)
+	}
+}
 
-	// Fails promptly instead of deadlocking on the conversion further up the chain
-	err := m.EnsureRepo(ctx, repoInfo(t, m, repoA), nil)
-	if !errors.Is(err, ErrSubmoduleCycle) {
-		t.Fatalf("EnsureRepo with circular submodules = %v, want ErrSubmoduleCycle", err)
+func TestSubmoduleCycleOfForksDecidesSharedCommitsTheSame(t *testing.T) {
+	// A records a commit of its own under an unusable URL, as mbed-crypto recorded mbedtls-psa
+	// before merging it. Its fork B shares that history, and A and B record each other.
+	repoA := newTestUpstream(t)
+	own := gitLine(t, repoA, nil, "rev-parse", "HEAD")
+	addGitlink(t, repoA, "crypto", "https://unusable.invalid/test/merged.git", own)
+	shared := gitLine(t, repoA, nil, "rev-parse", "HEAD")
+	repoB := filepath.Join(t.TempDir(), "fork.git")
+	gitRaw(t, "", nil, "clone", "-q", repoA, repoB)
+	gitRaw(t, repoB, nil, "config", "user.name", "Test User")
+	gitRaw(t, repoB, nil, "config", "user.email", "test@example.com")
+	commitToUpstream(t, repoB, "fork")
+	addGitlink(t, repoA, "subB", urlOf(repoB), gitLine(t, repoB, nil, "rev-parse", "HEAD"))
+	addGitlink(t, repoB, "subA", urlOf(repoA), shared)
+
+	// Whichever repository is converted first, both forks translate the shared commit the same way:
+	// the commit recorded under the unusable URL is translated by the other fork, as a submodule
+	converted := func(first string) [2]string {
+		m := newSubmoduleManager(t.TempDir(), 0, repoA, repoB)
+		approveSynthetic(t, m, "* https://unusable.invalid/test/merged.git")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.EnsureRepo(ctx, repoInfo(t, m, first), nil); err != nil {
+			t.Fatalf("EnsureRepo of %s failed: %v", filepath.Base(first), err)
+		}
+		var ids [2]string
+		for i, upstream := range []string{repoA, repoB} {
+			info := repoInfo(t, m, upstream)
+			if err := m.EnsureRepo(ctx, info, nil); err != nil {
+				t.Fatal(err)
+			}
+			id, err := LookupID(info.ServingPath, "sha1", shared)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids[i] = id
+		}
+		if ids[0] != ids[1] {
+			t.Errorf("converting %s first: shared commit is %s in A but %s in B", filepath.Base(first), ids[0], ids[1])
+		}
+		return ids
+	}
+	if fromA, fromB := converted(repoA), converted(repoB); fromA != fromB {
+		t.Errorf("conversion depends on the repository converted first: %v from A, %v from B", fromA, fromB)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
@@ -380,6 +381,12 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 		commits           []string
 	}
 	var problems []problem
+	// Submodules being converted further up the chain, which have no translation table yet
+	type chainedSubmodule struct {
+		submodule string
+		info      *resolver.RepositoryInfo
+	}
+	var chained []chainedSubmodule
 
 	submodules := make([]string, 0, len(targets))
 	for submodule := range targets {
@@ -431,7 +438,17 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 			return nil, fmt.Errorf("%w: %s needs submodule %s", ErrSubmoduleDepth, info.RepoName, submodule)
 		}
 
-		table, gone, err := m.ensureSubmoduleCommits(ctx, subInfo, pending, progressWriter, depth-1)
+		var table *translationIndex
+		var gone []string
+		if beingConverted(ctx, canonicalRepoID(subInfo)) {
+			// Its conversion waits for this one, so only the commits recorded here are translated
+			var translated map[sha1ID]sha256ID
+			translated, gone, err = m.translateCommits(ctx, subInfo, pending, progressWriter, depth-1)
+			maps.Copy(res.decided, translated)
+			chained = append(chained, chainedSubmodule{submodule, subInfo})
+		} else {
+			table, gone, err = m.ensureSubmoduleCommits(ctx, subInfo, pending, progressWriter, depth-1)
+		}
 		if table != nil {
 			res.tables = append(res.tables, table)
 		}
@@ -440,15 +457,34 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 			synthetic(pending, err.Error())
 			continue
 		}
-		if errors.Is(err, ErrSubmoduleCycle) || errors.Is(err, ErrSubmoduleDepth) || errors.Is(err, ErrSubmoduleUnavailable) || errors.Is(err, ErrSubmoduleNotApproved) {
-			return nil, fmt.Errorf("submodule %s of %s: %w", submodule, info.RepoName, err)
-		}
 		if err != nil {
-			return nil, fmt.Errorf("%w: submodule %s of %s: %w", ErrSubmoduleUnavailable, submodule, info.RepoName, err)
+			return nil, submoduleError(submodule, info.RepoName, err)
 		}
 		if len(gone) > 0 {
 			synthetic(gone, "commit or repository gone upstream")
 		}
+	}
+
+	// A submodule being converted further up the chain translates the commits its table would
+	// translate, those its refs reach, so they are decided as when it is converted first
+	for _, c := range chained {
+		var reachable []string
+		for _, p := range problems {
+			for _, commit := range p.commits {
+				id, err := parseSHA1Hex(commit)
+				if _, ok, _ := res.resolve(id); err == nil && !ok && !slices.Contains(reachable, commit) && reachableFromRefs(ctx, c.info.MirrorPath, commit) {
+					reachable = append(reachable, commit)
+				}
+			}
+		}
+		if len(reachable) == 0 {
+			continue
+		}
+		translated, _, err := m.translateCommits(ctx, c.info, reachable, progressWriter, depth-1)
+		if err != nil {
+			return nil, submoduleError(c.submodule, info.RepoName, err)
+		}
+		maps.Copy(res.decided, translated)
 	}
 
 	// The synthetic SHA-256 is only recorded if the administrator approved it
@@ -486,6 +522,20 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 			ErrSubmoduleNotApproved, superproject, strings.Join(unapprovedReasons, ""), hint.String())
 	}
 	return res, nil
+}
+
+// submoduleError reports a failure to convert a submodule, as temporary unless it is known why.
+func submoduleError(submodule, repoName string, err error) error {
+	if errors.Is(err, ErrSubmoduleCycle) || errors.Is(err, ErrSubmoduleDepth) || errors.Is(err, ErrSubmoduleUnavailable) || errors.Is(err, ErrSubmoduleNotApproved) {
+		return fmt.Errorf("submodule %s of %s: %w", submodule, repoName, err)
+	}
+	return fmt.Errorf("%w: submodule %s of %s: %w", ErrSubmoduleUnavailable, submodule, repoName, err)
+}
+
+// reachableFromRefs reports whether a commit is in the history of the repository's refs.
+func reachableFromRefs(ctx context.Context, repoPath, commit string) bool {
+	refs, err := runCmdContext(ctx, 0, repoPath, "git", "for-each-ref", "--count=1", "--contains", commit, "--format=%(refname)")
+	return err == nil && refs != ""
 }
 
 // syntheticGitlinksFile is the administrator's list of submodules approved for synthetic SHA-256s.
@@ -536,6 +586,73 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 	}
 	table, missing = missingFrom()
 	return table, missing, nil
+}
+
+// translateCommits computes the SHA-256 of commits of a submodule that is being converted further up
+// the chain of submodules, whose conversion waits for this one. A commit can only record commits that
+// existed before it, so recording each other's commits never leads two repositories back to the same
+// commit: the history of the commits is translated in memory, writing nothing, as the submodule's own
+// conversion will translate it. It returns the translations and the commits that do not exist upstream.
+func (m *Manager) translateCommits(ctx context.Context, subInfo *resolver.RepositoryInfo, commits []string, progressWriter io.Writer, depth int) (map[sha1ID]sha256ID, []string, error) {
+	log.Printf("[%s] Translating %d commit(s) needed by a submodule of the repository it is converted for", subInfo.RepoName, len(commits))
+	// The waiting conversion synced the mirror; missing commits are fetched without changing its refs
+	missing, err := missingCommits(ctx, subInfo.MirrorPath, commits)
+	if err != nil {
+		return nil, nil, err
+	}
+	var gone []string
+	for _, c := range missing {
+		err := m.gitUpstream(ctx, subInfo, subInfo.MirrorPath, func(remote string) []string {
+			return []string{"-c", "http.followRedirects=false", "fetch", "--no-tags", "--no-write-fetch-head", remote, c}
+		})
+		if err := markGone(err); errors.Is(err, errUpstreamGone) {
+			gone = append(gone, c)
+		} else if err != nil {
+			return nil, nil, fmt.Errorf("failed to fetch submodule commit %s: %w", c, err)
+		}
+	}
+	heads := slices.DeleteFunc(slices.Clone(commits), func(c string) bool { return slices.Contains(gone, c) })
+	if len(heads) == 0 {
+		return nil, gone, nil
+	}
+
+	gitlinks, err := m.resolveGitlinks(ctx, subInfo, progressWriter, depth, heads)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer gitlinks.close()
+	// History converted before is looked up in the translation table, as in an incremental conversion
+	ids := &translations{added: make(map[sha1ID]sha256ID)}
+	var exclude []string
+	if state := currentState(subInfo.ServingPath); state != nil && isIncrementalRewrite(subInfo.ServingPath) {
+		if err := ensureTranslationIndexes(subInfo.ServingPath); err != nil {
+			return nil, nil, fmt.Errorf("failed to index loose-object-idx: %w", err)
+		}
+		if ids.known, err = openTranslationIndex(filepath.Join(subInfo.ServingPath, sha1IndexFile), len(sha1ID{})); err != nil {
+			return nil, nil, err
+		}
+		defer ids.known.Close()
+		for _, id := range state.ConvertedRefs {
+			exclude = append(exclude, id)
+		}
+	}
+	if _, _, err := rewriteObjects(ctx, subInfo.MirrorPath, "", ids, gitlinks, heads, exclude, nil); err != nil {
+		return nil, nil, err
+	}
+
+	translated := make(map[sha1ID]sha256ID, len(heads))
+	for _, c := range heads {
+		id, err := parseSHA1Hex(c)
+		if err != nil {
+			return nil, nil, err
+		}
+		newID, ok := ids.lookup(id)
+		if !ok {
+			return nil, nil, fmt.Errorf("submodule commit %s of %s was not translated", c, subInfo.RepoName)
+		}
+		translated[id] = newID
+	}
+	return translated, gone, nil
 }
 
 // pinCommits makes required commits part of the mirror's history under refs/evergit-pinned/, fetching

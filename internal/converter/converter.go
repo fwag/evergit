@@ -206,6 +206,12 @@ func withVisitedRepo(ctx context.Context, canonicalID string) (context.Context, 
 	return context.WithValue(ctx, visitedReposKey{}, newVisited), true
 }
 
+// beingConverted reports whether a repository is being converted further up the chain of submodules.
+func beingConverted(ctx context.Context, canonicalID string) bool {
+	visited, _ := ctx.Value(visitedReposKey{}).(map[string]bool)
+	return visited[canonicalID]
+}
+
 // EnsureRepo checks if the repository exists, is up-to-date, and is converted.
 // If not, it clones/fetches, converts it, and optionally streams progress.
 // It accepts a context for cancellation (e.g. when all waiting clients disconnect).
