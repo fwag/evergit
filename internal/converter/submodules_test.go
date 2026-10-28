@@ -571,7 +571,7 @@ func TestDiscoverGitlinksQuotedAndSpecialPaths(t *testing.T) {
 		addGitlink(t, super, tc.path, tc.url, dummyCommit)
 	}
 
-	targets, err := discoverGitlinks(context.Background(), super, nil, nil)
+	targets, err := discoverGitlinks(context.Background(), super, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("discoverGitlinks: %v", err)
 	}
@@ -593,7 +593,7 @@ func TestDiscoverGitlinksProgress(t *testing.T) {
 	addGitlink(t, super, "sub2", "https://example.com/sub2.git", dummyCommit)
 
 	var lastScanned int
-	targets, err := discoverGitlinks(context.Background(), super, nil, func(n int) {
+	targets, err := discoverGitlinks(context.Background(), super, nil, nil, func(n int) {
 		lastScanned = n
 	})
 	if err != nil {

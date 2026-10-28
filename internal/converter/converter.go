@@ -395,7 +395,7 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 	}
 
 	// 3. Convert the submodules whose commits the history records, deciding every gitlink's SHA-256
-	gitlinks, err := m.resolveGitlinks(ctx, info, progressWriter, depth)
+	gitlinks, err := m.resolveGitlinks(ctx, info, progressWriter, depth, nil)
 	if err != nil {
 		return err
 	}

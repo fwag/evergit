@@ -133,13 +133,14 @@ const pathPrefix = "path:"
 // progressCommitInterval specifies how often submodule discovery progress is reported (in commits).
 const progressCommitInterval = 1000
 
-// discoverGitlinks lists the submodule commits recorded by the commits reachable from the mirror's
-// refs but not from exclude, by submodule.
-func discoverGitlinks(ctx context.Context, mirrorPath string, exclude []string, progress func(n int)) (gitlinkTargets, error) {
+// discoverGitlinks lists the submodule commits recorded by the commits reachable from heads (all of
+// the mirror's refs if nil) but not from exclude, by submodule.
+func discoverGitlinks(ctx context.Context, mirrorPath string, heads, exclude []string, progress func(n int)) (gitlinkTargets, error) {
 	// Merges are diffed against all parents (-c), so a gitlink a merge introduces is listed too
-	cmd := exec.CommandContext(ctx, "git", "log", "--all", "--root", "-c", "-r", "--raw", "--no-abbrev", "--no-renames", "--format=commit %H", "--stdin")
+	args, stdin := historyRevisions(heads, exclude)
+	cmd := exec.CommandContext(ctx, "git", append([]string{"log", "--root", "-c", "-r", "--raw", "--no-abbrev", "--no-renames", "--format=commit %H"}, args...)...)
 	cmd.Dir = mirrorPath
-	cmd.Stdin = excludedRevisions(exclude)
+	cmd.Stdin = stdin
 	cmd.Env = GitEnv()
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -322,9 +323,10 @@ func (g *gitlinkResolution) close() {
 	}
 }
 
-// resolveGitlinks converts the submodules of the commits the conversion will add and decides the
-// SHA-256 of every submodule commit they record. Earlier decisions are kept, also across rebuilds.
-func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) (_ *gitlinkResolution, err error) {
+// resolveGitlinks converts the submodules of the commits the conversion will add, those reachable
+// from heads (all of the mirror's refs if nil), and decides the SHA-256 of every submodule commit
+// they record. Earlier decisions are kept, also across rebuilds.
+func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, heads []string) (_ *gitlinkResolution, err error) {
 	var decided map[sha1ID]sha256ID
 	if previous, err := loadState(info.ServingPath); err == nil {
 		if decided, err = previous.gitlinkDecisions(); err != nil {
@@ -357,7 +359,7 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 			_, _ = fmt.Fprintf(progressWriter, "\rremote: Evergit: [Progress] Scanning %s: %d commits...", info.RepoName, n)
 		}
 	}
-	targets, err := discoverGitlinks(ctx, info.MirrorPath, exclude, progress)
+	targets, err := discoverGitlinks(ctx, info.MirrorPath, heads, exclude, progress)
 	if err != nil {
 		return nil, err
 	}

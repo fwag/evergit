@@ -408,7 +408,7 @@ type objectRewriter struct {
 	cat      *catFileBatch
 	repoPath string
 	packDir  string
-	pack     *packWriter
+	pack     *packWriter    // nil when only computing ids
 	chunk    []packedObject // objects in pack
 	ids      *translations
 	added    []sha1ID // objects converted in this run, in conversion order
@@ -443,15 +443,18 @@ func (r *objectRewriter) convert(id sha1ID, name string) (sha256ID, error) {
 		return sha256ID{}, fmt.Errorf("failed to convert %s %x: %w", typ, id, err)
 	}
 	newID := hashObject(typ, data)
-	if err := r.pack.add(typ, data); err != nil {
-		return sha256ID{}, fmt.Errorf("failed to write %s %x to pack: %w", typ, id, err)
-	}
-	r.chunk = append(r.chunk, packedObject{id: newID, name: name})
 	r.ids.added[id] = newID
 	r.added = append(r.added, id)
 	if r.progress != nil && len(r.added)%progressObjectInterval == 0 {
 		r.progress(len(r.added))
 	}
+	if r.pack == nil {
+		return newID, nil // only computing ids
+	}
+	if err := r.pack.add(typ, data); err != nil {
+		return sha256ID{}, fmt.Errorf("failed to write %s %x to pack: %w", typ, id, err)
+	}
+	r.chunk = append(r.chunk, packedObject{id: newID, name: name})
 	if r.pack.size() >= packChunkSize {
 		if err := r.flushChunk(); err != nil {
 			return sha256ID{}, err
@@ -565,20 +568,26 @@ func (r *objectRewriter) flushChunk() error {
 	return nil
 }
 
-// rewriteObjects converts every object reachable from the mirror's refs that is not yet in ids
-// into packs in targetPath, walking only history not reachable from exclude (refs converted
-// before). It returns the converted ids in conversion order, and the objects mergetags refer to but
-// the repository lacks, with a merge recording each.
-func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *translations, gitlinks *gitlinkResolution, exclude []string, progress func(int)) ([]sha1ID, map[string]string, error) {
+// rewriteObjects converts every object reachable from heads (commits, or all of the mirror's refs if
+// nil) that is not yet in ids into packs in targetPath, walking only history not reachable from
+// exclude (refs converted before). With an empty targetPath, it only computes the SHA-256 ids into
+// ids. It returns the converted ids in conversion order, and the objects mergetags refer to but the
+// repository lacks, with a merge recording each.
+func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *translations, gitlinks *gitlinkResolution, heads, exclude []string, progress func(int)) ([]sha1ID, map[string]string, error) {
 	// Parents before children keeps the recursion in convert shallow: commits only recurse into trees
-	commits, err := runCmdStdin(ctx, 0, mirrorPath, excludedRevisions(exclude), "git", "rev-list", "--reverse", "--topo-order", "--all", "--stdin")
+	args, stdin := historyRevisions(heads, exclude)
+	commits, err := runCmdStdin(ctx, 0, mirrorPath, stdin, "git", append([]string{"rev-list", "--reverse", "--topo-order"}, args...)...)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Tags, and refs pointing directly at trees or blobs, are not listed by rev-list
-	refTargets, err := runCmdContext(ctx, 0, mirrorPath, "git", "for-each-ref", "--format=%(objectname)")
-	if err != nil {
-		return nil, nil, err
+	objects := strings.Fields(commits)
+	if heads == nil {
+		// Tags, and refs pointing directly at trees or blobs, are not listed by rev-list
+		refTargets, err := runCmdContext(ctx, 0, mirrorPath, "git", "for-each-ref", "--format=%(objectname)")
+		if err != nil {
+			return nil, nil, err
+		}
+		objects = append(objects, strings.Fields(refTargets)...)
 	}
 
 	cat, err := startCatFile(ctx, mirrorPath)
@@ -587,17 +596,19 @@ func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *tra
 	}
 	defer cat.close()
 
-	packDir := filepath.Join(targetPath, "objects", "pack")
-	if err := os.MkdirAll(packDir, 0755); err != nil {
-		return nil, nil, err
+	r := &objectRewriter{ctx: ctx, cat: cat, ids: ids, gitlinks: gitlinks, progress: progress}
+	if targetPath != "" {
+		r.repoPath, r.packDir = targetPath, filepath.Join(targetPath, "objects", "pack")
+		if err := os.MkdirAll(r.packDir, 0755); err != nil {
+			return nil, nil, err
+		}
+		if err := r.startChunk(); err != nil {
+			return nil, nil, err
+		}
+		defer func() { r.pack.discard() }()
 	}
-	r := &objectRewriter{ctx: ctx, cat: cat, repoPath: targetPath, packDir: packDir, ids: ids, gitlinks: gitlinks, progress: progress}
-	if err := r.startChunk(); err != nil {
-		return nil, nil, err
-	}
-	defer func() { r.pack.discard() }()
 
-	for _, hexID := range append(strings.Fields(commits), strings.Fields(refTargets)...) {
+	for _, hexID := range objects {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
@@ -605,24 +616,34 @@ func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *tra
 			return nil, nil, err
 		}
 	}
-	if err := r.flushChunk(); err != nil {
-		return nil, nil, err
+	if r.pack != nil {
+		if err := r.flushChunk(); err != nil {
+			return nil, nil, err
+		}
 	}
 	return r.added, r.missingMergetags, nil
 }
 
-// excludedRevisions lists ids as negated revisions for git's --stdin, once each. Passed as
+// historyRevisions selects the history of heads, or of all refs if heads is nil, not reachable from
+// exclude: the arguments of git log or rev-list, and the revisions for their --stdin. Passed as
 // arguments, the refs of a large repository would exceed the system's argument size limit.
-func excludedRevisions(ids []string) io.Reader {
+func historyRevisions(heads, exclude []string) ([]string, io.Reader) {
+	args := []string{"--stdin"}
+	if heads == nil {
+		args = append(args, "--all")
+	}
 	var b strings.Builder
-	seen := make(map[string]bool, len(ids))
-	for _, id := range ids {
+	seen := make(map[string]bool, len(exclude))
+	for _, id := range exclude {
 		if !seen[id] {
 			seen[id] = true
 			b.WriteString("^" + id + "\n")
 		}
 	}
-	return strings.NewReader(b.String())
+	for _, id := range heads {
+		b.WriteString(id + "\n")
+	}
+	return args, strings.NewReader(b.String())
 }
 
 // updateRefs points every ref of the target at the translation of the mirror's ref.
@@ -774,7 +795,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err != nil {
 		return err
 	}
-	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, exclude, progress)
+	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, nil, exclude, progress)
 	if err != nil {
 		return err
 	}
