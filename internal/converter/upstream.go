@@ -14,7 +14,7 @@ import (
 )
 
 // ErrRedirectNotAllowed is returned when an upstream redirects outside the allowed hosts, or to
-// something else than an HTTPS repository URL.
+// something else than a repository URL.
 var ErrRedirectNotAllowed = errors.New("upstream redirect not allowed")
 
 const maxUpstreamRedirects = 5
@@ -51,7 +51,9 @@ func (m *Manager) gitUpstream(ctx context.Context, info *resolver.RepositoryInfo
 }
 
 // resolveRedirects follows the redirects of a repository URL's smart HTTP endpoint, over HTTPS and
-// only to allowed hosts, and returns the final repository URL.
+// only to allowed hosts, and returns the final repository URL. A redirect to plain HTTP, as
+// git.qemu.org's to http://gitlab.com/..., is followed to the same URL over HTTPS: nothing is ever
+// fetched over HTTP.
 func resolveRedirects(ctx context.Context, remote string, allowedHosts []string) (string, error) {
 	current := strings.TrimSuffix(remote, "/")
 	for hop := 0; hop <= maxUpstreamRedirects; hop++ {
@@ -89,12 +91,12 @@ func resolveRedirects(ctx context.Context, remote string, allowedHosts []string)
 		base, isRepository := strings.CutSuffix(location.Path, "/info/refs")
 		host := strings.ToLower(location.Hostname())
 		switch {
-		case location.Scheme != "https" || !isRepository:
-			return "", fmt.Errorf("%w: %s redirects to %s, which is not an HTTPS repository URL", ErrRedirectNotAllowed, current, location.Redacted())
+		case location.Scheme != "https" && location.Scheme != "http" || !isRepository:
+			return "", fmt.Errorf("%w: %s redirects to %s, which is not a repository URL", ErrRedirectNotAllowed, current, location.Redacted())
 		case !slices.Contains(allowedHosts, host):
 			return "", fmt.Errorf("%w: %s redirects to host %q, which is not in -allowed-hosts", ErrRedirectNotAllowed, current, host)
 		}
-		next := url.URL{Scheme: location.Scheme, Host: location.Host, Path: base}
+		next := url.URL{Scheme: "https", Host: location.Host, Path: base}
 		current = next.String()
 	}
 	return "", fmt.Errorf("%w: %s redirects more than %d times", ErrRedirectNotAllowed, remote, maxUpstreamRedirects)

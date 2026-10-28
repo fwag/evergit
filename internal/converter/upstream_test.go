@@ -101,15 +101,32 @@ func TestUpstreamRedirectToOtherHostIsRefused(t *testing.T) {
 	}
 }
 
-func TestUpstreamRedirectToPlainHTTPIsRefused(t *testing.T) {
+func TestUpstreamRedirectToPlainHTTPIsFollowedOverHTTPS(t *testing.T) {
+	up := newTestUpstream(t)
+	bare := filepath.Join(t.TempDir(), "repo.git")
+	gitRaw(t, "", nil, "clone", "-q", "--bare", up, bare)
+	// As git.qemu.org redirects to http://gitlab.com/...; the backend only speaks HTTPS
+	redirector := newRedirectingUpstream(t, bare, func(backend string) string { return strings.Replace(backend, "https://", "http://", 1) })
+
+	info := redirectedRepoInfo(t, redirector+"/repo.git")
+	m := NewManager(0)
+	m.SetConfig(&config.Config{AllowedHosts: []string{"127.0.0.1"}})
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatalf("clone redirected to plain HTTP, which must be fetched over HTTPS: %v", err)
+	}
+}
+
+func TestUpstreamRedirectToPlainHTTPOfOtherHostIsRefused(t *testing.T) {
 	bare := filepath.Join(t.TempDir(), "repo.git")
 	gitRaw(t, "", nil, "init", "-q", "--bare", bare)
-	redirector := newRedirectingUpstream(t, bare, func(backend string) string { return strings.Replace(backend, "https://", "http://", 1) })
+	redirector := newRedirectingUpstream(t, bare, func(backend string) string {
+		return strings.Replace(strings.Replace(backend, "https://", "http://", 1), "127.0.0.1", "localhost", 1)
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := resolveRedirects(ctx, redirector+"/repo.git", []string{"127.0.0.1"}); !errors.Is(err, ErrRedirectNotAllowed) {
-		t.Errorf("redirect from HTTPS to HTTP = %v, want ErrRedirectNotAllowed", err)
+		t.Errorf("redirect to plain HTTP of a host that is not allowed = %v, want ErrRedirectNotAllowed", err)
 	}
 }
 
