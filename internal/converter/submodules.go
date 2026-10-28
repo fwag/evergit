@@ -831,7 +831,7 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 	if strings.HasPrefix(rawURL, "./") || strings.HasPrefix(rawURL, "../") {
 		// Relative to the superproject's URL, as git resolves it: "../other.git" next to
 		// "<domain>/<owner>/<repo>.git" is "<domain>/<owner>/other.git"
-		parentURL := path.Join(parentInfo.Domain, parentInfo.Owner, parentInfo.RepoName+".git")
+		parentURL := path.Join(parentInfo.Domain, parentInfo.Path()+".git")
 		targetPath = path.Clean(path.Join(parentURL, rawURL))
 	} else if strings.HasPrefix(rawURL, "git@") {
 		// git@domain:owner/repo.git

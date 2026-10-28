@@ -251,7 +251,7 @@ func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.Reposi
 }
 
 func canonicalRepoID(info *resolver.RepositoryInfo) string {
-	return info.Domain + "/" + info.Owner + "/" + info.RepoName
+	return info.Domain + "/" + info.Path()
 }
 
 // ensureRepo checks or converts a repository. A non-empty requiredCommits lists commits the repository

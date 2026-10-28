@@ -287,6 +287,31 @@ func TestSubmoduleDiscoveredFromOldHistory(t *testing.T) {
 	}
 }
 
+func TestSubmoduleOnHostWithoutOwner(t *testing.T) {
+	sub := newTestUpstream(t)
+	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	super := newTestUpstream(t)
+	// A host serving repositories at the top level, as https://boringssl.googlesource.com/boringssl
+	addGitlink(t, super, "sub", "https://"+hostOf(sub)+"/"+strings.TrimSuffix(filepath.Base(sub), ".git"), commit)
+
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	info := repoInfo(t, m, super)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	subInfo, err := resolver.ParsePath(hostOf(sub)+"/"+filepath.Base(sub), m.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := LookupID(subInfo.ServingPath, "sha1", commit)
+	if err != nil {
+		t.Fatalf("submodule without owner not converted: %v", err)
+	}
+	if got := gitlinkOf(t, info.ServingPath, "HEAD", "sub"); got != want {
+		t.Errorf("gitlink = %s, want the real SHA-256 %s", got, want)
+	}
+}
+
 func TestSubmoduleCommitOnNoBranchIsFetched(t *testing.T) {
 	sub := newTestUpstream(t)
 	// A commit only a forge ref reaches, like GitHub's refs/pull/*

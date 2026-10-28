@@ -50,9 +50,24 @@ func TestParsePath(t *testing.T) {
 			wantErr:     false,
 		},
 		{
-			name:    "Too short",
+			name:    "Forge repository without owner",
 			rawPath: "github/ta",
 			wantErr: true,
+		},
+		{
+			name:    "Host only",
+			rawPath: "git.custom.org",
+			wantErr: true,
+		},
+		{
+			name:        "Generic host without owner",
+			rawPath:     "git.custom.org/MyRepo.git",
+			wantDomain:  "git.custom.org",
+			wantOwner:   "",
+			wantRepo:    "MyRepo",
+			wantRemote:  "https://git.custom.org/MyRepo.git",
+			wantMirror:  filepath.Join(storageRoot, "mirrors", "git.custom.org", "MyRepo.git"),
+			wantServing: filepath.Join(storageRoot, "repos", "git.custom.org", "MyRepo.git"),
 		},
 		{
 			name:    "Invalid domain",

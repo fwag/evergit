@@ -16,12 +16,20 @@ var validSegment = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 type RepositoryInfo struct {
 	Domain      string // e.g. github.com
-	Owner       string // e.g. ta or org/sub1/sub2
+	Owner       string // e.g. ta or org/sub1/sub2; empty for hosts serving repositories at the top level
 	RepoName    string // e.g. evergit (stripped of .git)
 	RemoteURL   string // e.g. https://github.com/ta/evergit.git
 	MirrorPath  string // e.g. <storageRoot>/mirrors/github.com/ta/evergit.git
 	ServingPath string // e.g. <storageRoot>/repos/github.com/ta/evergit.git; symlink to the current build
 	BuildsPath  string // e.g. <storageRoot>/builds/github.com/ta/evergit.git; holds full conversion builds
+}
+
+// Path returns the repository's path on its host, e.g. ta/evergit, or evergit without owner.
+func (info *RepositoryInfo) Path() string {
+	if info.Owner == "" {
+		return info.RepoName
+	}
+	return info.Owner + "/" + info.RepoName
 }
 
 // caseInsensitiveHosts are known Git forge hosts where user/org names and repository names
@@ -41,9 +49,10 @@ func isCaseInsensitiveHost(domain string) bool {
 	return false
 }
 
-// ParsePath parses a raw Git path (e.g. "github/owner/repo.git" or "github.com/org/sub/repo.git")
-// and resolves it into detailed repository information based on the configured storage root.
-// Only hosts listed in cfg.AllowedHosts are accepted.
+// ParsePath parses a raw Git path (e.g. "github/owner/repo.git", "github.com/org/sub/repo.git", or
+// "boringssl.googlesource.com/boringssl" for a host serving repositories at the top level) and
+// resolves it into detailed repository information based on the configured storage root. Only hosts
+// listed in cfg.AllowedHosts are accepted.
 func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 	storageRoot := cfg.StorageRoot
 
@@ -55,8 +64,8 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 	// Split the path into segments. No filepath.Clean: it keeps leading ".." on relative
 	// paths, so traversal is rejected per segment instead.
 	parts := strings.Split(path, "/")
-	if len(parts) < 3 {
-		return nil, errors.New("invalid repository path: must be in the format 'domain/owner/repo' or 'shorthand/owner/repo'")
+	if len(parts) < 2 {
+		return nil, errors.New("invalid repository path: must be in the format 'domain/owner/repo', 'shorthand/owner/repo' or 'domain/repo'")
 	}
 	for i, part := range parts {
 		if part == "." || part == ".." || !validSegment.MatchString(part) {
@@ -85,16 +94,21 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 	// Normalize owner and repo to lowercase for known case-insensitive hosts to avoid duplicate
 	// mirrors, duplicate conversions, and repo lock bypassing.
 	if isCaseInsensitiveHost(domain) {
+		if owner == "" {
+			return nil, fmt.Errorf("invalid repository path: repositories on %s are 'domain/owner/repo'", domain)
+		}
 		owner = strings.ToLower(owner)
 		repoName = strings.ToLower(repoName)
 	}
+
+	info := &RepositoryInfo{Domain: domain, Owner: owner, RepoName: repoName}
 
 	// Rebuild remote URL
 	var remoteURL string
 	if override, ok := cfg.UpstreamOverrides[domain]; ok {
 		remoteURL = override
 	} else {
-		remoteURL = "https://" + domain + "/" + owner + "/" + repoName + ".git"
+		remoteURL = "https://" + domain + "/" + info.Path() + ".git"
 	}
 
 	// Define safe local paths
@@ -105,15 +119,8 @@ func ParsePath(rawPath string, cfg *config.Config) (*RepositoryInfo, error) {
 		return nil, errors.New("invalid repository path: resolves outside of storage")
 	}
 
-	return &RepositoryInfo{
-		Domain:      domain,
-		Owner:       owner,
-		RepoName:    repoName,
-		RemoteURL:   remoteURL,
-		MirrorPath:  mirrorPath,
-		ServingPath: servingPath,
-		BuildsPath:  buildsPath,
-	}, nil
+	info.RemoteURL, info.MirrorPath, info.ServingPath, info.BuildsPath = remoteURL, mirrorPath, servingPath, buildsPath
+	return info, nil
 }
 
 func isWithin(root, path string) bool {
