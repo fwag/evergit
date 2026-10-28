@@ -429,6 +429,7 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 				return nil, "", submoduleError(submodule, info.RepoName, err)
 			}
 			maps.Copy(t.translated, translated)
+			maps.Copy(res.decided, translated)
 			return gone, "commit gone upstream", nil
 		}
 		if depth <= 0 {
@@ -441,6 +442,7 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 			var translated map[sha1ID]sha256ID
 			translated, gone, err = m.translateCommits(ctx, subInfo, commits, progressWriter, depth-1)
 			maps.Copy(t.translated, translated)
+			maps.Copy(res.decided, translated)
 		} else {
 			var table *translationIndex
 			table, gone, err = m.ensureSubmoduleCommits(ctx, subInfo, commits, progressWriter, depth-1)

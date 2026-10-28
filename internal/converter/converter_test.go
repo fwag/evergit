@@ -346,7 +346,8 @@ func newTestUpstream(t *testing.T) string {
 	}
 	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
 	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
-	commitToUpstream(t, upstreamPath, "commit 0")
+	// A distinct first commit, so that upstreams do not contain each other's commits
+	commitToUpstream(t, upstreamPath, "commit 0 of "+filepath.Base(upstreamPath))
 	return upstreamPath
 }
 
@@ -934,6 +935,38 @@ func TestSubmoduleCycleOfForksDecidesSharedCommitsTheSame(t *testing.T) {
 	}
 	if fromA, fromB := converted(repoA), converted(repoB); fromA != fromB {
 		t.Errorf("conversion depends on the repository converted first: %v from A, %v from B", fromA, fromB)
+	}
+}
+
+func TestSubmoduleCycleWithinRecordedHistoryConverts(t *testing.T) {
+	// B records A, then A records the commit of B that records A: converting either one needs the
+	// other's commits while the other's conversion waits
+	repoA := newTestUpstream(t)
+	repoB := newTestUpstream(t)
+	// Test upstreams start with the same commit: B must not contain the commit it records of A
+	commitToUpstream(t, repoA, "only in A")
+	addGitlink(t, repoB, "subA", urlOf(repoA), gitLine(t, repoA, nil, "rev-parse", "HEAD"))
+	addGitlink(t, repoA, "subB", urlOf(repoB), gitLine(t, repoB, nil, "rev-parse", "HEAD"))
+
+	converted := func(first string) map[string]string {
+		m := newSubmoduleManager(t.TempDir(), 0, repoA, repoB)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.EnsureRepo(ctx, repoInfo(t, m, first), nil); err != nil {
+			t.Fatalf("EnsureRepo of %s failed: %v", filepath.Base(first), err)
+		}
+		ids := make(map[string]string)
+		for name, upstream := range map[string]string{"A": repoA, "B": repoB} {
+			info := repoInfo(t, m, upstream)
+			if err := m.EnsureRepo(ctx, info, nil); err != nil {
+				t.Fatal(err)
+			}
+			ids[name] = headOf(t, info.ServingPath)
+		}
+		return ids
+	}
+	if fromA, fromB := converted(repoA), converted(repoB); !maps.Equal(fromA, fromB) {
+		t.Errorf("conversion depends on the repository converted first:\nfrom A: %v\nfrom B: %v", fromA, fromB)
 	}
 }
 
