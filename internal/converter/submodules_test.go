@@ -393,6 +393,45 @@ func TestSubmodulePointingIntoItsOwnRepository(t *testing.T) {
 	}
 }
 
+func TestSubmodulePointingIntoItsOwnRepositoryOnNoBranchIsFetched(t *testing.T) {
+	super := newTestUpstream(t)
+	m := newSubmoduleManager(t.TempDir(), 0, super)
+	info := repoInfo(t, m, super)
+	// Mirrored before the commit exists: cloning a local path would copy unreachable objects too
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A commit of the repository only a forge ref reaches, like GitHub's refs/pull/*
+	gitRaw(t, super, nil, "checkout", "-q", "-b", "pr")
+	commitToUpstream(t, super, "pull request")
+	commit := gitLine(t, super, nil, "rev-parse", "HEAD")
+	gitRaw(t, super, nil, "update-ref", "refs/pull/1/head", commit)
+	gitRaw(t, super, nil, "checkout", "-q", "main")
+	gitRaw(t, super, nil, "branch", "-D", "pr")
+	addGitlink(t, super, "self", urlOf(super), commit)
+
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The gitlink records the commit as the repository converts it once a branch reaches it
+	gitlink := gitlinkOf(t, info.ServingPath, "main", "self")
+	gitRaw(t, super, nil, "branch", "pr", commit)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := gitLine(t, info.ServingPath, nil, "--git-dir=.", "rev-parse", "pr"); gitlink != want {
+		t.Errorf("gitlink into the repository itself = %s, want its converted commit %s", gitlink, want)
+	}
+}
+
+func TestSubmodulePointingIntoItsOwnRepositoryGoneUpstreamNeedsApproval(t *testing.T) {
+	super := newTestUpstream(t)
+	addGitlink(t, super, "self", urlOf(super), strings.Repeat("ab", 20))
+
+	m := newSubmoduleManager(t.TempDir(), 0, super)
+	assertNeedsApproval(t, m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil), canonicalRepoID(repoInfo(t, m, super)), urlOf(super))
+}
+
 func TestMarkGoneClassifiesUpstreamErrors(t *testing.T) {
 	cases := []struct {
 		stderr string

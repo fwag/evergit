@@ -424,13 +424,24 @@ func (m *Manager) resolveGitlinks(ctx context.Context, info *resolver.Repository
 			continue
 		}
 		if canonicalRepoID(subInfo) == superproject {
-			// Translated from the repository's own objects, if it has them
+			// Translated from the repository's own objects; those it lacks are fetched from upstream
 			missing, err := missingCommits(ctx, info.MirrorPath, pending)
 			if err != nil {
 				return nil, err
 			}
-			if len(missing) > 0 {
-				synthetic(missing, "commit not in the repository itself")
+			if len(missing) == 0 {
+				continue
+			}
+			if depth <= 0 {
+				return nil, fmt.Errorf("%w: %s needs commits of itself not on its branches", ErrSubmoduleDepth, info.RepoName)
+			}
+			translated, gone, err := m.translateCommits(ctx, info, missing, progressWriter, depth-1)
+			if err != nil {
+				return nil, submoduleError(submodule, info.RepoName, err)
+			}
+			maps.Copy(res.decided, translated)
+			if len(gone) > 0 {
+				synthetic(gone, "commit gone upstream")
 			}
 			continue
 		}
@@ -588,14 +599,15 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 	return table, missing, nil
 }
 
-// translateCommits computes the SHA-256 of commits of a submodule that is being converted further up
-// the chain of submodules, whose conversion waits for this one. A commit can only record commits that
-// existed before it, so recording each other's commits never leads two repositories back to the same
-// commit: the history of the commits is translated in memory, writing nothing, as the submodule's own
-// conversion will translate it. It returns the translations and the commits that do not exist upstream.
+// translateCommits computes the SHA-256 of submodule commits of a repository being converted: further
+// up the chain of submodules, whose conversion waits for this one, or this one itself. A commit can
+// only record commits that existed before it, so recording each other's commits never leads two
+// repositories back to the same commit: the history of the commits is translated in memory, writing
+// nothing, as the repository's own conversion translates it. It returns the translations and the
+// commits that do not exist upstream.
 func (m *Manager) translateCommits(ctx context.Context, subInfo *resolver.RepositoryInfo, commits []string, progressWriter io.Writer, depth int) (map[sha1ID]sha256ID, []string, error) {
-	log.Printf("[%s] Translating %d commit(s) needed by a submodule of the repository it is converted for", subInfo.RepoName, len(commits))
-	// The waiting conversion synced the mirror; missing commits are fetched without changing its refs
+	log.Printf("[%s] Translating %d submodule commit(s) of a repository being converted", subInfo.RepoName, len(commits))
+	// The conversion synced the mirror; missing commits are fetched without changing its refs
 	missing, err := missingCommits(ctx, subInfo.MirrorPath, commits)
 	if err != nil {
 		return nil, nil, err
