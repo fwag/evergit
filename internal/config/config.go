@@ -31,6 +31,9 @@ type Config struct {
 	RequestWait time.Duration
 	// MaxConversionTime bounds a single sync or conversion
 	MaxConversionTime time.Duration
+	// MaxSubmoduleDepth bounds the nesting of submodules converted for a repository, counting each
+	// translation of commits of a submodule further up the chain of submodules as a level
+	MaxSubmoduleDepth int
 	Debug             bool
 	// AllowedHosts lists the upstream hosts clients may request; anything else is rejected
 	AllowedHosts []string
@@ -43,6 +46,12 @@ type Config struct {
 	// or environment variables; tests set it to serve fixtures without network access.
 	UpstreamOverrides map[string]string
 }
+
+// DefaultMaxSubmoduleDepth is the maximum nesting of submodules converted for a repository. It only
+// stops runaway nesting: exceeding it fails the conversion rather than changing any SHA-256. Each
+// commit translated for a cycle of submodules recording each other counts as a level, and the forks
+// of mbedtls reached from qemu through edk2 need 24.
+const DefaultMaxSubmoduleDepth = 50
 
 func Load() *Config {
 	storageRoot := os.Getenv("EVERGIT_STORAGE_ROOT")
@@ -89,6 +98,13 @@ func Load() *Config {
 		}
 	}
 
+	maxSubmoduleDepth := DefaultMaxSubmoduleDepth
+	if env := os.Getenv("EVERGIT_MAX_SUBMODULE_DEPTH"); env != "" {
+		if val, err := strconv.Atoi(env); err == nil && val >= 0 {
+			maxSubmoduleDepth = val
+		}
+	}
+
 	debug := os.Getenv("EVERGIT_DEBUG") == "1" || strings.EqualFold(os.Getenv("EVERGIT_DEBUG"), "true")
 
 	return &Config{
@@ -103,6 +119,7 @@ func Load() *Config {
 
 		RequestWait:       requestWait,
 		MaxConversionTime: maxConversionTime,
+		MaxSubmoduleDepth: maxSubmoduleDepth,
 		Debug:             debug,
 		AllowedHosts:      ParseHostList(getEnv("EVERGIT_ALLOWED_HOSTS", strings.Join(DefaultAllowedHosts, ","))),
 		Shorthands:        ParseShorthands(getEnv("EVERGIT_SHORTHANDS", DefaultShorthands)),

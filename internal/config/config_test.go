@@ -60,6 +60,16 @@ func TestLoadShorthandsFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadMaxSubmoduleDepth(t *testing.T) {
+	cases := map[string]int{"": DefaultMaxSubmoduleDepth, "0": 0, "7": 7, "-1": DefaultMaxSubmoduleDepth, "x": DefaultMaxSubmoduleDepth}
+	for env, want := range cases {
+		t.Setenv("EVERGIT_MAX_SUBMODULE_DEPTH", env)
+		if got := Load().MaxSubmoduleDepth; got != want {
+			t.Errorf("EVERGIT_MAX_SUBMODULE_DEPTH=%q: MaxSubmoduleDepth = %d, want %d", env, got, want)
+		}
+	}
+}
+
 func TestLoadStorageRootHierarchy(t *testing.T) {
 	t.Run("Default fallback", func(t *testing.T) {
 		t.Setenv("EVERGIT_STORAGE_ROOT", "")

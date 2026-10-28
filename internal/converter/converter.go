@@ -41,9 +41,9 @@ const DefaultExecTimeout = 12 * time.Hour
 // copy is still being converted; the conversion continues and a later request may succeed.
 var ErrConversionInProgress = errors.New("repository is being converted")
 
-// DefaultMaxSubmoduleDepth is the maximum nesting of submodules converted for a repository. It only
-// stops runaway nesting: exceeding it fails the conversion rather than changing any SHA-256.
-const DefaultMaxSubmoduleDepth = 10
+// DefaultMaxSubmoduleDepth is the maximum nesting of submodules converted for a repository (see
+// config.DefaultMaxSubmoduleDepth).
+const DefaultMaxSubmoduleDepth = config.DefaultMaxSubmoduleDepth
 
 type Manager struct {
 	cacheTTL          time.Duration
