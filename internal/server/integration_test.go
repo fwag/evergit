@@ -206,7 +206,7 @@ func TestServeSetupScript(t *testing.T) {
 	defer listener.Close()
 
 	srv := &http.Server{Handler: httpServer}
-	go srv.Serve(listener)
+	go func() { _ = srv.Serve(listener) }() // returns when the server is closed
 	defer srv.Close()
 
 	baseURL := "http://" + listener.Addr().String()
