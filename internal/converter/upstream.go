@@ -57,23 +57,7 @@ func (m *Manager) gitUpstream(ctx context.Context, info *resolver.RepositoryInfo
 func resolveRedirects(ctx context.Context, remote string, allowedHosts []string) (string, error) {
 	current := strings.TrimSuffix(remote, "/")
 	for hop := 0; hop <= maxUpstreamRedirects; hop++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current+"/info/refs?service=git-upload-pack", nil)
-		if err != nil {
-			return "", err
-		}
-		req.Header.Set("User-Agent", "git/evergit")
-		var resp *http.Response
-		for attempt := 0; attempt < 2; attempt++ {
-			resp, err = upstreamClient.Do(req)
-			if err == nil || ctx.Err() != nil {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(500 * time.Millisecond):
-			}
-		}
+		resp, err := probeUpstream(ctx, current)
 		if err != nil {
 			if hop == 0 {
 				return "", fmt.Errorf("probe upstream redirect for %s: %w", current, err)
@@ -84,20 +68,47 @@ func resolveRedirects(ctx context.Context, remote string, allowedHosts []string)
 		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
 			return current, nil
 		}
-		location, err := resp.Location()
-		if err != nil {
-			return "", fmt.Errorf("upstream %s returned redirect status %d without Location header: %w", current, resp.StatusCode, err)
+		if current, err = redirectTarget(current, resp, allowedHosts); err != nil {
+			return "", err
 		}
-		base, isRepository := strings.CutSuffix(location.Path, "/info/refs")
-		host := strings.ToLower(location.Hostname())
-		switch {
-		case location.Scheme != "https" && location.Scheme != "http" || !isRepository:
-			return "", fmt.Errorf("%w: %s redirects to %s, which is not a repository URL", ErrRedirectNotAllowed, current, location.Redacted())
-		case !slices.Contains(allowedHosts, host):
-			return "", fmt.Errorf("%w: %s redirects to host %q, which is not in -allowed-hosts", ErrRedirectNotAllowed, current, host)
-		}
-		next := url.URL{Scheme: "https", Host: location.Host, Path: base}
-		current = next.String()
 	}
 	return "", fmt.Errorf("%w: %s redirects more than %d times", ErrRedirectNotAllowed, remote, maxUpstreamRedirects)
+}
+
+// probeUpstream requests a repository URL's smart HTTP endpoint, retrying once on a transient error.
+func probeUpstream(ctx context.Context, repoURL string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, repoURL+"/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "git/evergit")
+	resp, err := upstreamClient.Do(req)
+	if err == nil || ctx.Err() != nil {
+		return resp, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(500 * time.Millisecond):
+	}
+	return upstreamClient.Do(req)
+}
+
+// redirectTarget returns the repository URL a redirect of current points to, over HTTPS, if it is a
+// repository URL on an allowed host.
+func redirectTarget(current string, resp *http.Response, allowedHosts []string) (string, error) {
+	location, err := resp.Location()
+	if err != nil {
+		return "", fmt.Errorf("upstream %s returned redirect status %d without Location header: %w", current, resp.StatusCode, err)
+	}
+	base, isRepository := strings.CutSuffix(location.Path, "/info/refs")
+	host := strings.ToLower(location.Hostname())
+	switch {
+	case location.Scheme != "https" && location.Scheme != "http" || !isRepository:
+		return "", fmt.Errorf("%w: %s redirects to %s, which is not a repository URL", ErrRedirectNotAllowed, current, location.Redacted())
+	case !slices.Contains(allowedHosts, host):
+		return "", fmt.Errorf("%w: %s redirects to host %q, which is not in -allowed-hosts", ErrRedirectNotAllowed, current, host)
+	}
+	next := url.URL{Scheme: "https", Host: location.Host, Path: base}
+	return next.String(), nil
 }
