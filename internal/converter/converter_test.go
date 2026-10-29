@@ -1008,6 +1008,31 @@ func newTestUpstreamSHA256(t *testing.T) string {
 	return upstreamPath
 }
 
+func TestUpstreamTurnedSHA256IsReported(t *testing.T) {
+	upstreamPath := newTestUpstream(t)
+	info := newTestRepoInfo(t, upstreamPath)
+	manager := NewManager(0)
+	if err := manager.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The upstream is replaced by its SHA-256 transition at the same URL
+	if err := os.RemoveAll(upstreamPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCmd("", "git", "init", "--initial-branch=main", "--object-format=sha256", upstreamPath); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = runCmd(upstreamPath, "git", "config", "user.name", "Test User")
+	_, _ = runCmd(upstreamPath, "git", "config", "user.email", "test@example.com")
+	commitToUpstream(t, upstreamPath, "commit 0 in SHA-256")
+
+	// Rather than serving the converted copy as if the upstream were unreachable
+	if err := manager.EnsureRepo(context.Background(), info, nil); !errors.Is(err, ErrUpstreamObjectFormatChanged) {
+		t.Fatalf("EnsureRepo after the upstream turned SHA-256 = %v, want ErrUpstreamObjectFormatChanged", err)
+	}
+}
+
 func TestNativeSHA256UpstreamIsServedUnconverted(t *testing.T) {
 	upstreamPath := newTestUpstreamSHA256(t)
 	upstreamHead, err := runCmd(upstreamPath, "git", "rev-parse", "HEAD")

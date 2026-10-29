@@ -123,6 +123,10 @@ func writeConversionError(w http.ResponseWriter, info *resolver.RepositoryInfo, 
 		http.Error(w, "Evergit: "+err.Error()+"; this can take a while for large repositories, please retry later", http.StatusServiceUnavailable)
 		return
 	}
+	if errors.Is(err, converter.ErrUpstreamObjectFormatChanged) {
+		http.Error(w, "Evergit: "+err.Error(), http.StatusBadGateway)
+		return
+	}
 	if errors.Is(err, converter.ErrSubmoduleNotApproved) || errors.Is(err, converter.ErrRedirectNotAllowed) {
 		http.Error(w, "Evergit: "+err.Error(), http.StatusForbidden)
 		return

@@ -30,6 +30,11 @@ var ErrServerBusy = errors.New("server is busy performing other conversions, ple
 // ErrDiskSpaceExhausted is returned when free disk space is below the safety threshold.
 var ErrDiskSpaceExhausted = errors.New("storage disk space exhausted")
 
+// ErrUpstreamObjectFormatChanged is returned when an upstream converted to SHA-1 changed its object
+// format, e.g. moved to SHA-256 at the same URL: its mirror can no longer be updated, and serving the
+// converted copy as if the upstream were unreachable would hide it.
+var ErrUpstreamObjectFormatChanged = errors.New("upstream changed its object format")
+
 // DefaultConversionTimeout is the maximum time a request will wait in the conversion queue before shedding load.
 const DefaultConversionTimeout = 30 * time.Second
 
@@ -650,6 +655,12 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 		err = m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
 			return append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", remote}, mirrorRefspecs...)
 		})
+		if err != nil && strings.Contains(err.Error(), "mismatched algorithms") {
+			// Removing the mirror serves the upstream's own history natively, whose commit ids may
+			// differ from those served so far
+			log.Printf("ERROR: upstream %s changed its object format; mirror %s cannot be updated, remove it to serve the upstream natively: %v", info.RemoteURL, info.MirrorPath, err)
+			return fmt.Errorf("%w: %s no longer has the object format of the converted copy; ask the Evergit administrator", ErrUpstreamObjectFormatChanged, info.RemoteURL)
+		}
 
 		// Archive overwritten/deleted refs even if the fetch failed midway, since it may already
 		// have pruned or updated some of them

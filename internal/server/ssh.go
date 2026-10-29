@@ -230,6 +230,9 @@ func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCm
 		if errors.Is(err, converter.ErrSubmoduleUnavailable) {
 			_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: error: a submodule could not be converted, please retry later\n")
 		}
+		if errors.Is(err, converter.ErrUpstreamObjectFormatChanged) {
+			_, _ = fmt.Fprintf(ch.Stderr(), "remote: Evergit: error: the upstream changed its object format (e.g. to SHA-256), ask the administrator\n")
+		}
 		writeError(ch, fmt.Errorf("gitconv failed: %w", err))
 		return err
 	}
