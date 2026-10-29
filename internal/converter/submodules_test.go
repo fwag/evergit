@@ -617,6 +617,33 @@ func TestPartialConversionExtendsWithoutChangingIDs(t *testing.T) {
 	}
 }
 
+func TestPinsLeftInMirrorAreNotConverted(t *testing.T) {
+	sub := newTestUpstream(t)
+	recorded := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	// A commit whose history records a submodule that cannot be converted
+	gitRaw(t, sub, nil, "checkout", "-q", "-b", "extra")
+	addGitlink(t, sub, "unusable", "https://unusable.invalid/test/other.git", strings.Repeat("cd", 20))
+	extra := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	gitRaw(t, sub, nil, "checkout", "-q", "main")
+	super := newTestUpstream(t)
+	addGitlink(t, super, "sub", urlOf(sub), recorded)
+
+	// The mirror keeps a pin of an earlier conversion whose serving repository was deleted
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	subInfo := repoInfo(t, m, sub)
+	if err := m.syncMirror(context.Background(), subInfo); err != nil {
+		t.Fatal(err)
+	}
+	gitRaw(t, subInfo.MirrorPath, nil, "update-ref", pinnedPrefix+extra, extra)
+
+	if err := m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LookupID(subInfo.ServingPath, "sha1", extra); err == nil {
+		t.Errorf("commit %s pinned by an earlier conversion, not required now, was converted", extra)
+	}
+}
+
 func TestSubmoduleConvertedOnlyAsFarAsRecordedCommits(t *testing.T) {
 	sub := newTestUpstream(t)
 	recorded := gitLine(t, sub, nil, "rev-parse", "HEAD")

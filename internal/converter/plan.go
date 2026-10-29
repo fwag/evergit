@@ -130,9 +130,9 @@ func (p *conversionPlan) item(info *resolver.RepositoryInfo) (*planItem, error) 
 	if previous, err := loadState(info.ServingPath); err == nil && !isIncrementalRewrite(info.ServingPath) {
 		if !previous.Partial {
 			r.rebuild, r.complete = true, true
-		} else if refs, err := listRefs(info.MirrorPath); err == nil {
+		} else {
 			// Rebuilt with all the commits superprojects required before
-			p.require(r, slices.Sorted(maps.Values(pinnedRefs(refs)))...)
+			p.require(r, slices.Sorted(maps.Values(pinnedRefs(previous.ConvertedRefs)))...)
 		}
 	}
 	return r, nil

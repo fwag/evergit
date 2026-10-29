@@ -737,10 +737,12 @@ func isIncrementalRewrite(servingPath string) bool {
 	return true
 }
 
-// conversionScope is what a conversion converts and serves: all refs, only the pinned refs
-// (partial), or only the history of some commits, serving nothing new (objects).
+// conversionScope is what a conversion converts and serves: all refs, pinned refs (partial: those
+// served before and those of pins), or only the history of some commits, serving nothing new
+// (objects).
 type conversionScope struct {
 	partial bool
+	pins    []string
 	objects []string
 }
 
@@ -791,6 +793,23 @@ func openTarget(ctx context.Context, info *resolver.RepositoryInfo, scope conver
 	return t, nil
 }
 
+// servedPins returns the pinned refs a partial conversion serves: those it served before and those
+// of the commits it adds. A pin left in the mirror by a serving repository since deleted stays
+// unconverted until a superproject requires its commit again.
+func servedPins(refs map[string]string, previous *repoState, commits []string) map[string]string {
+	served := make(map[string]string)
+	for name, id := range pinnedRefs(refs) {
+		before := false
+		if previous != nil {
+			_, before = previous.ConvertedRefs[name]
+		}
+		if before || slices.Contains(commits, id) {
+			served[name] = id
+		}
+	}
+	return served
+}
+
 // close releases the target, removing a new build if the conversion failed.
 func (t *conversionTarget) close(failed bool) {
 	_ = t.ids.known.Close()
@@ -826,7 +845,7 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	}
 	heads := scope.objects // nil: the history of all refs
 	if scope.partial {
-		refs = pinnedRefs(refs)
+		refs = servedPins(refs, t.previous, scope.pins)
 		heads = slices.Sorted(maps.Values(refs))
 	}
 	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, t.path, t.ids, gitlinks, heads, t.exclude, progress)

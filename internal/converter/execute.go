@@ -157,13 +157,16 @@ func (p *conversionPlan) step(r *planItem, heads []string, complete bool) error 
 	case complete:
 	case partialConversion(r.info.ServingPath):
 		if _, err := p.m.fetchCommits(p.ctx, r.info, heads, true); err != nil {
-			return err
+			return fmt.Errorf("%s: %w", r.id, err)
 		}
-		scope.partial = true
+		scope.partial, scope.pins = true, heads
 	default:
 		scope.objects = heads
 	}
-	return p.m.convertRepo(p.ctx, r.info, p.progressWriter, res, scope)
+	if err := p.m.convertRepo(p.ctx, r.info, p.progressWriter, res, scope); err != nil {
+		return fmt.Errorf("%s: %w", r.id, err)
+	}
+	return nil
 }
 
 // resolution decides an item's gitlinks: the decisions recorded before, and those of the plan whose
