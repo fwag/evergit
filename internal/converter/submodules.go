@@ -133,70 +133,10 @@ const progressCommitInterval = 1000
 // discoverGitlinks lists the submodule commits recorded by the commits reachable from heads (all of
 // the mirror's refs if nil) but not from exclude, by submodule.
 func discoverGitlinks(ctx context.Context, mirrorPath string, heads, exclude []string, progress func(n int)) (gitlinkTargets, error) {
-	// Merges are diffed against all parents (-c), so a gitlink a merge introduces is listed too
-	args, stdin := historyRevisions(heads, exclude)
-	cmd := exec.CommandContext(ctx, "git", append([]string{"log", "--root", "-c", "-r", "--raw", "--no-abbrev", "--no-renames", "--format=commit %H"}, args...)...)
-	cmd.Dir = mirrorPath
-	cmd.Stdin = stdin
-	cmd.Env = GitEnv()
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	stdout, err := cmd.StdoutPipe()
+	commits, recorded, err := scanGitlinks(ctx, mirrorPath, heads, exclude, progress)
 	if err != nil {
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	type gitlink struct{ path, target string }
-	recorded := make(map[string][]gitlink)
-	var commits []string
-	commit := ""
-	scanned := 0
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if c, ok := strings.CutPrefix(line, "commit "); ok {
-			commit = c
-			scanned++
-			if progress != nil && scanned%progressCommitInterval == 0 {
-				progress(scanned)
-			}
-			continue
-		}
-		meta, p, ok := strings.Cut(line, "\t")
-		if !ok || !strings.HasPrefix(meta, ":") {
-			continue
-		}
-		// ":<modes...> <ids...> <status>", one mode and id per parent plus the result
-		parents := len(meta) - len(strings.TrimLeft(meta, ":"))
-		fields := strings.Fields(meta[parents:])
-		if len(fields) != 2*(parents+1)+1 || fields[parents] != "160000" {
-			continue
-		}
-		if strings.HasPrefix(p, "\"") {
-			if unquoted, err := strconv.Unquote(p); err == nil {
-				p = unquoted
-			}
-		}
-		if _, seen := recorded[commit]; !seen {
-			commits = append(commits, commit)
-		}
-		recorded[commit] = append(recorded[commit], gitlink{path: p, target: fields[2*parents+1]})
-	}
-	if err := scanner.Err(); err != nil {
-		_ = cmd.Wait()
-		return nil, err
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("git log failed in %s: %w (stderr: %q)", mirrorPath, err, strings.TrimSpace(stderr.String()))
-	}
-	if progress != nil && scanned > 0 {
-		progress(scanned)
-	}
-
 	urls, err := gitmodulesURLs(ctx, mirrorPath, commits)
 	if err != nil {
 		return nil, err
@@ -215,6 +155,86 @@ func discoverGitlinks(ctx context.Context, mirrorPath string, heads, exclude []s
 		}
 	}
 	return targets, nil
+}
+
+// pathGitlink is a gitlink at a path of a commit's tree.
+type pathGitlink struct{ path, target string }
+
+// scanGitlinks lists the gitlinks the commits of a history add or change, by commit, and the commits
+// recording any, in the order of the history.
+func scanGitlinks(ctx context.Context, mirrorPath string, heads, exclude []string, progress func(n int)) ([]string, map[string][]pathGitlink, error) {
+	// Merges are diffed against all parents (-c), so a gitlink a merge introduces is listed too
+	args, stdin := historyRevisions(heads, exclude)
+	cmd := exec.CommandContext(ctx, "git", append([]string{"log", "--root", "-c", "-r", "--raw", "--no-abbrev", "--no-renames", "--format=commit %H"}, args...)...)
+	cmd.Dir = mirrorPath
+	cmd.Stdin = stdin
+	cmd.Env = GitEnv()
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, err
+	}
+
+	recorded := make(map[string][]pathGitlink)
+	var commits []string
+	commit := ""
+	scanned := 0
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if c, ok := strings.CutPrefix(line, "commit "); ok {
+			commit = c
+			scanned++
+			if progress != nil && scanned%progressCommitInterval == 0 {
+				progress(scanned)
+			}
+			continue
+		}
+		g, ok := parseRawGitlink(line)
+		if !ok {
+			continue
+		}
+		if _, seen := recorded[commit]; !seen {
+			commits = append(commits, commit)
+		}
+		recorded[commit] = append(recorded[commit], g)
+	}
+	if err := scanner.Err(); err != nil {
+		_ = cmd.Wait()
+		return nil, nil, err
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, nil, fmt.Errorf("git log failed in %s: %w (stderr: %q)", mirrorPath, err, strings.TrimSpace(stderr.String()))
+	}
+	if progress != nil && scanned > 0 {
+		progress(scanned)
+	}
+	return commits, recorded, nil
+}
+
+// parseRawGitlink parses a line of git log --raw, returning the gitlink it adds or changes, if any.
+func parseRawGitlink(line string) (pathGitlink, bool) {
+	meta, p, ok := strings.Cut(line, "\t")
+	if !ok || !strings.HasPrefix(meta, ":") {
+		return pathGitlink{}, false
+	}
+	// ":<modes...> <ids...> <status>", one mode and id per parent plus the result
+	parents := len(meta) - len(strings.TrimLeft(meta, ":"))
+	fields := strings.Fields(meta[parents:])
+	if len(fields) != 2*(parents+1)+1 || fields[parents] != "160000" {
+		return pathGitlink{}, false
+	}
+	if strings.HasPrefix(p, "\"") {
+		if unquoted, err := strconv.Unquote(p); err == nil {
+			p = unquoted
+		}
+	}
+	return pathGitlink{path: p, target: fields[2*parents+1]}, true
 }
 
 // gitmodulesURLs returns the submodule path -> URL mapping of each commit's .gitmodules, parsing
