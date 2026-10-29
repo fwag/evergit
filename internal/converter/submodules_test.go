@@ -1075,4 +1075,3 @@ func TestSubmoduleWithQuotedPath(t *testing.T) {
 		t.Errorf("gitlink at %q = %s, want real SHA-256 %s", tabPath, got, want)
 	}
 }
-
