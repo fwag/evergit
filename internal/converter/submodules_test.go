@@ -487,8 +487,12 @@ func TestSubmodulePointingIntoItsOwnRepositoryOnNoBranchIsFetched(t *testing.T) 
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)
 	}
-	// The gitlink records the commit as the repository converts it once a branch reaches it
+	// The commit is served, so that "git submodule update" over SSH (protocol v0) can check it out
 	gitlink := gitlinkOf(t, info.ServingPath, "main", "self")
+	if got := gitLine(t, info.ServingPath, nil, "--git-dir=.", "rev-parse", pinnedPrefix+commit); got != gitlink {
+		t.Errorf("pinned ref of the recorded commit = %s, want %s", got, gitlink)
+	}
+	// The gitlink records the commit as the repository converts it once a branch reaches it
 	gitRaw(t, super, nil, "branch", "pr", commit)
 	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
 		t.Fatal(err)

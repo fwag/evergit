@@ -152,12 +152,19 @@ func (p *conversionPlan) step(r *planItem, heads []string, complete bool) error 
 	if err != nil {
 		return err
 	}
-	var scope conversionScope
-	if !complete {
-		if _, err := p.m.fetchCommits(p.ctx, r.info, heads, true); err != nil {
+	// The commits a step converts for superprojects are pinned, so it serves them: "git submodule
+	// update" over SSH, with protocol v0, only fetches commits a ref reaches. A complete conversion
+	// serves every ref, including the pins of the commits required of it.
+	pins, scope := heads, conversionScope{}
+	if complete {
+		pins = r.required
+	} else {
+		scope = conversionScope{partial: partialConversion(r.info.ServingPath), pins: heads}
+	}
+	if len(pins) > 0 {
+		if _, err := p.m.fetchCommits(p.ctx, r.info, pins, true); err != nil {
 			return fmt.Errorf("%s: %w", r.id, err)
 		}
-		scope = conversionScope{partial: partialConversion(r.info.ServingPath), pins: heads}
 	}
 	if err := p.m.convertRepo(p.ctx, r.info, p.progressWriter, res, scope); err != nil {
 		return fmt.Errorf("%s: %w", r.id, err)
