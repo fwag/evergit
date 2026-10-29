@@ -931,6 +931,16 @@ func TestSubmoduleCycleOfForksDecidesSharedCommitsTheSame(t *testing.T) {
 		if got := gitlinkOf(t, repoInfo(t, m, repoA).ServingPath, ids[0], "crypto"); got != own+syntheticSHA256Padding {
 			t.Errorf("converting %s first: gitlink under the unusable URL = %s, want the synthetic SHA-256", filepath.Base(first), got)
 		}
+		// Each conversion step of the cycle keeps the decision, recorded once
+		for _, upstream := range []string{repoA, repoB} {
+			state, err := loadState(repoInfo(t, m, upstream).ServingPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decisions := state.Submodules["https://unusable.invalid/test/merged.git"].Synthetic; len(decisions) != 1 {
+				t.Errorf("converting %s first: %s records the synthetic decision %d times", filepath.Base(first), filepath.Base(upstream), len(decisions))
+			}
+		}
 		return ids
 	}
 	if fromA, fromB := converted(repoA), converted(repoB); fromA != fromB {
@@ -967,6 +977,31 @@ func TestSubmoduleCycleWithinRecordedHistoryConverts(t *testing.T) {
 	}
 	if fromA, fromB := converted(repoA), converted(repoB); !maps.Equal(fromA, fromB) {
 		t.Errorf("conversion depends on the repository converted first:\nfrom A: %v\nfrom B: %v", fromA, fromB)
+	}
+}
+
+func TestDecisionsRecordedOnceAcrossCycleSteps(t *testing.T) {
+	// A records an approved synthetic gitlink, B records that commit of A, and A records B: A is
+	// converted in two steps, partially for B, then completely
+	const unusable = "https://unusable.invalid/test/gone.git"
+	repoA := newTestUpstream(t)
+	repoB := newTestUpstream(t)
+	addGitlink(t, repoA, "gone", unusable, strings.Repeat("ab", 20))
+	addGitlink(t, repoB, "subA", urlOf(repoA), gitLine(t, repoA, nil, "rev-parse", "HEAD"))
+	addGitlink(t, repoA, "subB", urlOf(repoB), gitLine(t, repoB, nil, "rev-parse", "HEAD"))
+
+	m := newSubmoduleManager(t.TempDir(), 0, repoA, repoB)
+	approveSynthetic(t, m, "* "+unusable)
+	info := repoInfo(t, m, repoA)
+	if err := m.EnsureRepo(context.Background(), info, nil); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(info.ServingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decisions := state.Submodules[unusable].Synthetic; len(decisions) != 1 {
+		t.Errorf("synthetic decision recorded %d times: %+v", len(decisions), decisions)
 	}
 }
 

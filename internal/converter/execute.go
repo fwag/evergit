@@ -200,10 +200,14 @@ func (p *conversionPlan) resolution(r *planItem) (*gitlinkResolution, error) {
 	return res, nil
 }
 
-// add records the SHA-256 a planned gitlink gets.
+// add records the SHA-256 a planned gitlink gets, unless already decided, e.g. by an earlier step of
+// the same plan.
 func (g *gitlinkResolution) add(l plannedGitlink, newID sha256ID) error {
-	if previous, set := g.decided[l.id]; set && previous != newID {
-		return fmt.Errorf("submodule commit %s has conflicting SHA-256 translations %x and %x", l.commit, previous, newID)
+	if previous, set := g.decided[l.id]; set {
+		if previous != newID {
+			return fmt.Errorf("submodule commit %s has conflicting SHA-256 translations %x and %x", l.commit, previous, newID)
+		}
+		return nil
 	}
 	g.decided[l.id] = newID
 	g.recorded[l.submodule] = append(g.recorded[l.submodule], l.commit)
