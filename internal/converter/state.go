@@ -83,39 +83,49 @@ func (s *repoState) save(repoPath string) error {
 // rebuilt with them otherwise; synthetic ones do not depend on the rules.
 func (s *repoState) gitlinkDecisions() (map[sha1ID]sha256ID, error) {
 	decided := make(map[sha1ID]sha256ID)
-	add := func(oldHex, newHex string) error {
-		oldID, err := parseSHA1Hex(oldHex)
-		if err != nil {
-			return err
-		}
-		var newID sha256ID
-		if len(newHex) != 2*len(newID) {
-			return fmt.Errorf("invalid SHA-256 %q for submodule commit %s", newHex, oldHex)
-		}
-		if _, err := hex.Decode(newID[:], []byte(newHex)); err != nil {
-			return fmt.Errorf("invalid SHA-256 %q for submodule commit %s", newHex, oldHex)
-		}
-		decided[oldID] = newID
-		return nil
-	}
 	for _, sub := range s.Submodules {
-		for _, d := range sub.Synthetic {
-			for _, c := range d.Commits {
-				if err := add(c, c+syntheticSHA256Padding); err != nil {
-					return nil, err
-				}
-			}
-		}
-		if s.ConversionVersion != conversionVersion {
-			continue
-		}
-		for oldHex, newHex := range sub.Translated {
-			if err := add(oldHex, newHex); err != nil {
+		for _, d := range sub.decisions(s.ConversionVersion == conversionVersion) {
+			oldID, newID, err := parseDecision(d[0], d[1])
+			if err != nil {
 				return nil, err
 			}
+			decided[oldID] = newID
 		}
 	}
 	return decided, nil
+}
+
+// decisions lists a submodule's decisions as SHA-1 and SHA-256 pairs: the synthetic ones, and with
+// current, the real translations.
+func (sub *submoduleState) decisions(current bool) [][2]string {
+	var pairs [][2]string
+	for _, d := range sub.Synthetic {
+		for _, c := range d.Commits {
+			pairs = append(pairs, [2]string{c, c + syntheticSHA256Padding})
+		}
+	}
+	if current {
+		for oldHex, newHex := range sub.Translated {
+			pairs = append(pairs, [2]string{oldHex, newHex})
+		}
+	}
+	return pairs
+}
+
+// parseDecision parses a recorded decision.
+func parseDecision(oldHex, newHex string) (sha1ID, sha256ID, error) {
+	var newID sha256ID
+	oldID, err := parseSHA1Hex(oldHex)
+	if err != nil {
+		return oldID, newID, err
+	}
+	if len(newHex) != 2*len(newID) {
+		return oldID, newID, fmt.Errorf("invalid SHA-256 %q for submodule commit %s", newHex, oldHex)
+	}
+	if _, err := hex.Decode(newID[:], []byte(newHex)); err != nil {
+		return oldID, newID, fmt.Errorf("invalid SHA-256 %q for submodule commit %s", newHex, oldHex)
+	}
+	return oldID, newID, nil
 }
 
 // recordGitlinks adds the decisions of a conversion, under the submodules that recorded them.
@@ -123,41 +133,41 @@ func (s *repoState) recordGitlinks(g *gitlinkResolution) {
 	if s.Submodules == nil {
 		s.Submodules = make(map[string]*submoduleState)
 	}
-	submodules := make([]string, 0, len(g.recorded))
-	for submodule := range g.recorded {
-		submodules = append(submodules, submodule)
-	}
-	slices.Sort(submodules)
-	for _, submodule := range submodules {
+	for _, submodule := range sortedKeys(g.recorded) {
 		sub := s.Submodules[submodule]
 		if sub == nil {
 			sub = &submoduleState{}
 			s.Submodules[submodule] = sub
 		}
-		var synthetic []string
-		for _, c := range g.recorded[submodule] {
-			id, err := parseSHA1Hex(c)
-			if err != nil {
-				continue
-			}
-			newID, ok := g.decided[id]
-			if !ok {
-				continue // not reached by the conversion
-			}
-			if newHex := hex.EncodeToString(newID[:]); newHex == c+syntheticSHA256Padding {
-				synthetic = append(synthetic, c)
-			} else {
-				if sub.Translated == nil {
-					sub.Translated = make(map[string]string)
-				}
-				sub.Translated[c] = newHex
-			}
+		sub.record(g.recorded[submodule], g.decided, g.synthetic[submodule])
+	}
+}
+
+// record adds the decisions for commits a submodule records: real translations, and the synthetic
+// ones approved as why. Commits the conversion did not reach are not recorded.
+func (sub *submoduleState) record(commits []string, decided map[sha1ID]sha256ID, why syntheticDecision) {
+	var synthetic []string
+	for _, c := range commits {
+		id, err := parseSHA1Hex(c)
+		if err != nil {
+			continue
 		}
-		if len(synthetic) > 0 {
-			slices.Sort(synthetic)
-			why := g.synthetic[submodule]
-			sub.Synthetic = append(sub.Synthetic, syntheticDecision{Reason: why.Reason, ApprovedBy: why.ApprovedBy, Commits: synthetic})
+		newID, ok := decided[id]
+		if !ok {
+			continue
 		}
+		if newHex := hex.EncodeToString(newID[:]); newHex == c+syntheticSHA256Padding {
+			synthetic = append(synthetic, c)
+		} else {
+			if sub.Translated == nil {
+				sub.Translated = make(map[string]string)
+			}
+			sub.Translated[c] = newHex
+		}
+	}
+	if len(synthetic) > 0 {
+		slices.Sort(synthetic)
+		sub.Synthetic = append(sub.Synthetic, syntheticDecision{Reason: why.Reason, ApprovedBy: why.ApprovedBy, Commits: synthetic})
 	}
 }
 
