@@ -540,7 +540,7 @@ func (r *objectRewriter) flushChunk() error {
 	installed := &packWriter{base: filepath.Join(r.packDir, "pack-"+sum)}
 	// The .idx makes the pack visible, so it is installed last
 	for _, ext := range []string{".pack", ".rev", ".idx"} {
-		if err := os.Rename(r.pack.base+ext, installed.base+ext); err != nil && !(ext == ".rev" && errors.Is(err, os.ErrNotExist)) {
+		if err := os.Rename(r.pack.base+ext, installed.base+ext); err != nil && (ext != ".rev" || !errors.Is(err, os.ErrNotExist)) {
 			return fmt.Errorf("failed to install pack: %w", err)
 		}
 	}
