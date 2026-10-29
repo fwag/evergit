@@ -512,7 +512,7 @@ func convertCommits(ctx context.Context, m *Manager, info *resolver.RepositoryIn
 	if err := m.syncMirror(ctx, info); err != nil {
 		return err
 	}
-	p, err := m.planConversion(ctx, info, commits, nil, DefaultMaxSubmoduleDepth)
+	p, err := m.planConversion(ctx, info, commits, nil, DefaultMaxSubmoduleRepos)
 	if err != nil {
 		return err
 	}

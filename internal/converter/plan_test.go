@@ -14,7 +14,7 @@ func planFor(t *testing.T, m *Manager, upstream string) (*conversionPlan, error)
 	if err := m.syncMirror(context.Background(), info); err != nil {
 		t.Fatal(err)
 	}
-	return m.planConversion(context.Background(), info, nil, nil, DefaultMaxSubmoduleDepth)
+	return m.planConversion(context.Background(), info, nil, nil, DefaultMaxSubmoduleRepos)
 }
 
 // sourceIn returns the source the plan decided for a gitlink of a repository.
@@ -143,7 +143,7 @@ func TestPlanOwnCommitOnNoBranchIsFetched(t *testing.T) {
 	}
 }
 
-func TestPlanDepthLimit(t *testing.T) {
+func TestPlanRepositoryLimit(t *testing.T) {
 	sub := newTestUpstream(t)
 	super := newTestUpstream(t)
 	addGitlink(t, super, "sub", urlOf(sub), gitLine(t, sub, nil, "rev-parse", "HEAD"))
@@ -153,7 +153,11 @@ func TestPlanDepthLimit(t *testing.T) {
 	if err := m.syncMirror(context.Background(), info); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.planConversion(context.Background(), info, nil, nil, 0); !errors.Is(err, ErrSubmoduleDepth) {
-		t.Fatalf("plan with depth 0 = %v, want ErrSubmoduleDepth", err)
+	if _, err := m.planConversion(context.Background(), info, nil, nil, 0); !errors.Is(err, ErrTooManySubmodules) {
+		t.Fatalf("plan allowing no submodule repository = %v, want ErrTooManySubmodules", err)
+	}
+	// The requested repository does not count
+	if _, err := m.planConversion(context.Background(), info, nil, nil, 1); err != nil {
+		t.Fatalf("plan allowing the one submodule repository: %v", err)
 	}
 }

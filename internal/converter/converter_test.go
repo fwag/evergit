@@ -827,19 +827,19 @@ func TestSubmodulePathMovedInHistoryWithRealSHA256(t *testing.T) {
 	}
 }
 
-func TestSubmoduleRecursionDepthLimit(t *testing.T) {
+func TestSubmoduleRepositoryLimit(t *testing.T) {
 	sub := newTestUpstream(t)
 	super := newTestUpstream(t)
 	addGitlink(t, super, "libs/sub", urlOf(sub), gitLine(t, sub, nil, "rev-parse", "HEAD"))
 
 	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
-	m.SetMaxSubmoduleDepth(0)
+	m.SetMaxSubmoduleRepos(0)
 
-	// Exceeding the depth fails rather than recording the gitlink with the synthetic SHA-256, which
-	// would depend on how the repository was reached
+	// Exceeding the limit fails rather than recording the gitlink with the synthetic SHA-256, which
+	// would depend on the configuration
 	err := m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil)
-	if !errors.Is(err, ErrSubmoduleDepth) {
-		t.Fatalf("EnsureRepo with depth 0 = %v, want ErrSubmoduleDepth", err)
+	if !errors.Is(err, ErrTooManySubmodules) {
+		t.Fatalf("EnsureRepo allowing no submodule repository = %v, want ErrTooManySubmodules", err)
 	}
 }
 

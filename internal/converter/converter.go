@@ -46,9 +46,9 @@ const DefaultExecTimeout = 12 * time.Hour
 // copy is still being converted; the conversion continues and a later request may succeed.
 var ErrConversionInProgress = errors.New("repository is being converted")
 
-// DefaultMaxSubmoduleDepth is the maximum nesting of submodules converted for a repository (see
-// config.DefaultMaxSubmoduleDepth).
-const DefaultMaxSubmoduleDepth = config.DefaultMaxSubmoduleDepth
+// DefaultMaxSubmoduleRepos is the maximum number of submodule repositories a conversion may need (see
+// config.DefaultMaxSubmoduleRepos).
+const DefaultMaxSubmoduleRepos = config.DefaultMaxSubmoduleRepos
 
 type Manager struct {
 	cacheTTL          time.Duration
@@ -57,7 +57,7 @@ type Manager struct {
 	conversionSem     chan struct{}
 	conversionWait    time.Duration
 	execTimeout       time.Duration
-	maxSubmoduleDepth int
+	maxSubmoduleRepos int
 	cfg               *config.Config
 	locksMu           sync.Mutex
 	repoLocks         map[string]*repoLock
@@ -92,14 +92,14 @@ func NewManager(cacheTTL time.Duration, maxConversions ...int) *Manager {
 		cacheTTL:          cacheTTL,
 		conversionSem:     make(chan struct{}, limit),
 		conversionWait:    DefaultConversionTimeout,
-		maxSubmoduleDepth: DefaultMaxSubmoduleDepth,
+		maxSubmoduleRepos: DefaultMaxSubmoduleRepos,
 		repoLocks:         make(map[string]*repoLock),
 	}
 }
 
-// SetMaxSubmoduleDepth sets the maximum recursion depth for active submodule conversions.
-func (m *Manager) SetMaxSubmoduleDepth(depth int) {
-	m.maxSubmoduleDepth = depth
+// SetMaxSubmoduleRepos sets the maximum number of submodule repositories a conversion may need.
+func (m *Manager) SetMaxSubmoduleRepos(n int) {
+	m.maxSubmoduleRepos = n
 }
 
 // SetConfig sets the configuration used for resolving submodule paths and allowed hosts.
@@ -198,11 +198,11 @@ func (m *Manager) WaitIdle() {
 // If not, it clones/fetches, converts it, and optionally streams progress.
 // It accepts a context for cancellation (e.g. when all waiting clients disconnect).
 func (m *Manager) EnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
-	depth := m.maxSubmoduleDepth
-	if depth < 0 {
-		depth = DefaultMaxSubmoduleDepth
+	limit := m.maxSubmoduleRepos
+	if limit < 0 {
+		limit = DefaultMaxSubmoduleRepos
 	}
-	return m.EnsureRepoWithDepth(ctx, info, progressWriter, depth)
+	return m.ensureRepo(ctx, info, progressWriter, limit)
 }
 
 // EnsureRepoWithin is EnsureRepo for clients behind proxies with short timeouts. It waits at most
@@ -227,18 +227,13 @@ func (m *Manager) EnsureRepoWithin(ctx context.Context, info *resolver.Repositor
 	return fmt.Errorf("%w: %s", ErrConversionInProgress, info.RepoName)
 }
 
-// EnsureRepoWithDepth checks or converts a repository, converting submodules nested at most depth levels.
-func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
-	return m.ensureRepo(ctx, info, progressWriter, depth)
-}
-
 func canonicalRepoID(info *resolver.RepositoryInfo) string {
 	return info.Domain + "/" + info.Path()
 }
 
 // ensureRepo checks or converts a requested repository, in a job shared by the requests waiting for
 // it.
-func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
+func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, maxRepos int) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -291,7 +286,7 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 
 	go func() {
 		defer cancel()
-		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth)
+		err := m.doEnsureRepo(jobCtx, info, progressWriter, maxRepos)
 		job.mu.Lock()
 		job.err = err
 		close(job.done)
@@ -325,7 +320,7 @@ func (m *Manager) waitJob(ctx context.Context, job *repoJob) error {
 	}
 }
 
-func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
+func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, maxRepos int) error {
 	// 1. Check if the repository already exists and is within its TTL
 	if !m.needsSync(info) {
 		return nil
@@ -362,7 +357,7 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 
 	// 3. Plan the conversion of the repository and the submodules it needs: every missing approval
 	// is reported before converting anything
-	plan, err := m.planConversion(ctx, info, nil, progressWriter, depth)
+	plan, err := m.planConversion(ctx, info, nil, progressWriter, maxRepos)
 	if err != nil {
 		return err
 	}

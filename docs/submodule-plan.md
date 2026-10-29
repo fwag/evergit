@@ -1,6 +1,7 @@
 # Converting submodules: plan, then execute
 
-Status: proposal, for review before implementation.
+Status: implemented (`plan.go`, `execute.go`). The section *As implemented* lists where the
+implementation differs from the proposal.
 
 ## Problem
 
@@ -127,3 +128,23 @@ converted commits as `submodule-cycles` (same decisions), and fewer runs to coll
 - **Partial items for the requested repository:** a superproject requested itself is converted
   completely; a plan started for a submodule (e.g. from `git submodule update`) completes that
   repository too (A.a). No change intended.
+
+## As implemented
+
+- **Execution follows the gitlinks, not a precomputed order.** Converting `(repository, commits)`
+  first converts, in the repositories the plan decided, the commits recorded in their history, then
+  the repository: one small recursive function over the plan (`conversionPlan.convert`), guarded
+  against re-entering the same step. A cycle thus advances commit by commit without computing
+  strongly connected components.
+- **Three kinds of steps:** a complete conversion (the requested repository, or a repository
+  converted completely with other rules, rebuilt), a partial conversion pinning the step's commits,
+  and for a repository converted completely an *objects-only* conversion, which adds the commits'
+  objects and translations without changing its refs. The plan fetches commits without pinning them;
+  a step pins the commits it converts.
+- **Sources instead of tables.** A conversion no longer searches every submodule's translation table:
+  each gitlink's SHA-256 comes from the source the plan decided, so `gitlinkResolution` only holds
+  decisions.
+- **Limit:** `-max-submodule-repos` (default 500) counts the submodule repositories of a plan,
+  replacing `-max-submodule-depth`; 0 allows none, as depth 0 did.
+- **Progress:** clients see the scans, `Resolving N submodule(s)...`, and `Plan: N repositories, M to
+  convert` before the conversions.

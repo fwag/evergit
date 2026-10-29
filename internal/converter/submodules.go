@@ -29,8 +29,9 @@ import (
 // are recorded so later conversions of the same repository never translate a submodule commit
 // differently.
 
-// ErrSubmoduleDepth is returned when submodules are nested deeper than the configured limit.
-var ErrSubmoduleDepth = errors.New("submodules nested too deeply")
+// ErrTooManySubmodules is returned when a conversion needs more submodule repositories than the
+// configured limit.
+var ErrTooManySubmodules = errors.New("too many submodule repositories")
 
 // ErrSubmoduleNotApproved is returned when submodule commits cannot be converted for good and the
 // administrator has not approved recording them with the synthetic SHA-256.

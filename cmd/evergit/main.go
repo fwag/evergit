@@ -28,7 +28,7 @@ func main() {
 	minFreeDiskFlag := flag.Int("min-free-disk", -1, "Minimum free disk space in GB required before cloning new mirrors (default: 1)")
 	requestWaitStr := flag.String("request-wait", "", "How long a request waits for a running conversion before serving the current copy or answering 503; keep below the proxy timeout (default: 20s, 0 to wait for the end)")
 	maxConversionTimeStr := flag.String("max-conversion-time", "", "Maximum duration of a single sync or conversion (default: 12h)")
-	maxSubmoduleDepthFlag := flag.Int("max-submodule-depth", -1, fmt.Sprintf("Maximum nesting of submodules converted for a repository (default: %d)", config.DefaultMaxSubmoduleDepth))
+	maxSubmoduleReposFlag := flag.Int("max-submodule-repos", -1, fmt.Sprintf("Maximum number of submodule repositories a conversion may need (default: %d)", config.DefaultMaxSubmoduleRepos))
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
 	allowedHosts := flag.String("allowed-hosts", "", "Comma-separated upstream hosts clients may request (default: github.com,gitlab.com,bitbucket.org)")
 	syntheticGitlinks := flag.String("synthetic-gitlinks", "", "File of \"<superproject> <submodule>\" lines approving synthetic SHA-256s for submodules that cannot be converted")
@@ -88,8 +88,8 @@ func main() {
 		}
 		cfg.MaxConversionTime = limit
 	}
-	if *maxSubmoduleDepthFlag >= 0 {
-		cfg.MaxSubmoduleDepth = *maxSubmoduleDepthFlag
+	if *maxSubmoduleReposFlag >= 0 {
+		cfg.MaxSubmoduleRepos = *maxSubmoduleReposFlag
 	}
 	if *debugFlag {
 		cfg.Debug = true
@@ -112,7 +112,7 @@ func main() {
 	log.Printf("Min free disk:   %d GB", cfg.MinFreeDiskGB)
 	log.Printf("Request wait:    %v", cfg.RequestWait)
 	log.Printf("Max conversion:  %v", cfg.MaxConversionTime)
-	log.Printf("Submodule depth: %d", cfg.MaxSubmoduleDepth)
+	log.Printf("Submodule repos: %d", cfg.MaxSubmoduleRepos)
 	log.Printf("Debug:           %v", cfg.Debug)
 	if cfg.PublicURL != "" {
 		log.Printf("Public URL:      %s", cfg.PublicURL)
@@ -151,7 +151,7 @@ func main() {
 	convManager.SetConfig(cfg)
 	convManager.SetMinFreeDisk(uint64(cfg.MinFreeDiskGB) * 1024 * 1024 * 1024)
 	convManager.SetExecTimeout(cfg.MaxConversionTime)
-	convManager.SetMaxSubmoduleDepth(cfg.MaxSubmoduleDepth)
+	convManager.SetMaxSubmoduleRepos(cfg.MaxSubmoduleRepos)
 	convManager.SetDebug(cfg.Debug)
 
 	// Start SSH Server

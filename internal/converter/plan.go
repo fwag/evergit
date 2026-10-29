@@ -32,9 +32,8 @@ type gitlinkSource struct {
 
 // planItem is a repository of a plan, and the commits it must translate.
 type planItem struct {
-	info  *resolver.RepositoryInfo
-	id    string
-	level int // submodule nesting from the requested repository
+	info *resolver.RepositoryInfo
+	id   string
 	// complete: all refs are converted (the requested repository, or one rebuilt), otherwise the
 	// required commits
 	complete bool
@@ -65,7 +64,7 @@ type conversionPlan struct {
 	m              *Manager
 	ctx            context.Context
 	progressWriter io.Writer
-	maxLevel       int
+	maxRepos       int // submodule repositories
 	approvals      []config.SyntheticGitlink
 
 	top   *planItem
@@ -85,17 +84,17 @@ type unapprovedGitlinks struct {
 
 // planConversion plans the conversion of info: of all its refs, or with commits, only of their
 // history (as for a submodule). The repository's mirror must be synced.
-func (m *Manager) planConversion(ctx context.Context, info *resolver.RepositoryInfo, commits []string, progressWriter io.Writer, maxLevel int) (*conversionPlan, error) {
+func (m *Manager) planConversion(ctx context.Context, info *resolver.RepositoryInfo, commits []string, progressWriter io.Writer, maxRepos int) (*conversionPlan, error) {
 	approvals, err := config.LoadSyntheticGitlinks(m.syntheticGitlinksFile())
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	p := &conversionPlan{
-		m: m, ctx: ctx, progressWriter: progressWriter, maxLevel: maxLevel, approvals: approvals,
+		m: m, ctx: ctx, progressWriter: progressWriter, maxRepos: maxRepos, approvals: approvals,
 		items: make(map[string]*planItem), unapproved: make(map[string][]unapprovedGitlinks),
 		completed: make(map[*planItem]bool), converting: make(map[string]bool),
 	}
-	p.top, err = p.item(info, 0)
+	p.top, err = p.item(info)
 	if err != nil {
 		return nil, err
 	}
@@ -108,16 +107,16 @@ func (m *Manager) planConversion(ctx context.Context, info *resolver.RepositoryI
 	return p, p.approvalError()
 }
 
-// item returns the plan's item for a repository, adding it at a nesting level.
-func (p *conversionPlan) item(info *resolver.RepositoryInfo, level int) (*planItem, error) {
+// item returns the plan's item for a repository, adding it.
+func (p *conversionPlan) item(info *resolver.RepositoryInfo) (*planItem, error) {
 	id := canonicalRepoID(info)
 	if r, ok := p.items[id]; ok {
 		return r, nil
 	}
-	if level > p.maxLevel {
-		return nil, fmt.Errorf("%w: %s is nested %d levels deep", ErrSubmoduleDepth, id, level)
+	if p.top != nil && len(p.items)-1 >= p.maxRepos {
+		return nil, fmt.Errorf("%w: %s needs more than %d (-max-submodule-repos), the next being %s", ErrTooManySubmodules, p.top.id, p.maxRepos, id)
 	}
-	r := &planItem{info: info, id: id, level: level, gone: make(map[string]bool), present: make(map[string]bool),
+	r := &planItem{info: info, id: id, gone: make(map[string]bool), present: make(map[string]bool),
 		gitlinks: make(gitlinkTargets), sources: make(map[string]map[string]gitlinkSource)}
 	if previous, err := loadState(info.ServingPath); err == nil {
 		if r.decided, err = previous.gitlinkDecisions(); err != nil {
@@ -431,7 +430,7 @@ func (p *conversionPlan) sourceOf(r *planItem, submodule, commit string) (*gitli
 	if canonicalRepoID(subInfo) == r.id {
 		return p.ownSource(r, commit)
 	}
-	sub, err := p.item(subInfo, r.level+1)
+	sub, err := p.item(subInfo)
 	if err != nil {
 		return nil, "", err
 	}

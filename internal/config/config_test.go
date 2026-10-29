@@ -60,12 +60,12 @@ func TestLoadShorthandsFromEnv(t *testing.T) {
 	}
 }
 
-func TestLoadMaxSubmoduleDepth(t *testing.T) {
-	cases := map[string]int{"": DefaultMaxSubmoduleDepth, "0": 0, "7": 7, "-1": DefaultMaxSubmoduleDepth, "x": DefaultMaxSubmoduleDepth}
+func TestLoadMaxSubmoduleRepos(t *testing.T) {
+	cases := map[string]int{"": DefaultMaxSubmoduleRepos, "0": 0, "7": 7, "-1": DefaultMaxSubmoduleRepos, "x": DefaultMaxSubmoduleRepos}
 	for env, want := range cases {
-		t.Setenv("EVERGIT_MAX_SUBMODULE_DEPTH", env)
-		if got := Load().MaxSubmoduleDepth; got != want {
-			t.Errorf("EVERGIT_MAX_SUBMODULE_DEPTH=%q: MaxSubmoduleDepth = %d, want %d", env, got, want)
+		t.Setenv("EVERGIT_MAX_SUBMODULE_REPOS", env)
+		if got := Load().MaxSubmoduleRepos; got != want {
+			t.Errorf("EVERGIT_MAX_SUBMODULE_REPOS=%q: MaxSubmoduleRepos = %d, want %d", env, got, want)
 		}
 	}
 }
