@@ -110,7 +110,7 @@ func (s *SSHServer) handleConn(nConn net.Conn) {
 	for newChan := range chans {
 		// session: Used for interactive shells, executing single commands, SCP, and SFTP
 		if newChan.ChannelType() != "session" {
-			newChan.Reject(ssh.UnknownChannelType, "unsupported channel type")
+			_ = newChan.Reject(ssh.UnknownChannelType, "unsupported channel type")
 			continue
 		}
 
@@ -148,43 +148,50 @@ func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 				}
 			}
 			timer.Reset(sshRequestTimeout)
-
-			switch req.Type {
-			case "exec":
-				var payload struct {
-					Value string
-				}
-				if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
-					log.Printf("[SSH] Failed to unmarshal exec payload: %v", err)
-					req.Reply(false, nil)
-					return
-				}
-
-				req.Reply(true, nil)
-
-				// When the client disconnects or closes the session, the reqs channel is closed by ssh.
-				go func() {
-					for range reqs {
-					}
-					cancel()
-				}()
-
-				err := s.executeGitCommand(ctx, ch, payload.Value)
-				sendExitStatus(ch, err)
+			if s.handleRequest(ctx, cancel, ch, reqs, req) {
 				return
-
-			case "env":
-				// Environment variables are not applied, so do not claim otherwise
-				req.Reply(false, nil)
-
-			default:
-				req.Reply(false, nil)
 			}
 		case <-timer.C:
 			log.Printf("[SSH] Session timed out waiting for request")
 			return
 		}
 	}
+}
+
+// handleRequest handles a request of a session, and reports whether the session is over: after the
+// command it runs, or a malformed one. Replies only fail once the client is gone.
+func (s *SSHServer) handleRequest(ctx context.Context, cancel context.CancelFunc, ch ssh.Channel, reqs <-chan *ssh.Request, req *ssh.Request) bool {
+	switch req.Type {
+	case "exec":
+		var payload struct {
+			Value string
+		}
+		if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+			log.Printf("[SSH] Failed to unmarshal exec payload: %v", err)
+			_ = req.Reply(false, nil)
+			return true
+		}
+		_ = req.Reply(true, nil)
+
+		// When the client disconnects or closes the session, the reqs channel is closed by ssh.
+		go func() {
+			for range reqs {
+			}
+			cancel()
+		}()
+
+		err := s.executeGitCommand(ctx, ch, payload.Value)
+		sendExitStatus(ch, err)
+		return true
+
+	case "env":
+		// Environment variables are not applied, so do not claim otherwise
+		_ = req.Reply(false, nil)
+
+	default:
+		_ = req.Reply(false, nil)
+	}
+	return false
 }
 
 func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCmd string) error {
@@ -263,22 +270,23 @@ func parseGitCommand(cmdStr string) (verb, repoPath string, err error) {
 }
 
 func sendExitStatus(ch ssh.Channel, err error) {
-	status := uint32(0)
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if waitStatus, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				status = uint32(waitStatus.ExitStatus())
-			} else {
-				status = 1
-			}
-		} else {
-			status = 1
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, exitStatus(err))
+	_, _ = ch.SendRequest("exit-status", false, payload)
+}
+
+// exitStatus returns the exit status of a command: its own, or 1 if it failed without one.
+func exitStatus(err error) uint32 {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if waitStatus, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			return uint32(waitStatus.ExitStatus())
 		}
 	}
-
-	payload := make([]byte, 4)
-	binary.BigEndian.PutUint32(payload, status)
-	_, _ = ch.SendRequest("exit-status", false, payload)
+	return 1
 }
 
 func writeError(ch ssh.Channel, err error) {
