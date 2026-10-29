@@ -52,56 +52,13 @@ type Config struct {
 const DefaultMaxSubmoduleRepos = 500
 
 func Load() *Config {
-	storageRoot := os.Getenv("EVERGIT_STORAGE_ROOT")
-	if storageRoot == "" {
-		if stateDir := os.Getenv("STATE_DIRECTORY"); stateDir != "" {
-			storageRoot = stateDir
-		} else {
-			storageRoot = "./storage"
-		}
-	}
-	storageRoot, _ = filepath.Abs(storageRoot)
-
-	maxConversions := runtime.NumCPU()
-	if envMax := os.Getenv("EVERGIT_MAX_CONVERSIONS"); envMax != "" {
-		if val, err := strconv.Atoi(envMax); err == nil && val > 0 {
-			maxConversions = val
-		}
-	}
-
-	minFreeDiskGB := 1
-	if envDisk := os.Getenv("EVERGIT_MIN_FREE_DISK_GB"); envDisk != "" {
-		if val, err := strconv.Atoi(envDisk); err == nil && val >= 0 {
-			minFreeDiskGB = val
-		}
-	}
-
-	cacheTTL := 30 * time.Second
-	if envTTL := os.Getenv("EVERGIT_CACHE_TTL"); envTTL != "" {
-		if val, err := time.ParseDuration(envTTL); err == nil && val >= 0 {
-			cacheTTL = val
-		}
-	}
-
-	requestWait := 20 * time.Second
-	if env := os.Getenv("EVERGIT_REQUEST_WAIT"); env != "" {
-		if val, err := time.ParseDuration(env); err == nil && val >= 0 {
-			requestWait = val
-		}
-	}
-	maxConversionTime := 12 * time.Hour
-	if env := os.Getenv("EVERGIT_MAX_CONVERSION_TIME"); env != "" {
-		if val, err := time.ParseDuration(env); err == nil && val > 0 {
-			maxConversionTime = val
-		}
-	}
-
-	maxSubmoduleRepos := DefaultMaxSubmoduleRepos
-	if env := os.Getenv("EVERGIT_MAX_SUBMODULE_REPOS"); env != "" {
-		if val, err := strconv.Atoi(env); err == nil && val >= 0 {
-			maxSubmoduleRepos = val
-		}
-	}
+	storageRoot := storageRootFromEnv()
+	maxConversions := envInt("EVERGIT_MAX_CONVERSIONS", runtime.NumCPU(), 1)
+	minFreeDiskGB := envInt("EVERGIT_MIN_FREE_DISK_GB", 1, 0)
+	cacheTTL := envDuration("EVERGIT_CACHE_TTL", 30*time.Second, 0)
+	requestWait := envDuration("EVERGIT_REQUEST_WAIT", 20*time.Second, 0)
+	maxConversionTime := envDuration("EVERGIT_MAX_CONVERSION_TIME", 12*time.Hour, time.Nanosecond)
+	maxSubmoduleRepos := envInt("EVERGIT_MAX_SUBMODULE_REPOS", DefaultMaxSubmoduleRepos, 0)
 
 	debug := os.Getenv("EVERGIT_DEBUG") == "1" || strings.EqualFold(os.Getenv("EVERGIT_DEBUG"), "true")
 
@@ -124,6 +81,34 @@ func Load() *Config {
 
 		SyntheticGitlinksFile: os.Getenv("EVERGIT_SYNTHETIC_GITLINKS"),
 	}
+}
+
+// storageRootFromEnv returns the absolute storage root: EVERGIT_STORAGE_ROOT, systemd's
+// STATE_DIRECTORY, or ./storage.
+func storageRootFromEnv() string {
+	storageRoot := os.Getenv("EVERGIT_STORAGE_ROOT")
+	if storageRoot == "" {
+		storageRoot = getEnv("STATE_DIRECTORY", "./storage")
+	}
+	storageRoot, _ = filepath.Abs(storageRoot)
+	return storageRoot
+}
+
+// envInt returns an integer environment variable, or def if it is unset, invalid or below minimum.
+func envInt(key string, def, minimum int) int {
+	if val, err := strconv.Atoi(os.Getenv(key)); err == nil && val >= minimum {
+		return val
+	}
+	return def
+}
+
+// envDuration returns a duration environment variable, or def if it is unset, invalid or below
+// minimum.
+func envDuration(key string, def, minimum time.Duration) time.Duration {
+	if val, err := time.ParseDuration(os.Getenv(key)); err == nil && val >= minimum {
+		return val
+	}
+	return def
 }
 
 func getEnv(key, defaultValue string) string {
