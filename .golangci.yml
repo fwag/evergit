@@ -1,0 +1,36 @@
+version: "2"
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - gocognit # readability: penalises nesting, unlike gocyclo
+    - funlen
+    - nestif
+    - dupl
+  settings:
+    gocognit:
+      min-complexity: 20
+    funlen:
+      lines: 80
+      statements: 50
+    nestif:
+      min-complexity: 5
+    dupl:
+      threshold: 100
+  exclusions:
+    # Unchecked Close, Remove, ... in cleanup paths, as is common in Go
+    presets: [std-error-handling]
+    rules:
+      # Tests are long and repetitive by nature: setup, act, assert
+      - path: _test\.go
+        linters: [funlen, gocognit, nestif, dupl]
+
+issues:
+  # Only code changed since this commit is checked; the findings in older code are known debt,
+  # listed with: golangci-lint run --new-from-rev=
+  new-from-rev: c0ed207
+  # funlen and gocognit both report on the func line
+  uniq-by-line: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
