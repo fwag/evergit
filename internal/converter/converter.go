@@ -397,7 +397,7 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 	}
 
 	if len(requiredCommits) > 0 {
-		if err := m.pinCommits(ctx, info, requiredCommits); err != nil {
+		if _, err := m.fetchCommits(ctx, info, requiredCommits, true); err != nil {
 			return err
 		}
 	}
@@ -443,7 +443,7 @@ func partialConversion(servingPath string) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-// pinnedPrefix holds the submodule commits that superprojects record (see pinCommits).
+// pinnedPrefix holds the submodule commits that superprojects record (see fetchCommits).
 const pinnedPrefix = "refs/evergit-pinned/"
 
 // pinnedRefs returns the refs under pinnedPrefix.

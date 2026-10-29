@@ -695,21 +695,10 @@ func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.
 // commits that do not exist upstream.
 func (m *Manager) translateCommits(ctx context.Context, subInfo *resolver.RepositoryInfo, commits []string, progressWriter io.Writer, depth int) (map[sha1ID]sha256ID, []string, error) {
 	log.Printf("[%s] Translating %d submodule commit(s) of a repository being converted", subInfo.RepoName, len(commits))
-	// The conversion synced the mirror; missing commits are fetched without changing its refs
-	missing, err := missingCommits(ctx, subInfo.MirrorPath, commits)
+	// The conversion synced the mirror; commits it lacks are fetched without changing its refs
+	gone, err := m.fetchCommits(ctx, subInfo, commits, false)
 	if err != nil {
 		return nil, nil, err
-	}
-	var gone []string
-	for _, c := range missing {
-		err := m.gitUpstream(ctx, subInfo, subInfo.MirrorPath, func(remote string) []string {
-			return []string{"-c", "http.followRedirects=false", "fetch", "--no-tags", "--no-write-fetch-head", remote, c}
-		})
-		if err := markGone(err); errors.Is(err, errUpstreamGone) {
-			gone = append(gone, c)
-		} else if err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch submodule commit %s: %w", c, err)
-		}
 	}
 	heads := slices.DeleteFunc(slices.Clone(commits), func(c string) bool { return slices.Contains(gone, c) })
 	if len(heads) == 0 {
@@ -755,30 +744,46 @@ func (m *Manager) translateCommits(ctx context.Context, subInfo *resolver.Reposi
 	return translated, gone, nil
 }
 
-// pinCommits makes required commits part of the mirror's history under refs/evergit-pinned/, fetching
-// them by id when the mirror lacks them. Commits the upstream does not have are skipped; other
-// failures are returned.
-func (m *Manager) pinCommits(ctx context.Context, info *resolver.RepositoryInfo, requiredCommits []string) error {
-	for _, c := range requiredCommits {
+// fetchCommits makes commits available in the mirror: those it lacks are fetched by id, as no
+// branch or tag may reach them, and with pin all of them are kept under pinnedPrefix. It returns the
+// commits the upstream does not have; other failures are errors.
+func (m *Manager) fetchCommits(ctx context.Context, info *resolver.RepositoryInfo, commits []string, pin bool) ([]string, error) {
+	for _, c := range commits {
 		if _, err := parseSHA1Hex(c); err != nil {
-			return err
-		}
-		ref := pinnedPrefix + c
-		if _, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "cat-file", "-e", c+"^{commit}"); err == nil {
-			if _, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "update-ref", ref, c); err != nil {
-				return err
-			}
-		} else if err := m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
-			return []string{"-c", "http.followRedirects=false", "fetch", "--no-tags", remote, "+" + c + ":" + ref}
-		}); err != nil {
-			if err := markGone(err); errors.Is(err, errUpstreamGone) {
-				log.Printf("[%s] Submodule commit %s does not exist upstream: %v", info.RepoName, c, err)
-				continue
-			}
-			return fmt.Errorf("failed to fetch submodule commit %s: %w", c, err)
+			return nil, err
 		}
 	}
-	return nil
+	missing, err := missingCommits(ctx, info.MirrorPath, commits)
+	if err != nil {
+		return nil, err
+	}
+	var gone []string
+	for _, c := range missing {
+		err := m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
+			return []string{"-c", "http.followRedirects=false", "fetch", "--no-tags", "--no-write-fetch-head", remote, c}
+		})
+		if err := markGone(err); errors.Is(err, errUpstreamGone) {
+			log.Printf("[%s] Submodule commit %s does not exist upstream: %v", info.RepoName, c, err)
+			gone = append(gone, c)
+		} else if err != nil {
+			return nil, fmt.Errorf("failed to fetch submodule commit %s: %w", c, err)
+		}
+	}
+	if !pin {
+		return gone, nil
+	}
+	var updates strings.Builder
+	for _, c := range commits {
+		if !slices.Contains(gone, c) {
+			fmt.Fprintf(&updates, "update %s%s %s\n", pinnedPrefix, c, c)
+		}
+	}
+	if updates.Len() > 0 {
+		if _, err := runCmdStdin(ctx, 0, info.MirrorPath, strings.NewReader(updates.String()), "git", "update-ref", "--stdin"); err != nil {
+			return nil, err
+		}
+	}
+	return gone, nil
 }
 
 // missingCommits returns the commits the repository does not contain.
