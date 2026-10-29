@@ -443,37 +443,40 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 		}
 	}
 
-	var targetPath string
-	if strings.HasPrefix(rawURL, "./") || strings.HasPrefix(rawURL, "../") {
+	targetPath, err := submodulePath(rawURL, parentInfo)
+	if err != nil {
+		return nil, err
+	}
+	return resolver.ParsePath(strings.TrimSuffix(targetPath, ".git"), cfg)
+}
+
+// submodulePath returns the repository path ("<domain>/<owner>/<repo>.git") of a submodule URL.
+func submodulePath(rawURL string, parentInfo *resolver.RepositoryInfo) (string, error) {
+	switch {
+	case strings.HasPrefix(rawURL, "./") || strings.HasPrefix(rawURL, "../"):
 		// Relative to the superproject's URL, as git resolves it: "../other.git" next to
 		// "<domain>/<owner>/<repo>.git" is "<domain>/<owner>/other.git"
 		parentURL := path.Join(parentInfo.Domain, parentInfo.Path()+".git")
-		targetPath = path.Clean(path.Join(parentURL, rawURL))
-	} else if strings.HasPrefix(rawURL, "git@") {
+		return path.Clean(path.Join(parentURL, rawURL)), nil
+	case strings.HasPrefix(rawURL, "git@"):
 		// git@domain:owner/repo.git
-		trimmed := strings.TrimPrefix(rawURL, "git@")
-		domain, repoPart, found := strings.Cut(trimmed, ":")
+		domain, repoPart, found := strings.Cut(strings.TrimPrefix(rawURL, "git@"), ":")
 		if !found {
-			return nil, fmt.Errorf("invalid git@ submodule URL %q", rawURL)
+			return "", fmt.Errorf("invalid git@ submodule URL %q", rawURL)
 		}
-		targetPath = domain + "/" + repoPart
-	} else if strings.Contains(rawURL, "://") {
+		return domain + "/" + repoPart, nil
+	case strings.Contains(rawURL, "://"):
 		u, err := url.Parse(rawURL)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse submodule URL %q: %w", rawURL, err)
+			return "", fmt.Errorf("failed to parse submodule URL %q: %w", rawURL, err)
 		}
 		if !slices.Contains(networkSchemes, u.Scheme) {
-			return nil, fmt.Errorf("URL scheme %q is not mirrored", u.Scheme)
+			return "", fmt.Errorf("URL scheme %q is not mirrored", u.Scheme)
 		}
-		host := u.Hostname()
-		repoPart := strings.TrimPrefix(u.Path, "/")
-		targetPath = host + "/" + repoPart
-	} else {
-		targetPath = rawURL
+		return u.Hostname() + "/" + strings.TrimPrefix(u.Path, "/"), nil
+	default:
+		return rawURL, nil
 	}
-
-	targetPath = strings.TrimSuffix(targetPath, ".git")
-	return resolver.ParsePath(targetPath, cfg)
 }
 
 // networkSchemes are the URL schemes of submodules that can be mirrored from an allowed host.
