@@ -101,23 +101,9 @@ func translateCommit(data []byte, mapHex, mapMergetag func(string) (string, erro
 			}
 			fmt.Fprintf(&out, "%s %s\n", key, mapped)
 		case bytes.HasPrefix(line, []byte("mergetag ")):
-			tag := append([]byte(nil), line[len("mergetag "):]...)
-			for len(data) > 0 && data[0] == ' ' {
-				line, data = cutLine(data)
-				tag = append(tag, line[1:]...)
-			}
-			newTag, err := translateTag(tag, mapMergetag)
-			if err != nil {
-				return nil, fmt.Errorf("mergetag: %w", err)
-			}
-			out.WriteString("mergetag")
-			for len(newTag) > 0 {
-				line, newTag = cutLine(newTag)
-				out.WriteByte(' ')
-				out.Write(line)
-				if !bytes.HasSuffix(line, []byte("\n")) {
-					out.WriteByte('\n')
-				}
+			var err error
+			if data, err = copyMergetag(&out, line, data, mapMergetag); err != nil {
+				return nil, err
 			}
 		default:
 			out.Write(line)
@@ -125,6 +111,30 @@ func translateCommit(data []byte, mapHex, mapMergetag func(string) (string, erro
 	}
 	out.Write(data)
 	return out.Bytes(), nil
+}
+
+// copyMergetag writes the translation of the mergetag header starting with line, whose continuation
+// lines start data, and returns the rest of data.
+func copyMergetag(out *bytes.Buffer, line, data []byte, mapMergetag func(string) (string, error)) ([]byte, error) {
+	tag := append([]byte(nil), line[len("mergetag "):]...)
+	for len(data) > 0 && data[0] == ' ' {
+		line, data = cutLine(data)
+		tag = append(tag, line[1:]...)
+	}
+	newTag, err := translateTag(tag, mapMergetag)
+	if err != nil {
+		return nil, fmt.Errorf("mergetag: %w", err)
+	}
+	out.WriteString("mergetag")
+	for len(newTag) > 0 {
+		line, newTag = cutLine(newTag)
+		out.WriteByte(' ')
+		out.Write(line)
+		if !bytes.HasSuffix(line, []byte("\n")) {
+			out.WriteByte('\n')
+		}
+	}
+	return data, nil
 }
 
 // translateTag rewrites the object header. As in git, the in-body signature belongs to the hash
