@@ -38,17 +38,8 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func (s *HTTPServer) serveSetupScript(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if (s.cfg.PublicURL == "" || s.cfg.PublicSSHURL == "") && !requestHost.MatchString(r.Host) {
-		http.Error(w, "Evergit: invalid Host header for the setup script; the administrator can set -public-url and -public-ssh-url", http.StatusBadRequest)
-		return
-	}
-
+// publicHTTPBase returns the public base URL of the HTTP service: -public-url, or the request's.
+func (s *HTTPServer) publicHTTPBase(r *http.Request) string {
 	httpBase := s.cfg.PublicURL
 	if httpBase == "" {
 		scheme := "http"
@@ -57,8 +48,12 @@ func (s *HTTPServer) serveSetupScript(w http.ResponseWriter, r *http.Request) {
 		}
 		httpBase = scheme + "://" + r.Host
 	}
-	httpBase = strings.TrimRight(httpBase, "/")
+	return strings.TrimRight(httpBase, "/")
+}
 
+// publicSSHBase returns the public base URL of the SSH service: -public-ssh-url, or the request's
+// host with the SSH listen port.
+func (s *HTTPServer) publicSSHBase(r *http.Request) string {
 	sshBase := s.cfg.PublicSSHURL
 	if sshBase == "" {
 		host := r.Host
@@ -73,7 +68,22 @@ func (s *HTTPServer) serveSetupScript(w http.ResponseWriter, r *http.Request) {
 		}
 		sshBase = fmt.Sprintf("ssh://git@%s:%s", host, sshPort)
 	}
-	sshBase = strings.TrimRight(sshBase, "/")
+	return strings.TrimRight(sshBase, "/")
+}
+
+func (s *HTTPServer) serveSetupScript(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if (s.cfg.PublicURL == "" || s.cfg.PublicSSHURL == "") && !requestHost.MatchString(r.Host) {
+		http.Error(w, "Evergit: invalid Host header for the setup script; the administrator can set -public-url and -public-ssh-url", http.StatusBadRequest)
+		return
+	}
+
+	httpBase := s.publicHTTPBase(r)
+	sshBase := s.publicSSHBase(r)
 
 	allowedHosts := s.cfg.AllowedHosts
 	if len(allowedHosts) == 0 {
