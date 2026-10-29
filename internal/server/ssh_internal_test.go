@@ -96,3 +96,25 @@ func TestHostKeyGenerationUsesEd25519(t *testing.T) {
 		t.Errorf("reloaded public key does not match generated public key")
 	}
 }
+
+func TestAcceptedEnvOnlyAllowsProtocolVersion2(t *testing.T) {
+	cases := []struct {
+		name, value string
+		accepted    bool
+	}{
+		{"GIT_PROTOCOL", "version=2", true},
+		{"GIT_PROTOCOL", "version=1", false},
+		{"GIT_PROTOCOL", "version=2:object-format=sha1", false},
+		{"GIT_PROTOCOL", "version=2\n", false},
+		{"GIT_PROTOCOL", " version=2", false},
+		{"git_protocol", "version=2", false},
+		{"GIT_DIR", "/etc", false},
+		{"LD_PRELOAD", "/tmp/x.so", false},
+		{"GIT_CONFIG_PARAMETERS", "'uploadpack.packObjectsHook=sh'", false},
+	}
+	for _, c := range cases {
+		if got := acceptedEnv(c.name, c.value); got != c.accepted {
+			t.Errorf("acceptedEnv(%q, %q) = %v, want %v", c.name, c.value, got, c.accepted)
+		}
+	}
+}

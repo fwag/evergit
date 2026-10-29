@@ -135,6 +135,7 @@ func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	timer := time.NewTimer(sshRequestTimeout)
 	defer timer.Stop()
 
+	session := &sshSession{ctx: ctx, cancel: cancel, ch: ch, reqs: reqs}
 	for {
 		select {
 		case req, ok := <-reqs:
@@ -148,7 +149,7 @@ func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 				}
 			}
 			timer.Reset(sshRequestTimeout)
-			if s.handleRequest(ctx, cancel, ch, reqs, req) {
+			if s.handleRequest(session, req) {
 				return
 			}
 		case <-timer.C:
@@ -158,9 +159,27 @@ func (s *SSHServer) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	}
 }
 
+// sshSession is the state of an SSH session until its command runs.
+type sshSession struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	ch     ssh.Channel
+	reqs   <-chan *ssh.Request
+	// gitProtocol is the GIT_PROTOCOL the client sent, if accepted (see acceptedEnv)
+	gitProtocol string
+}
+
+// acceptedEnv reports whether a client may set an environment variable for the git command it runs:
+// only GIT_PROTOCOL selecting protocol v2, exactly as git sends it, so that a client can never change
+// how git runs on the server (GIT_DIR, GIT_CONFIG_PARAMETERS, LD_PRELOAD, ...).
+func acceptedEnv(name, value string) bool {
+	return name == "GIT_PROTOCOL" && value == "version=2"
+}
+
 // handleRequest handles a request of a session, and reports whether the session is over: after the
 // command it runs, or a malformed one. Replies only fail once the client is gone.
-func (s *SSHServer) handleRequest(ctx context.Context, cancel context.CancelFunc, ch ssh.Channel, reqs <-chan *ssh.Request, req *ssh.Request) bool {
+func (s *SSHServer) handleRequest(session *sshSession, req *ssh.Request) bool {
+	ch, reqs := session.ch, session.reqs
 	switch req.Type {
 	case "exec":
 		var payload struct {
@@ -177,16 +196,23 @@ func (s *SSHServer) handleRequest(ctx context.Context, cancel context.CancelFunc
 		go func() {
 			for range reqs {
 			}
-			cancel()
+			session.cancel()
 		}()
 
-		err := s.executeGitCommand(ctx, ch, payload.Value)
+		err := s.executeGitCommand(session.ctx, ch, payload.Value, session.gitProtocol)
 		sendExitStatus(ch, err)
 		return true
 
 	case "env":
-		// Environment variables are not applied, so do not claim otherwise
-		_ = req.Reply(false, nil)
+		// Only an accepted variable is applied: the others are refused, not silently dropped
+		var payload struct {
+			Name, Value string
+		}
+		accepted := ssh.Unmarshal(req.Payload, &payload) == nil && acceptedEnv(payload.Name, payload.Value)
+		if accepted {
+			session.gitProtocol = payload.Value
+		}
+		_ = req.Reply(accepted, nil)
 
 	default:
 		_ = req.Reply(false, nil)
@@ -194,7 +220,9 @@ func (s *SSHServer) handleRequest(ctx context.Context, cancel context.CancelFunc
 	return false
 }
 
-func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCmd string) error {
+// executeGitCommand runs a client's git command, with the git protocol it selected (protocol v2:
+// "version=2", see acceptedEnv), or git's default.
+func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCmd, gitProtocol string) error {
 	log.Printf("[SSH] Command: %q", rawCmd)
 
 	verb, repoPath, err := parseGitCommand(rawCmd)
@@ -247,6 +275,9 @@ func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCm
 	// Execute git command directly against the safe path
 	cmd := exec.CommandContext(ctx, verb, absServingPath)
 	cmd.Env = converter.GitEnv()
+	if acceptedEnv("GIT_PROTOCOL", gitProtocol) {
+		cmd.Env = append(cmd.Env, "GIT_PROTOCOL="+gitProtocol)
+	}
 	cmd.Stdin = ch
 	cmd.Stdout = ch
 	cmd.Stderr = ch.Stderr()

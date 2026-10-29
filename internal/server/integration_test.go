@@ -170,6 +170,17 @@ func TestIntegration(t *testing.T) {
 		if !strings.Contains(logOut, "initial commit on sha1") {
 			t.Errorf("missing expected commit in logs: %q", logOut)
 		}
+
+		// git sends GIT_PROTOCOL through SSH for protocol v2, which the server honours
+		lsRemote := exec.Command("git", "-c", "protocol.version=2", "ls-remote", "ssh://git@127.0.0.1/local.test/test/repo.git")
+		lsRemote.Env = append(os.Environ(), "GIT_SSH_COMMAND="+sshCmd, "GIT_TRACE_PACKET=1")
+		packets, err := lsRemote.CombinedOutput()
+		if err != nil {
+			t.Fatalf("ls-remote over SSH: %v\n%s", err, packets)
+		}
+		if !strings.Contains(string(packets), "< version 2") {
+			t.Errorf("SSH server did not speak protocol v2:\n%s", packets)
+		}
 	})
 }
 
