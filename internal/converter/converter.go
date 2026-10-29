@@ -421,6 +421,17 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 		return nil
 	}
 
+	// All missing approvals of the repository and its submodules are reported before converting
+	if len(requiredCommits) == 0 {
+		plan, err := m.planConversion(ctx, info, nil, progressWriter, depth)
+		if err != nil {
+			return err
+		}
+		if progressWriter != nil {
+			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Plan: %s\n", info.RepoName, plan.summary())
+		}
+	}
+
 	// 3. Convert the submodules whose commits the history records, deciding every gitlink's SHA-256
 	gitlinks, err := m.resolveGitlinks(ctx, info, progressWriter, depth, heads)
 	if err != nil {

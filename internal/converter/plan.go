@@ -518,6 +518,17 @@ func (p *conversionPlan) approvalError() error {
 		ErrSubmoduleNotApproved, reasons.String(), hint.String())
 }
 
+// summary describes the plan for clients' progress.
+func (p *conversionPlan) summary() string {
+	toConvert := 0
+	for _, r := range p.items {
+		if r.heads != nil {
+			toConvert++
+		}
+	}
+	return fmt.Sprintf("%d repositories, %d to convert", len(p.items), toConvert)
+}
+
 func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {

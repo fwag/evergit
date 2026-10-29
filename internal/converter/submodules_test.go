@@ -125,6 +125,24 @@ func TestSubmoduleTemporaryFailureFailsConversion(t *testing.T) {
 	}
 }
 
+func TestMissingApprovalsReportedAtOnce(t *testing.T) {
+	// The superproject and its submodule each record a submodule that cannot be converted
+	sub := newTestUpstream(t)
+	addGitlink(t, sub, "inner", "https://unusable.invalid/test/inner.git", strings.Repeat("cd", 20))
+	super := newTestUpstream(t)
+	addGitlink(t, super, "outer", "https://unusable.invalid/test/outer.git", strings.Repeat("ab", 20))
+	addGitlink(t, super, "sub", urlOf(sub), gitLine(t, sub, nil, "rev-parse", "HEAD"))
+
+	// Both are reported by the first attempt, before anything is converted
+	m := newSubmoduleManager(t.TempDir(), 0, super, sub)
+	err := m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil)
+	assertNeedsApproval(t, err, canonicalRepoID(repoInfo(t, m, super)), "https://unusable.invalid/test/outer.git")
+	assertNeedsApproval(t, err, canonicalRepoID(repoInfo(t, m, sub)), "https://unusable.invalid/test/inner.git")
+	if _, err := os.Stat(repoInfo(t, m, sub).ServingPath); err == nil {
+		t.Error("submodule converted before its approvals were reported")
+	}
+}
+
 func TestSubmoduleGoneUpstreamNeedsApproval(t *testing.T) {
 	sub := newTestUpstream(t)
 	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
