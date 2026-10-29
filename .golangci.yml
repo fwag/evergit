@@ -26,10 +26,11 @@ linters:
       - path: _test\.go
         linters: [funlen, gocognit, nestif, dupl]
 
+formatters:
+  enable:
+    - gofmt
+
 issues:
-  # Only code changed since this commit is checked; the findings in older code are known debt,
-  # listed with: golangci-lint run --new-from-rev=
-  new-from-rev: c0ed207
   # funlen and gocognit both report on the func line
   uniq-by-line: false
   max-issues-per-linter: 0
