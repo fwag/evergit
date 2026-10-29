@@ -410,45 +410,54 @@ func isRepoSHA256(repoPath string) bool {
 // syncNativeSHA256 creates or updates the serving repository for an upstream repository that is
 // already in SHA-256 format, bypassing object conversion.
 func (m *Manager) syncNativeSHA256(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
+	if _, err := os.Stat(filepath.Join(info.ServingPath, "HEAD")); err == nil {
+		return m.updateNativeSHA256(ctx, info, progressWriter)
+	}
+	return m.createNativeSHA256(ctx, info, progressWriter)
+}
+
+// updateNativeSHA256 updates the serving repository of a natively SHA-256 upstream from its mirror.
+func (m *Manager) updateNativeSHA256(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
 	servingHeadPath := filepath.Join(info.ServingPath, "HEAD")
-	if _, err := os.Stat(servingHeadPath); err == nil {
-		if nativeUpToDate(info) {
-			now := time.Now()
-			_ = os.Chtimes(servingHeadPath, now, now)
-			return nil
-		}
-
-		log.Printf("Syncing native SHA256 updates for repository %s...", info.RepoName)
-		if progressWriter != nil {
-			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Syncing native SHA-256 updates for %s...\n", info.RepoName)
-		}
-		// Fetch branches and tags, pruning any deleted upstream branches/tags
-		if _, err := runCmdContext(ctx, 0, info.ServingPath, "git", "fetch", "--prune", "--", info.MirrorPath,
-			"+refs/heads/*:refs/heads/*",
-			"+refs/tags/*:refs/tags/*",
-		); err != nil {
-			return fmt.Errorf("failed to fetch native sha256 updates into %s: %w", info.ServingPath, err)
-		}
-
-		// Backup refs are never pruned: older versions or re-cloned mirrors may lose them,
-		// leaving the serving repo as their only copy. Fetch them additively without --prune.
-		if _, err := runCmdContext(ctx, 0, info.ServingPath, "git", "fetch", "--", info.MirrorPath,
-			"+refs/evergit-backups/*:refs/evergit-backups/*",
-		); err != nil {
-			log.Printf("WARNING: failed to fetch backup refs for native sha256 repo %s: %v", info.RepoName, err)
-		}
-
-		if headRef, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
-			_, _ = runCmdContext(ctx, 0, info.ServingPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
-		}
-
+	if nativeUpToDate(info) {
 		now := time.Now()
 		_ = os.Chtimes(servingHeadPath, now, now)
-		m.logBackupRefs(info)
 		return nil
 	}
 
-	// Serving repo does not exist: clone directly from the mirror into a new build
+	log.Printf("Syncing native SHA256 updates for repository %s...", info.RepoName)
+	if progressWriter != nil {
+		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: Syncing native SHA-256 updates for %s...\n", info.RepoName)
+	}
+	// Fetch branches and tags, pruning any deleted upstream branches/tags
+	if _, err := runCmdContext(ctx, 0, info.ServingPath, "git", "fetch", "--prune", "--", info.MirrorPath,
+		"+refs/heads/*:refs/heads/*",
+		"+refs/tags/*:refs/tags/*",
+	); err != nil {
+		return fmt.Errorf("failed to fetch native sha256 updates into %s: %w", info.ServingPath, err)
+	}
+
+	// Backup refs are never pruned: older versions or re-cloned mirrors may lose them,
+	// leaving the serving repo as their only copy. Fetch them additively without --prune.
+	if _, err := runCmdContext(ctx, 0, info.ServingPath, "git", "fetch", "--", info.MirrorPath,
+		"+refs/evergit-backups/*:refs/evergit-backups/*",
+	); err != nil {
+		log.Printf("WARNING: failed to fetch backup refs for native sha256 repo %s: %v", info.RepoName, err)
+	}
+
+	if headRef, err := runCmdContext(ctx, 0, info.MirrorPath, "git", "symbolic-ref", "HEAD"); err == nil {
+		_, _ = runCmdContext(ctx, 0, info.ServingPath, "git", "--git-dir=.", "symbolic-ref", "HEAD", headRef)
+	}
+
+	now := time.Now()
+	_ = os.Chtimes(servingHeadPath, now, now)
+	m.logBackupRefs(info)
+	return nil
+}
+
+// createNativeSHA256 creates the serving repository of a natively SHA-256 upstream: a clone of its
+// mirror in a new build.
+func (m *Manager) createNativeSHA256(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer) error {
 	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
 		return fmt.Errorf("failed to create repos directory: %w", err)
 	}
