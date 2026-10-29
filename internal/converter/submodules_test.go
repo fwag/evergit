@@ -391,6 +391,31 @@ func TestGitlinkDecisionsAreKept(t *testing.T) {
 	}
 }
 
+func TestSubmoduleConvertedWithOtherRulesIsRebuiltBeforeUse(t *testing.T) {
+	sub := newTestUpstream(t)
+	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	super := newTestUpstream(t)
+	addGitlink(t, super, "sub", urlOf(sub), commit)
+	other := newTestUpstream(t)
+	addGitlink(t, other, "sub", urlOf(sub), commit)
+
+	m := newSubmoduleManager(t.TempDir(), 0, super, other, sub)
+	if err := m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil); err != nil {
+		t.Fatal(err)
+	}
+	subPath := repoInfo(t, m, sub).ServingPath
+	build := gitLine(t, "", nil, "-C", subPath, "rev-parse", "--absolute-git-dir")
+
+	// Its translation table holds the commit, but was made with other rules
+	setConversionVersion(t, subPath, conversionVersion-1)
+	if err := m.EnsureRepo(context.Background(), repoInfo(t, m, other), nil); err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt := gitLine(t, "", nil, "-C", subPath, "rev-parse", "--absolute-git-dir"); rebuilt == build {
+		t.Error("submodule converted with other rules was used without being rebuilt")
+	}
+}
+
 // setConversionVersion rewrites a serving repository's state as if converted with other rules.
 func setConversionVersion(t *testing.T, servingPath string, version int) {
 	t.Helper()

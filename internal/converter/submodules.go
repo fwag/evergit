@@ -655,10 +655,11 @@ func (m *Manager) syntheticGitlinksFile() string {
 // partialConversion). Commits it translates already need no fetch: commits never change.
 func (m *Manager) ensureSubmoduleCommits(ctx context.Context, subInfo *resolver.RepositoryInfo, commits []string, progressWriter io.Writer, depth int) (*translationIndex, []string, error) {
 	// missingFrom opens the submodule's index (none for a natively SHA-256 submodule, whose
-	// commits have no SHA-1) and lists the commits it lacks
+	// commits have no SHA-1, or for one converted with other rules, which is rebuilt) and lists the
+	// commits it lacks
 	missingFrom := func() (*translationIndex, []string) {
 		var table *translationIndex
-		if ensureTranslationIndexes(subInfo.ServingPath) == nil {
+		if currentState(subInfo.ServingPath) != nil && ensureTranslationIndexes(subInfo.ServingPath) == nil {
 			table, _ = openTranslationIndex(filepath.Join(subInfo.ServingPath, sha1IndexFile), len(sha1ID{}))
 		}
 		var missing []string
