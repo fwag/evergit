@@ -138,9 +138,11 @@ converted commits as `submodule-cycles` (same decisions), and fewer runs to coll
   strongly connected components.
 - **Three kinds of steps:** a complete conversion (the requested repository, or a repository
   converted completely with other rules, rebuilt), a partial conversion pinning the step's commits,
-  and for a repository converted completely an *objects-only* conversion, which adds the commits'
-  objects and translations without changing its refs. The plan fetches commits without pinning them;
-  a step pins the commits it converts.
+  and for a repository converted completely an *extension*, which adds the commits and serves them
+  as pinned refs without changing its branches, tags or TTL. Either way the step's commits are
+  served, so `git submodule update` finds them even over SSH, where git uses protocol v0, which only
+  fetches advertised commits. The plan fetches commits without pinning them; a step pins the commits
+  it converts.
 - **Sources instead of tables.** A conversion no longer searches every submodule's translation table:
   each gitlink's SHA-256 comes from the source the plan decided, so `gitlinkResolution` only holds
   decisions.

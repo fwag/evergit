@@ -737,13 +737,18 @@ func isIncrementalRewrite(servingPath string) bool {
 	return true
 }
 
-// conversionScope is what a conversion converts and serves: all refs, pinned refs (partial: those
-// served before and those of pins), or only the history of some commits, serving nothing new
-// (objects).
+// conversionScope is what a conversion converts and serves: all refs, or the history of the commits
+// pins, served as pinned refs, of a partial repository (which serves only pinned refs) or of one
+// converted completely (whose branches and tags stay as they were).
 type conversionScope struct {
 	partial bool
 	pins    []string
-	objects []string
+}
+
+// extends reports whether a conversion only adds pinned commits to a repository converted
+// completely.
+func (s conversionScope) extends() bool {
+	return s.pins != nil && !s.partial
 }
 
 // conversionTarget is where a conversion writes: the serving repository itself, extended
@@ -757,18 +762,19 @@ type conversionTarget struct {
 	state       *repoState
 }
 
-// openTarget prepares a conversion's target. A conversion of objects only extends a repository.
+// openTarget prepares a conversion's target. Extending a repository converted completely requires an
+// incremental conversion.
 func openTarget(ctx context.Context, info *resolver.RepositoryInfo, scope conversionScope) (*conversionTarget, error) {
 	t := &conversionTarget{path: info.ServingPath, incremental: isIncrementalRewrite(info.ServingPath),
 		ids: &translations{added: make(map[sha1ID]sha256ID)}}
 	t.previous, _ = loadState(info.ServingPath)
 	t.state = newRepoState(t.previous)
 	t.state.Partial = scope.partial
-	if scope.objects != nil {
+	if scope.extends() {
 		if !t.incremental {
 			return nil, fmt.Errorf("cannot extend %s, which must be converted again", info.RepoName)
 		}
-		// Only objects are added: what is served stays as it was
+		// Branches and tags stay as they were
 		t.state.Partial, t.state.ConvertedRefs = t.previous.Partial, t.previous.ConvertedRefs
 	}
 	if !t.incremental {
@@ -843,10 +849,14 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err != nil {
 		return err
 	}
-	heads := scope.objects // nil: the history of all refs
-	if scope.partial {
+	var heads []string // nil: the history of all refs
+	switch {
+	case scope.partial:
 		refs = servedPins(refs, t.previous, scope.pins)
 		heads = slices.Sorted(maps.Values(refs))
+	case scope.extends():
+		refs = servedPins(refs, nil, scope.pins)
+		heads = scope.pins
 	}
 	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, t.path, t.ids, gitlinks, heads, t.exclude, progress)
 	if err != nil {
@@ -868,12 +878,13 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err := t.state.save(t.path); err != nil {
 		return fmt.Errorf("failed to record conversion state: %w", err)
 	}
-	if scope.objects == nil {
-		if err := m.serveConversion(ctx, info, t, refs, progressWriter); err != nil {
-			return err
-		}
-	} else if err := writeTranslationIndexes(t.path, t.ids.known, t.ids.added); err != nil {
-		return fmt.Errorf("failed to write translation indexes: %w", err)
+	if scope.extends() {
+		err = extendServing(ctx, t, refs)
+	} else {
+		err = m.serveConversion(ctx, info, t, refs, progressWriter)
+	}
+	if err != nil {
+		return err
 	}
 	log.Printf("Completed %s object conversion for repository %s in %v (%d objects)", scope.kind(t.incremental), info.RepoName, time.Since(start).Round(time.Millisecond), len(added))
 	return nil
@@ -904,6 +915,27 @@ func (m *Manager) serveConversion(ctx context.Context, info *resolver.Repository
 	return m.publishConversion(info, t.path, t.incremental)
 }
 
+// extendServing serves the pinned refs added to a repository converted completely, without touching
+// its branches and tags or restarting its TTL: they are updated when it is requested itself.
+func extendServing(ctx context.Context, t *conversionTarget, pins map[string]string) error {
+	if err := writeTranslationIndexes(t.path, t.ids.known, t.ids.added); err != nil {
+		return fmt.Errorf("failed to write translation indexes: %w", err)
+	}
+	if err := updateRefs(ctx, pins, t.path, t.ids); err != nil {
+		return err
+	}
+	converted := maps.Clone(t.state.ConvertedRefs)
+	if converted == nil {
+		converted = make(map[string]string)
+	}
+	maps.Copy(converted, pins)
+	t.state.ConvertedRefs = converted
+	if err := t.state.save(t.path); err != nil {
+		return fmt.Errorf("failed to record conversion state: %w", err)
+	}
+	return nil
+}
+
 // kind describes a conversion in the log.
 func (s conversionScope) kind(incremental bool) string {
 	kind := "full"
@@ -913,8 +945,8 @@ func (s conversionScope) kind(incremental bool) string {
 	switch {
 	case s.partial:
 		kind += " partial"
-	case s.objects != nil:
-		kind += " objects-only"
+	case s.extends():
+		kind += " pins"
 	}
 	return kind
 }

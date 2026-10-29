@@ -742,6 +742,38 @@ func TestSubmoduleMovedTranslatesCommitsRecordedUnderOldURL(t *testing.T) {
 	}
 }
 
+func TestCompleteSubmoduleServesCommitsRecordedLater(t *testing.T) {
+	sub := newTestUpstream(t)
+	m := newSubmoduleManager(t.TempDir(), time.Hour, sub)
+	subInfo := repoInfo(t, m, sub)
+	// The submodule was requested itself, and is converted completely
+	if err := m.EnsureRepo(context.Background(), subInfo, nil); err != nil {
+		t.Fatal(err)
+	}
+	branch := gitLine(t, subInfo.ServingPath, nil, "--git-dir=.", "rev-parse", "main")
+	commitToUpstream(t, sub, "recorded later")
+	commit := gitLine(t, sub, nil, "rev-parse", "HEAD")
+	super := newTestUpstream(t)
+	addGitlink(t, super, "sub", urlOf(sub), commit)
+	m.SetConfig(newSubmoduleManager(m.cfg.StorageRoot, 0, super, sub).cfg)
+
+	if err := m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil); err != nil {
+		t.Fatal(err)
+	}
+	// Served, as "git submodule update" over SSH (protocol v0) only fetches advertised commits,
+	// without changing the branches, which are updated when the submodule is requested itself
+	want, err := LookupID(subInfo.ServingPath, "sha1", commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gitLine(t, subInfo.ServingPath, nil, "--git-dir=.", "rev-parse", pinnedPrefix+commit); got != want {
+		t.Errorf("pinned ref of the recorded commit = %s, want %s", got, want)
+	}
+	if got := gitLine(t, subInfo.ServingPath, nil, "--git-dir=.", "rev-parse", "main"); got != branch {
+		t.Errorf("branch moved to %s, was %s", got, branch)
+	}
+}
+
 func TestRequestForPartialSubmoduleCompletesIt(t *testing.T) {
 	sub := newTestUpstream(t)
 	recorded := gitLine(t, sub, nil, "rev-parse", "HEAD")

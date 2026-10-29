@@ -141,8 +141,8 @@ func convertedRefs(r *planItem) []string {
 	return refs
 }
 
-// step converts an item: all refs, or only the history of heads, as a partial conversion (pinning
-// heads) or by adding their objects to a repository converted completely.
+// step converts an item: all refs, or the history of heads, pinned and served, as a partial
+// conversion or by extending a repository converted completely.
 func (p *conversionPlan) step(r *planItem, heads []string, complete bool) error {
 	mu := p.m.repoMutex(r.info)
 	mu.Lock()
@@ -153,15 +153,11 @@ func (p *conversionPlan) step(r *planItem, heads []string, complete bool) error 
 		return err
 	}
 	var scope conversionScope
-	switch {
-	case complete:
-	case partialConversion(r.info.ServingPath):
+	if !complete {
 		if _, err := p.m.fetchCommits(p.ctx, r.info, heads, true); err != nil {
 			return fmt.Errorf("%s: %w", r.id, err)
 		}
-		scope.partial, scope.pins = true, heads
-	default:
-		scope.objects = heads
+		scope = conversionScope{partial: partialConversion(r.info.ServingPath), pins: heads}
 	}
 	if err := p.m.convertRepo(p.ctx, r.info, p.progressWriter, res, scope); err != nil {
 		return fmt.Errorf("%s: %w", r.id, err)
