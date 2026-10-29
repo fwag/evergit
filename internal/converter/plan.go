@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -34,8 +35,12 @@ type planItem struct {
 	info  *resolver.RepositoryInfo
 	id    string
 	level int // submodule nesting from the requested repository
-	// complete: all refs are converted (the requested repository), otherwise the required commits
+	// complete: all refs are converted (the requested repository, or one rebuilt), otherwise the
+	// required commits
 	complete bool
+	// rebuild: converted completely with other rules, so converted completely again rather than
+	// extended
+	rebuild  bool
 	required []string
 	scanned  int  // required commits already scanned
 	queued   bool // waiting for a scan
@@ -66,6 +71,9 @@ type conversionPlan struct {
 	top   *planItem
 	items map[string]*planItem
 	queue []*planItem
+	// execution: items converted completely, and the conversions in progress
+	completed  map[*planItem]bool
+	converting map[string]bool
 	// missing approvals, by superproject
 	unapproved map[string][]unapprovedGitlinks
 }
@@ -85,13 +93,14 @@ func (m *Manager) planConversion(ctx context.Context, info *resolver.RepositoryI
 	p := &conversionPlan{
 		m: m, ctx: ctx, progressWriter: progressWriter, maxLevel: maxLevel, approvals: approvals,
 		items: make(map[string]*planItem), unapproved: make(map[string][]unapprovedGitlinks),
+		completed: make(map[*planItem]bool), converting: make(map[string]bool),
 	}
 	p.top, err = p.item(info, 0)
 	if err != nil {
 		return nil, err
 	}
 	p.top.synced = true
-	p.top.complete = commits == nil
+	p.top.complete = p.top.complete || commits == nil
 	p.require(p.top, commits...)
 	if err := p.walk(); err != nil {
 		return nil, err
@@ -117,12 +126,16 @@ func (p *conversionPlan) item(info *resolver.RepositoryInfo, level int) (*planIt
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	if state := currentState(info.ServingPath); state != nil && isIncrementalRewrite(info.ServingPath) {
-		for _, ref := range state.ConvertedRefs {
-			r.exclude = append(r.exclude, ref)
+	r.exclude = convertedRefs(r)
+	p.items[id] = r
+	if previous, err := loadState(info.ServingPath); err == nil && !isIncrementalRewrite(info.ServingPath) {
+		if !previous.Partial {
+			r.rebuild, r.complete = true, true
+		} else if refs, err := listRefs(info.MirrorPath); err == nil {
+			// Rebuilt with all the commits superprojects required before
+			p.require(r, slices.Sorted(maps.Values(pinnedRefs(refs)))...)
 		}
 	}
-	p.items[id] = r
 	return r, nil
 }
 
@@ -179,7 +192,7 @@ func (p *conversionPlan) scan(r *planItem) error {
 	if err != nil || !ok {
 		return err
 	}
-	targets, err := discoverGitlinks(p.ctx, r.info.MirrorPath, heads, append(slices.Clone(r.exclude), r.heads...), nil)
+	targets, err := p.discover(r, heads)
 	if err != nil {
 		return err
 	}
@@ -197,6 +210,24 @@ func (p *conversionPlan) scan(r *planItem) error {
 		}
 	}
 	return nil
+}
+
+// discover lists the gitlinks of the history of heads of an item not scanned before, reporting
+// progress to the client.
+func (p *conversionPlan) discover(r *planItem, heads []string) (gitlinkTargets, error) {
+	if p.progressWriter == nil {
+		return discoverGitlinks(p.ctx, r.info.MirrorPath, heads, append(slices.Clone(r.exclude), r.heads...), nil)
+	}
+	_, _ = fmt.Fprintf(p.progressWriter, "remote: Evergit: [%s] Scanning history for submodules...\n", r.info.RepoName)
+	scanned := 0
+	targets, err := discoverGitlinks(p.ctx, r.info.MirrorPath, heads, append(slices.Clone(r.exclude), r.heads...), func(n int) {
+		scanned = n
+		_, _ = fmt.Fprintf(p.progressWriter, "\rremote: Evergit: [Progress] Scanning %s: %d commits...", r.info.RepoName, n)
+	})
+	if err == nil && scanned > 0 {
+		_, _ = fmt.Fprintf(p.progressWriter, "\rremote: Evergit: [Progress] Scanning %s: %d commits, done.\n", r.info.RepoName, scanned)
+	}
+	return targets, err
 }
 
 // prepare fetches an item's new required commits that its serving repository does not translate,
@@ -248,6 +279,9 @@ func (p *conversionPlan) untranslated(r *planItem, commits []string) ([]string, 
 // fetch syncs a submodule's mirror, once per plan, and fetches the commits it lacks without pinning
 // them: an execution step pins the commits it converts.
 func (p *conversionPlan) fetch(r *planItem, commits []string) error {
+	mu := p.m.repoMutex(r.info)
+	mu.Lock()
+	defer mu.Unlock()
 	if !r.synced {
 		r.synced = true
 		err := p.m.syncMirror(p.ctx, r.info)
@@ -294,6 +328,7 @@ func (p *conversionPlan) decide(r *planItem) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	p.reportResolving(r, links)
 	var problems []recordedGitlink
 	decided := false
 	for _, l := range links {
@@ -313,6 +348,18 @@ func (p *conversionPlan) decide(r *planItem) (bool, error) {
 	}
 	solved, err := p.decideProblems(r, problems)
 	return decided || solved, err
+}
+
+// reportResolving tells the client how many submodules of an item are being decided.
+func (p *conversionPlan) reportResolving(r *planItem, links []recordedGitlink) {
+	if p.progressWriter == nil || len(links) == 0 {
+		return
+	}
+	submodules := make(map[string]bool)
+	for _, l := range links {
+		submodules[l.submodule] = true
+	}
+	_, _ = fmt.Fprintf(p.progressWriter, "remote: Evergit: [%s] Resolving %d submodule(s)...\n", r.info.RepoName, len(submodules))
 }
 
 // undecided lists the gitlinks of an item that neither an earlier conversion nor the plan decided.

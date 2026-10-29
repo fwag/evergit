@@ -506,6 +506,19 @@ func TestSubmodulePointingIntoItsOwnRepositoryGoneUpstreamNeedsApproval(t *testi
 	assertNeedsApproval(t, m.EnsureRepo(context.Background(), repoInfo(t, m, super), nil), canonicalRepoID(repoInfo(t, m, super)), urlOf(super))
 }
 
+// convertCommits converts the history of commits of a repository, as for a submodule: partially,
+// unless it was converted completely before.
+func convertCommits(ctx context.Context, m *Manager, info *resolver.RepositoryInfo, commits ...string) error {
+	if err := m.syncMirror(ctx, info); err != nil {
+		return err
+	}
+	p, err := m.planConversion(ctx, info, commits, nil, DefaultMaxSubmoduleDepth)
+	if err != nil {
+		return err
+	}
+	return p.convert(p.top, commits)
+}
+
 func TestPartialConversionExtendsWithoutChangingIDs(t *testing.T) {
 	up := newTestUpstream(t)
 	commitToUpstream(t, up, "second")
@@ -541,7 +554,7 @@ func TestPartialConversionExtendsWithoutChangingIDs(t *testing.T) {
 	}
 
 	// Only the history of the required commit is converted, and only its pinned ref is served
-	if err := m.ensureRepo(ctx, info, nil, DefaultMaxSubmoduleDepth, []string{needed}, true); err != nil {
+	if err := convertCommits(ctx, m, info, needed); err != nil {
 		t.Fatal(err)
 	}
 	neededID := idOf(needed)
@@ -564,7 +577,7 @@ func TestPartialConversionExtendsWithoutChangingIDs(t *testing.T) {
 	}
 
 	// Another required commit extends it
-	if err := m.ensureRepo(ctx, info, nil, DefaultMaxSubmoduleDepth, []string{other}, true); err != nil {
+	if err := convertCommits(ctx, m, info, other); err != nil {
 		t.Fatal(err)
 	}
 	extended("another required commit")
@@ -596,7 +609,7 @@ func TestPartialConversionExtendsWithoutChangingIDs(t *testing.T) {
 	}
 
 	// A complete conversion is never reduced to a partial one
-	if err := m.ensureRepo(ctx, info, nil, DefaultMaxSubmoduleDepth, []string{needed}, true); err != nil {
+	if err := convertCommits(ctx, m, info, needed); err != nil {
 		t.Fatal(err)
 	}
 	if b := branches(); !strings.Contains(b, "refs/heads/main") {

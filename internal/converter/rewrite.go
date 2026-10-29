@@ -409,7 +409,7 @@ type objectRewriter struct {
 	cat      *catFileBatch
 	repoPath string
 	packDir  string
-	pack     *packWriter    // nil when only computing ids
+	pack     *packWriter
 	chunk    []packedObject // objects in pack
 	ids      *translations
 	added    []sha1ID // objects converted in this run, in conversion order
@@ -448,9 +448,6 @@ func (r *objectRewriter) convert(id sha1ID, name string) (sha256ID, error) {
 	r.added = append(r.added, id)
 	if r.progress != nil && len(r.added)%progressObjectInterval == 0 {
 		r.progress(len(r.added))
-	}
-	if r.pack == nil {
-		return newID, nil // only computing ids
 	}
 	if err := r.pack.add(typ, data); err != nil {
 		return sha256ID{}, fmt.Errorf("failed to write %s %x to pack: %w", typ, id, err)
@@ -571,9 +568,8 @@ func (r *objectRewriter) flushChunk() error {
 
 // rewriteObjects converts every object reachable from heads (commits, or all of the mirror's refs if
 // nil) that is not yet in ids into packs in targetPath, walking only history not reachable from
-// exclude (refs converted before). With an empty targetPath, it only computes the SHA-256 ids into
-// ids. It returns the converted ids in conversion order, and the objects mergetags refer to but the
-// repository lacks, with a merge recording each.
+// exclude (refs converted before). It returns the converted ids in conversion order, and the objects
+// mergetags refer to but the repository lacks, with a merge recording each.
 func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *translations, gitlinks *gitlinkResolution, heads, exclude []string, progress func(int)) ([]sha1ID, map[string]string, error) {
 	// Parents before children keeps the recursion in convert shallow: commits only recurse into trees
 	args, stdin := historyRevisions(heads, exclude)
@@ -597,17 +593,15 @@ func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *tra
 	}
 	defer cat.close()
 
-	r := &objectRewriter{ctx: ctx, cat: cat, ids: ids, gitlinks: gitlinks, progress: progress}
-	if targetPath != "" {
-		r.repoPath, r.packDir = targetPath, filepath.Join(targetPath, "objects", "pack")
-		if err := os.MkdirAll(r.packDir, 0755); err != nil {
-			return nil, nil, err
-		}
-		if err := r.startChunk(); err != nil {
-			return nil, nil, err
-		}
-		defer func() { r.pack.discard() }()
+	r := &objectRewriter{ctx: ctx, cat: cat, repoPath: targetPath, packDir: filepath.Join(targetPath, "objects", "pack"),
+		ids: ids, gitlinks: gitlinks, progress: progress}
+	if err := os.MkdirAll(r.packDir, 0755); err != nil {
+		return nil, nil, err
 	}
+	if err := r.startChunk(); err != nil {
+		return nil, nil, err
+	}
+	defer func() { r.pack.discard() }()
 
 	for _, hexID := range objects {
 		if ctx.Err() != nil {
@@ -617,10 +611,8 @@ func rewriteObjects(ctx context.Context, mirrorPath, targetPath string, ids *tra
 			return nil, nil, err
 		}
 	}
-	if r.pack != nil {
-		if err := r.flushChunk(); err != nil {
-			return nil, nil, err
-		}
+	if err := r.flushChunk(); err != nil {
+		return nil, nil, err
 	}
 	return r.added, r.missingMergetags, nil
 }
@@ -745,46 +737,80 @@ func isIncrementalRewrite(servingPath string) bool {
 	return true
 }
 
+// conversionScope is what a conversion converts and serves: all refs, only the pinned refs
+// (partial), or only the history of some commits, serving nothing new (objects).
+type conversionScope struct {
+	partial bool
+	objects []string
+}
+
+// conversionTarget is where a conversion writes: the serving repository itself, extended
+// incrementally, or a new build.
+type conversionTarget struct {
+	path        string
+	incremental bool
+	ids         *translations
+	exclude     []string // refs converted before
+	previous    *repoState
+	state       *repoState
+}
+
+// openTarget prepares a conversion's target. A conversion of objects only extends a repository.
+func openTarget(ctx context.Context, info *resolver.RepositoryInfo, scope conversionScope) (*conversionTarget, error) {
+	t := &conversionTarget{path: info.ServingPath, incremental: isIncrementalRewrite(info.ServingPath),
+		ids: &translations{added: make(map[sha1ID]sha256ID)}}
+	t.previous, _ = loadState(info.ServingPath)
+	t.state = newRepoState(t.previous)
+	t.state.Partial = scope.partial
+	if scope.objects != nil {
+		if !t.incremental {
+			return nil, fmt.Errorf("cannot extend %s, which must be converted again", info.RepoName)
+		}
+		// Only objects are added: what is served stays as it was
+		t.state.Partial, t.state.ConvertedRefs = t.previous.Partial, t.previous.ConvertedRefs
+	}
+	if !t.incremental {
+		log.Printf("Starting full object conversion for repository %s...", info.RepoName)
+		t.path = filepath.Join(info.BuildsPath, strconv.FormatInt(time.Now().UnixNano(), 10))
+		if _, err := runCmdContext(ctx, 0, "", "git", "init", "--bare", "--object-format=sha256", t.path); err != nil {
+			return nil, fmt.Errorf("failed to initialize bare sha256 repository: %w", err)
+		}
+		return t, nil
+	}
+	log.Printf("Starting incremental object conversion for repository %s...", info.RepoName)
+	if err := ensureTranslationIndexes(info.ServingPath); err != nil {
+		return nil, fmt.Errorf("failed to index loose-object-idx: %w", err)
+	}
+	var err error
+	if t.ids.known, err = openTranslationIndex(filepath.Join(info.ServingPath, sha1IndexFile), len(sha1ID{})); err != nil {
+		return nil, err
+	}
+	for _, id := range t.previous.ConvertedRefs {
+		t.exclude = append(t.exclude, id)
+	}
+	return t, nil
+}
+
+// close releases the target, removing a new build if the conversion failed.
+func (t *conversionTarget) close(failed bool) {
+	_ = t.ids.known.Close()
+	if failed && !t.incremental {
+		os.RemoveAll(t.path)
+	}
+}
+
 // convertObjects converts the mirror with object-level translation, incrementally when the serving
-// repository was produced the same way. With partial, only the history of the pinned refs is
-// converted and served.
-func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution, partial bool) (err error) {
+// repository was produced the same way.
+func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution, scope conversionScope) (err error) {
 	if err := os.MkdirAll(filepath.Dir(info.ServingPath), 0755); err != nil {
 		return fmt.Errorf("failed to create repos directory: %w", err)
 	}
-
-	incremental := isIncrementalRewrite(info.ServingPath)
 	start := time.Now()
-	previous, _ := loadState(info.ServingPath)
-	state := newRepoState(previous)
-	state.Partial = partial
-	targetPath := info.ServingPath
-	ids := &translations{added: make(map[sha1ID]sha256ID)}
-	var exclude []string
-	if incremental {
-		log.Printf("Starting incremental object conversion for repository %s...", info.RepoName)
-		if err := ensureTranslationIndexes(info.ServingPath); err != nil {
-			return fmt.Errorf("failed to index loose-object-idx: %w", err)
-		}
-		if ids.known, err = openTranslationIndex(filepath.Join(info.ServingPath, sha1IndexFile), len(sha1ID{})); err != nil {
-			return err
-		}
-		defer ids.known.Close()
-		for _, id := range previous.ConvertedRefs {
-			exclude = append(exclude, id)
-		}
-	} else {
-		log.Printf("Starting full object conversion for repository %s...", info.RepoName)
-		targetPath = filepath.Join(info.BuildsPath, strconv.FormatInt(time.Now().UnixNano(), 10))
-		if _, err := runCmdContext(ctx, 0, "", "git", "init", "--bare", "--object-format=sha256", targetPath); err != nil {
-			return fmt.Errorf("failed to initialize bare sha256 repository: %w", err)
-		}
-		defer func() {
-			if err != nil {
-				os.RemoveAll(targetPath)
-			}
-		}()
+	t, err := openTarget(ctx, info, scope)
+	if err != nil {
+		return err
 	}
+	defer func() { t.close(err != nil) }()
 	if progressWriter != nil {
 		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Converting SHA-1 objects to SHA-256...\n", info.RepoName)
 	}
@@ -798,12 +824,12 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	if err != nil {
 		return err
 	}
-	var heads []string // nil: the history of all refs
-	if partial {
+	heads := scope.objects // nil: the history of all refs
+	if scope.partial {
 		refs = pinnedRefs(refs)
 		heads = slices.Sorted(maps.Values(refs))
 	}
-	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, targetPath, ids, gitlinks, heads, exclude, progress)
+	added, missingMergetags, err := rewriteObjects(ctx, info.MirrorPath, t.path, t.ids, gitlinks, heads, t.exclude, progress)
 	if err != nil {
 		return err
 	}
@@ -815,44 +841,61 @@ func (m *Manager) convertObjects(ctx context.Context, info *resolver.RepositoryI
 	}
 
 	// Translations are written before refs, so no served commit lacks its SHA-1 id
-	if err := appendTranslationTable(targetPath, added, ids); err != nil {
+	if err := appendTranslationTable(t.path, added, t.ids); err != nil {
 		return fmt.Errorf("failed to write loose-object-idx: %w", err)
 	}
-	state.recordGitlinks(gitlinks)
-	state.recordMissingMergetags(missingMergetags)
-	if err := state.save(targetPath); err != nil {
+	t.state.recordGitlinks(gitlinks)
+	t.state.recordMissingMergetags(missingMergetags)
+	if err := t.state.save(t.path); err != nil {
 		return fmt.Errorf("failed to record conversion state: %w", err)
 	}
-	if err := updateRefs(ctx, refs, targetPath, ids); err != nil {
+	if scope.objects == nil {
+		if err := m.serveConversion(ctx, info, t, refs, progressWriter); err != nil {
+			return err
+		}
+	} else if err := writeTranslationIndexes(t.path, t.ids.known, t.ids.added); err != nil {
+		return fmt.Errorf("failed to write translation indexes: %w", err)
+	}
+	log.Printf("Completed %s object conversion for repository %s in %v (%d objects)", scope.kind(t.incremental), info.RepoName, time.Since(start).Round(time.Millisecond), len(added))
+	return nil
+}
+
+// serveConversion points the target's refs at the converted refs and publishes it.
+func (m *Manager) serveConversion(ctx context.Context, info *resolver.RepositoryInfo, t *conversionTarget, refs map[string]string, progressWriter io.Writer) error {
+	if err := updateRefs(ctx, refs, t.path, t.ids); err != nil {
 		return err
 	}
-	if incremental {
+	if t.incremental {
 		if err := pruneServingRefs(info); err != nil {
 			return err
 		}
 	}
-	if err := writeTranslationIndexes(targetPath, ids.known, ids.added); err != nil {
+	if err := writeTranslationIndexes(t.path, t.ids.known, t.ids.added); err != nil {
 		return fmt.Errorf("failed to write translation indexes: %w", err)
 	}
 	// Repacking after the refs are set orders the pack and its bitmap by reachability
-	if err := repackConverted(ctx, targetPath, incremental, progressWriter, info.RepoName); err != nil {
+	if err := repackConverted(ctx, t.path, t.incremental, progressWriter, info.RepoName); err != nil {
 		return err
 	}
 	// The conversion is complete: until this is recorded, the next request converts again
-	state.ConvertedRefs = refs
-	if err := state.save(targetPath); err != nil {
+	t.state.ConvertedRefs = refs
+	if err := t.state.save(t.path); err != nil {
 		return fmt.Errorf("failed to record conversion state: %w", err)
 	}
-	if err := m.publishConversion(info, targetPath, incremental); err != nil {
-		return err
-	}
+	return m.publishConversion(info, t.path, t.incremental)
+}
+
+// kind describes a conversion in the log.
+func (s conversionScope) kind(incremental bool) string {
 	kind := "full"
 	if incremental {
 		kind = "incremental"
 	}
-	if partial {
+	switch {
+	case s.partial:
 		kind += " partial"
+	case s.objects != nil:
+		kind += " objects-only"
 	}
-	log.Printf("Completed %s object conversion for repository %s in %v (%d objects)", kind, info.RepoName, time.Since(start).Round(time.Millisecond), len(added))
-	return nil
+	return kind
 }

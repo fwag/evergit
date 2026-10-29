@@ -61,6 +61,7 @@ type Manager struct {
 	cfg               *config.Config
 	locksMu           sync.Mutex
 	repoLocks         map[string]*repoLock
+	repoMutexes       sync.Map // serving path -> *sync.Mutex (see repoMutex)
 }
 
 // repoJob tracks an active conversion job. It runs to completion (or until the exec timeout) even
@@ -193,30 +194,6 @@ func (m *Manager) WaitIdle() {
 	}
 }
 
-type visitedReposKey struct{}
-
-func withVisitedRepo(ctx context.Context, canonicalID string) (context.Context, bool) {
-	visited, _ := ctx.Value(visitedReposKey{}).(map[string]bool)
-	if visited == nil {
-		visited = make(map[string]bool)
-	}
-	if visited[canonicalID] {
-		return ctx, false
-	}
-	newVisited := make(map[string]bool, len(visited)+1)
-	for k, v := range visited {
-		newVisited[k] = v
-	}
-	newVisited[canonicalID] = true
-	return context.WithValue(ctx, visitedReposKey{}, newVisited), true
-}
-
-// beingConverted reports whether a repository is being converted further up the chain of submodules.
-func beingConverted(ctx context.Context, canonicalID string) bool {
-	visited, _ := ctx.Value(visitedReposKey{}).(map[string]bool)
-	return visited[canonicalID]
-}
-
 // EnsureRepo checks if the repository exists, is up-to-date, and is converted.
 // If not, it clones/fetches, converts it, and optionally streams progress.
 // It accepts a context for cancellation (e.g. when all waiting clients disconnect).
@@ -252,29 +229,19 @@ func (m *Manager) EnsureRepoWithin(ctx context.Context, info *resolver.Repositor
 
 // EnsureRepoWithDepth checks or converts a repository, converting submodules nested at most depth levels.
 func (m *Manager) EnsureRepoWithDepth(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
-	return m.ensureRepo(ctx, info, progressWriter, depth, nil, false)
+	return m.ensureRepo(ctx, info, progressWriter, depth)
 }
 
 func canonicalRepoID(info *resolver.RepositoryInfo) string {
 	return info.Domain + "/" + info.Path()
 }
 
-// ensureRepo checks or converts a repository. A non-empty requiredCommits lists commits the repository
-// must contain: the upstream is fetched regardless of the TTL, commits no branch or tag reaches are
-// fetched by id, and a fetch failure is returned instead of serving the cached repository. With
-// partial, a repository not converted completely before is converted only as far as the history of
-// the required commits and those required before (see partialConversion).
-func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, requiredCommits []string, partial bool) error {
+// ensureRepo checks or converts a requested repository, in a job shared by the requests waiting for
+// it.
+func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	canonicalID := canonicalRepoID(info)
-	ctxWithVisited, ok := withVisitedRepo(ctx, canonicalID)
-	if !ok {
-		// Waiting for the conversion further up the chain would deadlock
-		return fmt.Errorf("%w: %s is already being converted further up the chain of submodules", ErrSubmoduleCycle, canonicalID)
-	}
-	ctx = ctxWithVisited
 
 	if progressWriter != nil {
 		async := newAsyncWriter(progressWriter)
@@ -301,29 +268,13 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	}()
 
 	lock.mu.Lock()
-	for lock.job != nil {
-		job := lock.job
-		if len(requiredCommits) == 0 {
-			lock.mu.Unlock()
-			if err := m.waitJob(ctx, job); err != nil || !servedPartially(info.ServingPath) {
-				return err
-			}
-			// The job converted the repository partially, for submodule commits: complete it
-			lock.mu.Lock()
-			continue
-		}
-		// A running job may not fetch the required commits: wait for it to exit before starting a new one
+	if job := lock.job; job != nil {
 		lock.mu.Unlock()
-		select {
-		case <-job.done:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		lock.mu.Lock()
+		return m.waitJob(ctx, job)
 	}
 
 	// 1. Check if the repository already exists and is within its TTL
-	if len(requiredCommits) == 0 && !m.needsSync(info) {
+	if !m.needsSync(info) {
 		lock.mu.Unlock()
 		return nil
 	}
@@ -333,15 +284,14 @@ func (m *Manager) ensureRepo(ctx context.Context, info *resolver.RepositoryInfo,
 	if timeout <= 0 {
 		timeout = DefaultExecTimeout
 	}
+	// The job outlives this request
 	jobCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	// The job outlives this request, but submodule conversions it starts must see the chain
-	jobCtx = context.WithValue(jobCtx, visitedReposKey{}, ctx.Value(visitedReposKey{}))
 	lock.job = job
 	lock.mu.Unlock()
 
 	go func() {
 		defer cancel()
-		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth, requiredCommits, partial)
+		err := m.doEnsureRepo(jobCtx, info, progressWriter, depth)
 		job.mu.Lock()
 		job.err = err
 		close(job.done)
@@ -375,72 +325,60 @@ func (m *Manager) waitJob(ctx context.Context, job *repoJob) error {
 	}
 }
 
-func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int, requiredCommits []string, partial bool) error {
+func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, depth int) error {
 	// 1. Check if the repository already exists and is within its TTL
-	if len(requiredCommits) == 0 && !m.needsSync(info) {
+	if !m.needsSync(info) {
 		return nil
 	}
 
-	// 2. Clone/Fetch the upstream mirror
+	// 2. Clone/Fetch the upstream mirror, which a plan for another repository may also update
+	mu := m.repoMutex(info)
+	mu.Lock()
 	err := m.syncMirror(ctx, info)
 	var cached *cacheFallbackError
-	if errors.As(err, &cached) && len(requiredCommits) == 0 {
+	if errors.As(err, &cached) {
 		err = nil // serve the cached repository
 	}
-	if err != nil {
+	if err == nil && isRepoSHA256(info.MirrorPath) {
+		// The upstream is natively SHA-256: there is nothing to convert
+		err = m.syncNativeSHA256(ctx, info, progressWriter)
+		mu.Unlock()
 		return err
 	}
-
-	// If the upstream mirror is natively SHA-256, there is nothing to convert
-	if isRepoSHA256(info.MirrorPath) {
-		return m.syncNativeSHA256(ctx, info, progressWriter)
-	}
-
-	if len(requiredCommits) > 0 {
-		if _, err := m.fetchCommits(ctx, info, requiredCommits, true); err != nil {
-			return err
-		}
-	}
-	partial = partial && len(requiredCommits) > 0 && partialConversion(info.ServingPath)
-	var heads []string // nil: the history of all refs
-	if partial {
-		refs, err := listRefs(info.MirrorPath)
-		if err != nil {
-			return err
-		}
-		heads = slices.Sorted(maps.Values(pinnedRefs(refs)))
+	mu.Unlock()
+	if err != nil {
+		return err
 	}
 
 	// Skip conversion when the serving repo is a complete conversion of the mirror's current refs.
 	// Comparing with the last successful conversion, rather than with the mirror before the fetch,
 	// retries a conversion that failed after its fetch instead of serving the old version. Touching
 	// HEAD restarts the TTL. Anything else, such as a lost translation table, is converted again.
-	if convertedUpToDate(info, partial) {
+	if convertedUpToDate(info, false) {
 		now := time.Now()
 		_ = os.Chtimes(filepath.Join(info.ServingPath, "HEAD"), now, now)
 		return nil
 	}
 
-	// All missing approvals of the repository and its submodules are reported before converting
-	if len(requiredCommits) == 0 {
-		plan, err := m.planConversion(ctx, info, nil, progressWriter, depth)
-		if err != nil {
-			return err
-		}
-		if progressWriter != nil {
-			_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Plan: %s\n", info.RepoName, plan.summary())
-		}
-	}
-
-	// 3. Convert the submodules whose commits the history records, deciding every gitlink's SHA-256
-	gitlinks, err := m.resolveGitlinks(ctx, info, progressWriter, depth, heads)
+	// 3. Plan the conversion of the repository and the submodules it needs: every missing approval
+	// is reported before converting anything
+	plan, err := m.planConversion(ctx, info, nil, progressWriter, depth)
 	if err != nil {
 		return err
 	}
-	defer gitlinks.close()
+	if progressWriter != nil {
+		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Plan: %s\n", info.RepoName, plan.summary())
+	}
 
-	// 4. Convert mirror to serving repo (SHA1 -> SHA256 conversion)
-	return m.convertRepo(ctx, info, progressWriter, gitlinks, partial)
+	// 4. Convert the submodules, then the repository (SHA1 -> SHA256 conversion)
+	return plan.convert(plan.top, nil)
+}
+
+// repoMutex returns the mutex serializing the changes to a repository's mirror and serving
+// repository. It is only held for one repository at a time, so plans cannot deadlock.
+func (m *Manager) repoMutex(info *resolver.RepositoryInfo) *sync.Mutex {
+	mu, _ := m.repoMutexes.LoadOrStore(info.ServingPath, &sync.Mutex{})
+	return mu.(*sync.Mutex)
 }
 
 // partialConversion reports whether a repository needed for submodule commits can be converted
@@ -758,7 +696,7 @@ func looksLikeBareRepo(path string) bool {
 // scoped to heads and tags, "git fetch --prune" can never delete refs/evergit-backups/*.
 var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
-func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution, partial bool) error {
+func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo, progressWriter io.Writer, gitlinks *gitlinkResolution, scope conversionScope) error {
 	// Guard against unbounded concurrent conversions across all repositories
 	if m.conversionSem != nil {
 		wait := m.conversionWait
@@ -775,7 +713,7 @@ func (m *Manager) convertRepo(ctx context.Context, info *resolver.RepositoryInfo
 		}
 	}
 
-	return m.convertObjects(ctx, info, progressWriter, gitlinks, partial)
+	return m.convertObjects(ctx, info, progressWriter, gitlinks, scope)
 }
 
 // syntheticSHA256Padding turns the SHA-1 of a submodule commit without a known translation into a
