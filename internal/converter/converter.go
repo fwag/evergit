@@ -579,58 +579,65 @@ func (m *Manager) syncMirror(ctx context.Context, info *resolver.RepositoryInfo)
 	}
 
 	if os.IsNotExist(statErr) {
-		if err := m.checkDiskSpace(info.MirrorPath); err != nil {
-			return err
-		}
-		// Clone as a bare mirror
-		// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
-		// thousands of refs/pull/* from forks
-		err := m.gitUpstream(ctx, info, "", func(remote string) []string {
-			return []string{"-c", "http.followRedirects=false", "clone", "--bare", "--", remote, info.MirrorPath}
-		})
-		if err != nil {
-			_ = os.RemoveAll(info.MirrorPath)
-			return fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, markGone(err))
-		}
-		return nil
-	} else {
-		// Read current refs before fetching: without this baseline, force-pushes cannot be archived
-		oldRefs, err := listRefs(info.MirrorPath)
-		if err != nil {
-			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
-				log.Printf("WARNING: cannot read refs of mirror %s (%v), skipping upstream fetch and serving cached repository", info.MirrorPath, err)
-				return &cacheFallbackError{err}
-			}
-			return fmt.Errorf("failed to read refs of mirror %s: %w", info.MirrorPath, err)
-		}
+		return m.cloneMirror(ctx, info)
+	}
+	return m.fetchMirror(ctx, info)
+}
 
-		// Fetch updates
-		err = m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
-			return append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", remote}, mirrorRefspecs...)
-		})
-		if err != nil && strings.Contains(err.Error(), "mismatched algorithms") {
-			// Removing the mirror serves the upstream's own history natively, whose commit ids may
-			// differ from those served so far
-			log.Printf("ERROR: upstream %s changed its object format; mirror %s cannot be updated, remove it to serve the upstream natively: %v", info.RemoteURL, info.MirrorPath, err)
-			return fmt.Errorf("%w: %s no longer has the object format of the converted copy; ask the Evergit administrator", ErrUpstreamObjectFormatChanged, info.RemoteURL)
-		}
+// cloneMirror clones the upstream as a bare mirror, of branches and tags only.
+func (m *Manager) cloneMirror(ctx context.Context, info *resolver.RepositoryInfo) error {
+	if err := m.checkDiskSpace(info.MirrorPath); err != nil {
+		return err
+	}
+	// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
+	// thousands of refs/pull/* from forks
+	err := m.gitUpstream(ctx, info, "", func(remote string) []string {
+		return []string{"-c", "http.followRedirects=false", "clone", "--bare", "--", remote, info.MirrorPath}
+	})
+	if err != nil {
+		_ = os.RemoveAll(info.MirrorPath)
+		return fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, markGone(err))
+	}
+	return nil
+}
 
-		// Archive overwritten/deleted refs even if the fetch failed midway, since it may already
-		// have pruned or updated some of them
-		if len(oldRefs) > 0 {
-			m.backupForcePushedRefs(info, oldRefs)
+// fetchMirror fetches the upstream into its mirror, archiving overwritten and deleted refs. If the
+// upstream cannot be fetched and a converted copy exists, it returns a cacheFallbackError.
+func (m *Manager) fetchMirror(ctx context.Context, info *resolver.RepositoryInfo) error {
+	// Read current refs before fetching: without this baseline, force-pushes cannot be archived
+	oldRefs, err := listRefs(info.MirrorPath)
+	if err != nil {
+		if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
+			log.Printf("WARNING: cannot read refs of mirror %s (%v), skipping upstream fetch and serving cached repository", info.MirrorPath, err)
+			return &cacheFallbackError{err}
 		}
+		return fmt.Errorf("failed to read refs of mirror %s: %w", info.MirrorPath, err)
+	}
 
-		if err != nil {
-			// Check if we have an existing serving repository to fall back to
-			if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
-				log.Printf("WARNING: Upstream fetch failed for %s (%v). Falling back to cached repository.", info.RemoteURL, err)
-				return &cacheFallbackError{markGone(err)}
-			}
-			return fmt.Errorf("upstream fetch failed and no local cache available for %s: %w", info.RemoteURL, markGone(err))
-		}
+	err = m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
+		return append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", remote}, mirrorRefspecs...)
+	})
+	if err != nil && strings.Contains(err.Error(), "mismatched algorithms") {
+		// Removing the mirror serves the upstream's own history natively, whose commit ids may
+		// differ from those served so far
+		log.Printf("ERROR: upstream %s changed its object format; mirror %s cannot be updated, remove it to serve the upstream natively: %v", info.RemoteURL, info.MirrorPath, err)
+		return fmt.Errorf("%w: %s no longer has the object format of the converted copy; ask the Evergit administrator", ErrUpstreamObjectFormatChanged, info.RemoteURL)
+	}
+
+	// Archive overwritten/deleted refs even if the fetch failed midway, since it may already
+	// have pruned or updated some of them
+	if len(oldRefs) > 0 {
+		m.backupForcePushedRefs(info, oldRefs)
+	}
+	if err == nil {
 		return nil
 	}
+	// Check if we have an existing serving repository to fall back to
+	if _, statErr := os.Stat(filepath.Join(info.ServingPath, "HEAD")); statErr == nil {
+		log.Printf("WARNING: Upstream fetch failed for %s (%v). Falling back to cached repository.", info.RemoteURL, err)
+		return &cacheFallbackError{markGone(err)}
+	}
+	return fmt.Errorf("upstream fetch failed and no local cache available for %s: %w", info.RemoteURL, markGone(err))
 }
 
 // convertedUpToDate reports whether the serving repository is a complete conversion of the
