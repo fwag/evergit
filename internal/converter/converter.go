@@ -615,7 +615,7 @@ func (m *Manager) fetchMirror(ctx context.Context, info *resolver.RepositoryInfo
 	}
 
 	err = m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
-		return append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", remote}, mirrorRefspecs...)
+		return append([]string{"-c", "http.followRedirects=false", "fetch", "--prune", "--", remote}, mirrorRefspecs...)
 	})
 	if err != nil && strings.Contains(err.Error(), "mismatched algorithms") {
 		// Removing the mirror serves the upstream's own history natively, whose commit ids may

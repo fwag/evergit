@@ -145,6 +145,8 @@ func (p *conversionPlan) require(r *planItem, commits ...string) {
 			r.required = append(r.required, c)
 		}
 	}
+	// Queue if not already queued and there are new required commits to scan, or if
+	// a complete conversion has not performed its initial all-refs scan yet (r.heads == nil).
 	if !r.queued && (r.scanned < len(r.required) || (r.complete && r.heads == nil)) {
 		r.queued = true
 		p.queue = append(p.queue, r)
@@ -304,7 +306,10 @@ func (p *conversionPlan) fetch(r *planItem, commits []string) error {
 	for _, c := range commits {
 		r.present[c] = !slices.Contains(missing, c)
 	}
-	gone, err := p.m.fetchCommits(p.ctx, r.info, missing, false)
+	if len(missing) == 0 {
+		return nil
+	}
+	gone, err := p.m.fetchMissingCommits(p.ctx, r.info, missing)
 	if errors.Is(err, ErrRedirectNotAllowed) {
 		r.unavailable = err
 		return nil

@@ -133,14 +133,17 @@ const progressCommitInterval = 1000
 // discoverGitlinks lists the submodule commits recorded by the commits reachable from heads (all of
 // the mirror's refs if nil) but not from exclude, by submodule.
 func discoverGitlinks(ctx context.Context, mirrorPath string, heads, exclude []string, progress func(n int)) (gitlinkTargets, error) {
+	// recorded[commitSuperproject] -> {path, commitSHA1submodule}
 	commits, recorded, err := scanGitlinks(ctx, mirrorPath, heads, exclude, progress)
 	if err != nil {
 		return nil, err
 	}
+	// urls[commitSuperproject][submodulePath] = submoduleURL
 	urls, err := gitmodulesURLs(ctx, mirrorPath, commits)
 	if err != nil {
 		return nil, err
 	}
+	//targets[submoduleURL][commitSHA1] = true
 	targets := make(gitlinkTargets)
 	for _, c := range commits {
 		for _, g := range recorded[c] {
@@ -160,8 +163,8 @@ func discoverGitlinks(ctx context.Context, mirrorPath string, heads, exclude []s
 // pathGitlink is a gitlink at a path of a commit's tree.
 type pathGitlink struct{ path, target string }
 
-// scanGitlinks lists the gitlinks the commits of a history add or change, by commit, and the commits
-// recording any, in the order of the history.
+// scanGitlinks returns the commits that add or change gitlinks (in history order),
+// and the gitlinks added or changed by each commit.
 func scanGitlinks(ctx context.Context, mirrorPath string, heads, exclude []string, progress func(n int)) ([]string, map[string][]pathGitlink, error) {
 	// Merges are diffed against all parents (-c), so a gitlink a merge introduces is listed too
 	args, stdin := historyRevisions(heads, exclude)
@@ -367,17 +370,9 @@ func (m *Manager) fetchCommits(ctx context.Context, info *resolver.RepositoryInf
 	if err != nil {
 		return nil, err
 	}
-	var gone []string
-	for _, c := range missing {
-		err := m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
-			return []string{"-c", "http.followRedirects=false", "fetch", "--no-tags", "--no-write-fetch-head", remote, c}
-		})
-		if err := markGone(err); errors.Is(err, errUpstreamGone) {
-			log.Printf("[%s] Submodule commit %s does not exist upstream: %v", info.RepoName, c, err)
-			gone = append(gone, c)
-		} else if err != nil {
-			return nil, fmt.Errorf("failed to fetch submodule commit %s: %w", c, err)
-		}
+	gone, err := m.fetchMissingCommits(ctx, info, missing)
+	if err != nil {
+		return nil, err
 	}
 	if !pin {
 		return gone, nil
@@ -391,6 +386,29 @@ func (m *Manager) fetchCommits(ctx context.Context, info *resolver.RepositoryInf
 	if updates.Len() > 0 {
 		if _, err := runCmdStdin(ctx, 0, info.MirrorPath, strings.NewReader(updates.String()), "git", "update-ref", "--stdin"); err != nil {
 			return nil, err
+		}
+	}
+	return gone, nil
+}
+
+// fetchMissingCommits fetches commits missing from the mirror from upstream by id, returning
+// the commits the upstream does not have. Other failures are errors.
+func (m *Manager) fetchMissingCommits(ctx context.Context, info *resolver.RepositoryInfo, missing []string) ([]string, error) {
+	for _, c := range missing {
+		if _, err := parseSHA1Hex(c); err != nil {
+			return nil, err
+		}
+	}
+	var gone []string
+	for _, c := range missing {
+		err := m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {
+			return []string{"-c", "http.followRedirects=false", "fetch", "--no-tags", "--no-write-fetch-head", "--", remote, c}
+		})
+		if err := markGone(err); errors.Is(err, errUpstreamGone) {
+			log.Printf("[%s] Submodule commit %s does not exist upstream: %v", info.RepoName, c, err)
+			gone = append(gone, c)
+		} else if err != nil {
+			return nil, fmt.Errorf("failed to fetch submodule commit %s: %w", c, err)
 		}
 	}
 	return gone, nil
@@ -425,7 +443,17 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 	if m.cfg != nil && m.cfg.StorageRoot != "" {
 		storageRoot = m.cfg.StorageRoot
 	} else if parentInfo.MirrorPath != "" {
-		storageRoot = filepath.Dir(filepath.Dir(filepath.Dir(parentInfo.MirrorPath)))
+		for dir := parentInfo.MirrorPath; ; {
+			parent := filepath.Dir(dir)
+			if filepath.Base(dir) == "mirrors" {
+				storageRoot = parent
+				break
+			}
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
 	}
 
 	// Submodules are mirrored from allowed hosts only: a URL in a public repository's .gitmodules
@@ -458,13 +486,6 @@ func submodulePath(rawURL string, parentInfo *resolver.RepositoryInfo) (string, 
 		// "<domain>/<owner>/<repo>.git" is "<domain>/<owner>/other.git"
 		parentURL := path.Join(parentInfo.Domain, parentInfo.Path()+".git")
 		return path.Clean(path.Join(parentURL, rawURL)), nil
-	case strings.HasPrefix(rawURL, "git@"):
-		// git@domain:owner/repo.git
-		domain, repoPart, found := strings.Cut(strings.TrimPrefix(rawURL, "git@"), ":")
-		if !found {
-			return "", fmt.Errorf("invalid git@ submodule URL %q", rawURL)
-		}
-		return domain + "/" + repoPart, nil
 	case strings.Contains(rawURL, "://"):
 		u, err := url.Parse(rawURL)
 		if err != nil {
@@ -475,8 +496,46 @@ func submodulePath(rawURL string, parentInfo *resolver.RepositoryInfo) (string, 
 		}
 		return u.Hostname() + "/" + strings.TrimPrefix(u.Path, "/"), nil
 	default:
+		// SCP-like SSH syntax: "[user@]host:path/to/repo.git" -> "host/path/to/repo.git"
+		if scpPath, ok, err := parseSCPLike(rawURL); ok {
+			return scpPath, err
+		}
 		return rawURL, nil
 	}
+}
+
+// parseSCPLike parses an SCP-like SSH URL ("[user@]host:path") into "host/path".
+func parseSCPLike(rawURL string) (string, bool, error) {
+	colon := strings.Index(rawURL, ":")
+	at := strings.Index(rawURL, "@")
+
+	// SSH URL with user: "user@host:path" (e.g. git@..., gitea@..., forgejo@...)
+	if at >= 0 && (colon < 0 || at < colon) {
+		user := rawURL[:at]
+		if strings.Contains(user, "/") || strings.HasPrefix(user, "-") {
+			return "", true, fmt.Errorf("invalid SSH submodule URL %q", rawURL)
+		}
+		if colon < 0 {
+			return "", true, fmt.Errorf("invalid SSH submodule URL %q: missing ':'", rawURL)
+		}
+		host := rawURL[at+1 : colon]
+		repoPart := rawURL[colon+1:]
+		if host == "" || repoPart == "" || strings.Contains(host, "/") || strings.HasPrefix(host, "-") {
+			return "", true, fmt.Errorf("invalid SSH submodule URL %q", rawURL)
+		}
+		return host + "/" + strings.TrimPrefix(repoPart, "/"), true, nil
+	}
+
+	// SSH URL without user: "host:path" (no slash before colon, not a Windows drive letter)
+	if colon > 1 && !strings.Contains(rawURL[:colon], "/") {
+		host := rawURL[:colon]
+		repoPart := rawURL[colon+1:]
+		if host != "" && repoPart != "" && !strings.HasPrefix(repoPart, "//") && !strings.HasPrefix(host, "-") {
+			return host + "/" + strings.TrimPrefix(repoPart, "/"), true, nil
+		}
+	}
+
+	return "", false, nil
 }
 
 // networkSchemes are the URL schemes of submodules that can be mirrored from an allowed host.

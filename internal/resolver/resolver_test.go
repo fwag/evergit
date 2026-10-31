@@ -125,6 +125,21 @@ func TestParsePath(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "Repo segment starting with dash",
+			rawPath: "github.com/org/-repo",
+			wantErr: true,
+		},
+		{
+			name:    "Owner segment starting with dash",
+			rawPath: "github.com/-org/repo",
+			wantErr: true,
+		},
+		{
+			name:    "Flag-like segment",
+			rawPath: "github.com/org/--upload-pack",
+			wantErr: true,
+		},
+		{
 			name:        "Host is case-insensitive",
 			rawPath:     "GitHub.com/ta/evergit",
 			wantDomain:  "github.com",

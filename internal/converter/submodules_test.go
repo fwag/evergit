@@ -930,6 +930,79 @@ func TestRelativeSubmoduleURLsResolveLikeGit(t *testing.T) {
 	}
 }
 
+func TestResolveSubmoduleInfoStorageRootInferredFromMirrorPath(t *testing.T) {
+	m := &Manager{}
+	expectedRoot := filepath.Join("custom", "storage", "root")
+	tests := []struct {
+		name       string
+		mirrorPath string
+	}{
+		{
+			name:       "domain/repo (no owner)",
+			mirrorPath: filepath.Join(expectedRoot, "mirrors", "example.com", "repo.git"),
+		},
+		{
+			name:       "domain/owner/repo (single owner)",
+			mirrorPath: filepath.Join(expectedRoot, "mirrors", "github.com", "owner", "repo.git"),
+		},
+		{
+			name:       "domain/group/subgroup/repo (nested owner)",
+			mirrorPath: filepath.Join(expectedRoot, "mirrors", "gitlab.com", "group", "subgroup", "repo.git"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := &resolver.RepositoryInfo{MirrorPath: tt.mirrorPath}
+			subInfo, err := m.resolveSubmoduleInfo("https://github.com/libvirt/libvirt.git", parent)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			expectedSubMirror := filepath.Join(expectedRoot, "mirrors", "github.com", "libvirt", "libvirt.git")
+			if subInfo.MirrorPath != expectedSubMirror {
+				t.Errorf("got MirrorPath %q, want %q", subInfo.MirrorPath, expectedSubMirror)
+			}
+		})
+	}
+}
+
+func TestSSHSubmoduleURLs(t *testing.T) {
+	m := newSubmoduleManager(t.TempDir(), 0)
+	parent := &resolver.RepositoryInfo{Domain: "github.com", Owner: "owner", RepoName: "repo"}
+
+	tests := []struct {
+		url     string
+		want    string
+		wantErr bool
+	}{
+		{url: "git@github.com:owner/repo.git", want: "github.com/owner/repo"},
+		{url: "gitea@github.com:owner/repo.git", want: "github.com/owner/repo"},
+		{url: "forgejo@github.com:owner/repo.git", want: "github.com/owner/repo"},
+		{url: "customuser@gitlab.com:group/subgroup/repo.git", want: "gitlab.com/group/subgroup/repo"},
+		{url: "github.com:owner/repo.git", want: "github.com/owner/repo"},
+		{url: "ssh://gitea@github.com/owner/repo.git", want: "github.com/owner/repo"},
+		{url: "gitea@github.com", wantErr: true},
+		{url: "-oProxyCommand=evil@github.com:owner/repo.git", wantErr: true},
+		{url: "user@-github.com:owner/repo.git", wantErr: true},
+		{url: "-github.com:owner/repo.git", wantErr: true},
+	}
+	for _, tt := range tests {
+		info, err := m.resolveSubmoduleInfo(tt.url, parent)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("url %q: expected error, got nil", tt.url)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("url %q: unexpected error: %v", tt.url, err)
+			continue
+		}
+		if got := canonicalRepoID(info); got != tt.want {
+			t.Errorf("url %q: got %s, want %s", tt.url, got, tt.want)
+		}
+	}
+}
+
 func TestDiscoverGitlinksQuotedAndSpecialPaths(t *testing.T) {
 	super := newTestUpstream(t)
 	dummyCommit := strings.Repeat("12", 20)

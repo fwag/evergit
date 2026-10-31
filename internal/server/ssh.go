@@ -273,7 +273,7 @@ func (s *SSHServer) executeGitCommand(ctx context.Context, ch ssh.Channel, rawCm
 	}
 
 	// Execute git command directly against the safe path
-	cmd := exec.CommandContext(ctx, verb, absServingPath)
+	cmd := exec.CommandContext(ctx, verb, "--", absServingPath)
 	cmd.Env = converter.GitEnv()
 	if acceptedEnv("GIT_PROTOCOL", gitProtocol) {
 		cmd.Env = append(cmd.Env, "GIT_PROTOCOL="+gitProtocol)
