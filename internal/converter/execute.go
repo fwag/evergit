@@ -64,6 +64,7 @@ type plannedGitlink struct {
 // recorded by earlier conversions.
 func (r *planItem) planned() ([]plannedGitlink, error) {
 	var links []plannedGitlink
+	//r.sources[submoduleURL][submoduleCommit]
 	for _, submodule := range sortedKeys(r.sources) {
 		for _, c := range sortedKeys(r.sources[submodule]) {
 			id, err := parseSHA1Hex(c)
@@ -121,7 +122,8 @@ func (p *conversionPlan) needs(r *planItem, heads []string, complete bool) (map[
 	}
 	needs := make(map[string][]string)
 	for _, l := range links {
-		// A complete conversion converts the commits of the repository itself it records
+		// Self-gitlinks: a complete conversion already converts its own commits in the same pass.
+		// A partial conversion must convert older self-commits first as explicit dependencies.
 		repo := l.src.repo
 		if repo != nil && (repo != r || !complete) && !slices.Contains(needs[repo.id], l.commit) {
 			needs[repo.id] = append(needs[repo.id], l.commit)

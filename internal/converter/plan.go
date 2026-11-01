@@ -49,10 +49,13 @@ type planItem struct {
 	gone        map[string]bool // required commits the upstream does not have
 	present     map[string]bool // commits checked to be in the mirror before any fetch
 
-	previouslyDecided map[sha1ID]sha256ID // decisions recorded by earlier conversions
-	exclude           []string            // refs converted before, whose gitlinks are decided
-	heads             []string            // commits whose history was scanned
-	gitlinks          gitlinkTargets      // gitlinks of the history to convert, by submodule
+	// previouslyDecided maps submodule commits to the SHA-256 recorded by earlier conversions.
+	// Named "decided" rather than "converted" because entries may be synthetic SHA-256 assignments
+	// (<sha1> + 24 zeros) rather than actual Git conversions.
+	previouslyDecided map[sha1ID]sha256ID
+	exclude           []string       // refs converted before, whose gitlinks are decided
+	heads             []string       // commits whose history was scanned
+	gitlinks          gitlinkTargets // gitlinks of the history to convert, by submodule
 	sources           map[string]map[string]gitlinkSource
 
 	recording gitlinkTargets // gitlinks of the whole history, for problems
