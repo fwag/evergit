@@ -443,6 +443,7 @@ func (m *Manager) resolveSubmoduleInfo(rawURL string, parentInfo *resolver.Repos
 	if m.cfg != nil && m.cfg.StorageRoot != "" {
 		storageRoot = m.cfg.StorageRoot
 	} else if parentInfo.MirrorPath != "" {
+		// find storagePath regardless of format domain/owner/repo or domain/repo
 		for dir := parentInfo.MirrorPath; ; {
 			parent := filepath.Dir(dir)
 			if filepath.Base(dir) == "mirrors" {

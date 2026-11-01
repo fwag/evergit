@@ -49,11 +49,11 @@ type planItem struct {
 	gone        map[string]bool // required commits the upstream does not have
 	present     map[string]bool // commits checked to be in the mirror before any fetch
 
-	decided  map[sha1ID]sha256ID // decisions recorded by earlier conversions
-	exclude  []string            // refs converted before, whose gitlinks are decided
-	heads    []string            // commits whose history was scanned
-	gitlinks gitlinkTargets      // gitlinks of the history to convert, by submodule
-	sources  map[string]map[string]gitlinkSource
+	previouslyDecided map[sha1ID]sha256ID // decisions recorded by earlier conversions
+	exclude           []string            // refs converted before, whose gitlinks are decided
+	heads             []string            // commits whose history was scanned
+	gitlinks          gitlinkTargets      // gitlinks of the history to convert, by submodule
+	sources           map[string]map[string]gitlinkSource
 
 	recording gitlinkTargets // gitlinks of the whole history, for problems
 	aliases   map[string][]string
@@ -70,8 +70,9 @@ type conversionPlan struct {
 	top   *planItem
 	items map[string]*planItem
 	queue []*planItem
-	// execution: items converted completely, and the conversions in progress
-	completed  map[*planItem]bool
+	// execution: items converted completely
+	completed map[*planItem]bool
+	// execution: items for which conversion is in progress
 	converting map[string]bool
 	// missing approvals, by superproject
 	unapproved map[string][]unapprovedGitlinks
@@ -119,7 +120,7 @@ func (p *conversionPlan) item(info *resolver.RepositoryInfo) (*planItem, error) 
 	r := &planItem{info: info, id: id, gone: make(map[string]bool), present: make(map[string]bool),
 		gitlinks: make(gitlinkTargets), sources: make(map[string]map[string]gitlinkSource)}
 	if previous, err := loadState(info.ServingPath); err == nil {
-		if r.decided, err = previous.gitlinkDecisions(); err != nil {
+		if r.previouslyDecided, err = previous.gitlinkDecisions(); err != nil {
 			return nil, err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -153,7 +154,8 @@ func (p *conversionPlan) require(r *planItem, commits ...string) {
 	}
 }
 
-// walk scans the queued items until every gitlink of the plan has a source.
+// walk iteratively alternates between scanning queued repositories and resolving gitlinks
+// until reaching a fixed point (no new work queued and no further gitlinks resolved).
 func (p *conversionPlan) walk() error {
 	for {
 		for len(p.queue) > 0 {
@@ -375,7 +377,7 @@ func (r *planItem) undecided() ([]recordedGitlink, error) {
 			if err != nil {
 				return nil, err
 			}
-			_, recorded := r.decided[id]
+			_, recorded := r.previouslyDecided[id]
 			_, planned := r.sources[submodule][c]
 			if !recorded && !planned {
 				links = append(links, recordedGitlink{submodule: submodule, commit: c})

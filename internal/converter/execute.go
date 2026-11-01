@@ -70,7 +70,7 @@ func (r *planItem) planned() ([]plannedGitlink, error) {
 			if err != nil {
 				return nil, err
 			}
-			if _, ok := r.decided[id]; !ok {
+			if _, ok := r.previouslyDecided[id]; !ok {
 				links = append(links, plannedGitlink{submodule, c, id, r.sources[submodule][c]})
 			}
 		}
@@ -98,7 +98,7 @@ func (p *conversionPlan) stepGitlinks(r *planItem, heads []string) ([]plannedGit
 	for submodule, commits := range targets {
 		for c := range commits {
 			id, err := parseSHA1Hex(c)
-			if _, recorded := r.decided[id]; err == nil && !recorded {
+			if _, recorded := r.previouslyDecided[id]; err == nil && !recorded {
 				return nil, fmt.Errorf("gitlink %s of submodule %s in %s was not planned", c, submodule, r.id)
 			}
 		}
