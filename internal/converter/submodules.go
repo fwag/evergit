@@ -399,6 +399,9 @@ func (m *Manager) fetchMissingCommits(ctx context.Context, info *resolver.Reposi
 			return nil, err
 		}
 	}
+	if len(missing) > 0 {
+		log.Printf("[%s] Fetching %d missing commit(s) from %s...", info.RepoName, len(missing), info.RemoteURL)
+	}
 	var gone []string
 	for _, c := range missing {
 		err := m.gitUpstream(ctx, info, info.MirrorPath, func(remote string) []string {

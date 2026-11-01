@@ -290,6 +290,9 @@ func (p *conversionPlan) fetch(r *planItem, commits []string) error {
 	defer mu.Unlock()
 	if !r.synced {
 		r.synced = true
+		if !looksLikeBareRepo(r.info.MirrorPath) && p.progressWriter != nil {
+			_, _ = fmt.Fprintf(p.progressWriter, "remote: Evergit: [%s] Cloning mirror from %s...\n", r.info.RepoName, r.info.RemoteURL)
+		}
 		err := p.m.syncMirror(p.ctx, r.info)
 		switch {
 		case errors.Is(err, errUpstreamGone) || errors.Is(err, ErrRedirectNotAllowed):
@@ -313,6 +316,9 @@ func (p *conversionPlan) fetch(r *planItem, commits []string) error {
 	}
 	if len(missing) == 0 {
 		return nil
+	}
+	if p.progressWriter != nil {
+		_, _ = fmt.Fprintf(p.progressWriter, "remote: Evergit: [%s] Fetching %d missing commit(s) from upstream...\n", r.info.RepoName, len(missing))
 	}
 	gone, err := p.m.fetchMissingCommits(p.ctx, r.info, missing)
 	if errors.Is(err, ErrRedirectNotAllowed) {

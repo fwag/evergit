@@ -329,6 +329,9 @@ func (m *Manager) doEnsureRepo(ctx context.Context, info *resolver.RepositoryInf
 	// 2. Clone/Fetch the upstream mirror, which a plan for another repository may also update
 	mu := m.repoMutex(info)
 	mu.Lock()
+	if !looksLikeBareRepo(info.MirrorPath) && progressWriter != nil {
+		_, _ = fmt.Fprintf(progressWriter, "remote: Evergit: [%s] Cloning mirror from %s...\n", info.RepoName, info.RemoteURL)
+	}
 	err := m.syncMirror(ctx, info)
 	var cached *cacheFallbackError
 	if errors.As(err, &cached) {
@@ -589,6 +592,7 @@ func (m *Manager) cloneMirror(ctx context.Context, info *resolver.RepositoryInfo
 	if err := m.checkDiskSpace(info.MirrorPath); err != nil {
 		return err
 	}
+	log.Printf("[%s] Cloning mirror from %s...", info.RepoName, info.RemoteURL)
 	// --bare rather than --mirror: only branches and tags, not forge refs such as GitHub's
 	// thousands of refs/pull/* from forks
 	err := m.gitUpstream(ctx, info, "", func(remote string) []string {
@@ -598,12 +602,14 @@ func (m *Manager) cloneMirror(ctx context.Context, info *resolver.RepositoryInfo
 		_ = os.RemoveAll(info.MirrorPath)
 		return fmt.Errorf("failed to clone remote %s: %w", info.RemoteURL, markGone(err))
 	}
+	log.Printf("[%s] Mirror clone completed.", info.RepoName)
 	return nil
 }
 
 // fetchMirror fetches the upstream into its mirror, archiving overwritten and deleted refs. If the
 // upstream cannot be fetched and a converted copy exists, it returns a cacheFallbackError.
 func (m *Manager) fetchMirror(ctx context.Context, info *resolver.RepositoryInfo) error {
+	log.Printf("[%s] Fetching mirror updates from %s...", info.RepoName, info.RemoteURL)
 	// Read current refs before fetching: without this baseline, force-pushes cannot be archived
 	oldRefs, err := listRefs(info.MirrorPath)
 	if err != nil {
